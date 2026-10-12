@@ -3,21 +3,29 @@ use crate::record::{LogLevel, LogRecordView};
 /// Checks if `haystack` contains `needle_lower` ignoring ASCII case without allocating any memory.
 ///
 /// Invariant: `needle_lower` MUST be pre-lowercased.
+///
+/// Candidate search: only positions where the needle's first byte can
+/// match are verified, so the common reject path is a single memchr scan
+/// instead of a per-window comparison.
 pub fn contains_insensitive(haystack: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
-    let needle_bytes = needle_lower.as_bytes();
-    let haystack_bytes = haystack.as_bytes();
-    if needle_bytes.len() > haystack_bytes.len() {
+    let n = needle_lower.as_bytes();
+    let hay = haystack.as_bytes();
+    if n.len() > hay.len() {
         return false;
     }
-    haystack_bytes.windows(needle_bytes.len()).any(|window| {
-        window
-            .iter()
-            .zip(needle_bytes.iter())
-            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
-    })
+    let b = n[0];
+    let hit =
+        |pos: usize| hay[pos..].len() >= n.len() && hay[pos..pos + n.len()].eq_ignore_ascii_case(n);
+    // `needle_lower` is lowercased, so for ASCII letters the byte can
+    // appear in either case; other bytes only match themselves.
+    if b.is_ascii_alphabetic() {
+        memchr::memchr2_iter(b, b.to_ascii_uppercase(), hay).any(hit)
+    } else {
+        memchr::memchr_iter(b, hay).any(hit)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +247,27 @@ mod tests {
         assert!(contains_insensitive("ERROR occurred in subsystem", "error"));
         assert!(contains_insensitive("system error", "error"));
         assert!(!contains_insensitive("All clean", "error"));
+    }
+
+    #[test]
+    fn test_contains_insensitive_edge_cases() {
+        // Match anchored at the very end of the haystack.
+        assert!(contains_insensitive("all quiet until ERROR", "error"));
+        assert!(contains_insensitive("ERROR", "error"));
+        // Overlapping prefix: first-byte candidates at 0 and 1.
+        assert!(contains_insensitive("aaab", "aab"));
+        // Non-ASCII needle matches by exact bytes (memchr path, not the
+        // ASCII-letter memchr2 path).
+        assert!(contains_insensitive("[에러] 디스크 오류", "에러"));
+        assert!(!contains_insensitive("[경고] 디스크 오류", "에러"));
+        // Needle longer than the haystack never matches.
+        assert!(!contains_insensitive("err", "error"));
+        // Digit/punctuation first byte of the needle.
+        assert!(contains_insensitive("exit code 500", "500"));
+        assert!(contains_insensitive("tag=[ERROR]", "[error]"));
+        assert!(!contains_insensitive("tag=(ERROR)", "[error]"));
+        // First-byte candidate exists but the rest does not.
+        assert!(!contains_insensitive("erroneous", "error"));
     }
 
     #[test]

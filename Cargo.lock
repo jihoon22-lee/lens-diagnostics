@@ -894,6 +894,7 @@ dependencies = [
  "lens-env",
  "lens-log",
  "lens-net",
+ "lens-ops",
  "lens-sys",
  "lens-test",
  "lens-trace",
@@ -960,17 +961,10 @@ dependencies = [
 name = "lens-mcp"
 version = "0.6.1"
 dependencies = [
- "lens-abi",
- "lens-build",
- "lens-cli",
  "lens-core",
  "lens-disk",
- "lens-env",
  "lens-log",
- "lens-net",
- "lens-sys",
- "lens-test",
- "lens-trace",
+ "lens-ops",
  "serde",
  "serde_json",
  "tempfile",
@@ -982,6 +976,28 @@ version = "0.6.1"
 dependencies = [
  "lens-core",
  "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "lens-ops"
+version = "0.6.1"
+dependencies = [
+ "flate2",
+ "lens-abi",
+ "lens-build",
+ "lens-core",
+ "lens-disk",
+ "lens-env",
+ "lens-log",
+ "lens-net",
+ "lens-sys",
+ "lens-test",
+ "lens-trace",
+ "libc",
+ "serde",
+ "serde_json",
+ "tar",
  "tempfile",
 ]
 

@@ -12,6 +12,20 @@ pub fn default_syslog_year() -> i32 {
     jiff::Timestamp::now().to_zoned(TimeZone::UTC).year().into()
 }
 
+/// Epoch milliseconds → RFC 3339 UTC string (`2026-10-09T12:00:00Z`).
+/// `None` when `ms` is out of representable range.
+pub fn format_rfc3339_ms(ms: i64) -> Option<String> {
+    jiff::Timestamp::from_millisecond(ms)
+        .ok()
+        .map(|t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+/// Epoch seconds → RFC 3339 UTC string (same shape as
+/// [`format_rfc3339_ms`], used for bucket starts).
+pub fn format_rfc3339_secs(secs: i64) -> Option<String> {
+    format_rfc3339_ms(secs.checked_mul(1000)?)
+}
+
 /// Parse a `--since`/`--until` bound. Accepted forms:
 ///   RFC 3339 with offset (`2026-10-09T12:00:00Z`, `...+09:00`),
 ///   ISO date-time without offset (`2026-10-09T12:00:00`,

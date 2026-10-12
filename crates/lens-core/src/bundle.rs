@@ -73,15 +73,29 @@ fn valid_entry_name(name: &str) -> bool {
     !name.split('/').any(|c| c == ".." || c.is_empty())
 }
 
+/// Estimated uncompressed tar size: one 512-byte header per entry plus
+/// the data padded up to a 512 boundary, plus the two zero end blocks.
+fn estimated_archive_bytes(data_sizes: impl Iterator<Item = u64>) -> u64 {
+    let mut total = 1024u64;
+    for size in data_sizes {
+        total += 512 + size.div_ceil(512) * 512;
+    }
+    total
+}
+
 /// Writes `artifacts` plus a generated `manifest.json` to `bundle_path` as a
 /// `.tar.gz` archive and returns the manifest that was embedded. The archive
-/// is staged to a temporary sibling file and atomically renamed on success,
-/// so a failed write never leaves a partial bundle behind.
+/// is staged to a temporary sibling file and atomically persisted on success,
+/// so a failed write never leaves a partial bundle behind. `overwrite`
+/// controls whether an existing bundle at `bundle_path` may be replaced.
+/// Enforces the same entry/byte caps `verify` uses: a bundle too large to
+/// verify is refused rather than written.
 pub fn create_bundle_archive<P: AsRef<Path>>(
     bundle_path: P,
     tool_version: &str,
     artifacts: &[BundleArtifact],
     diagnostics: Vec<String>,
+    overwrite: bool,
 ) -> Result<BundleManifest> {
     let path_ref = bundle_path.as_ref();
 
@@ -104,6 +118,17 @@ pub fn create_bundle_archive<P: AsRef<Path>>(
         }
     }
 
+    // The archive must stay inside the caps verification enforces.
+    if artifacts.len() + 1 > MAX_BUNDLE_ENTRIES {
+        return Err(LensError::LimitExceeded {
+            message: format!(
+                "bundle would contain {} entries, exceeding the verify limit of {}",
+                artifacts.len() + 1,
+                MAX_BUNDLE_ENTRIES
+            ),
+        });
+    }
+
     let mut sources = Vec::with_capacity(artifacts.len());
     for art in artifacts {
         sources.push(Source {
@@ -124,10 +149,29 @@ pub fn create_bundle_archive<P: AsRef<Path>>(
     };
     let manifest_json = crate::json::to_deterministic_pretty(&manifest)?.into_bytes();
 
-    let tmp_path = path_ref.with_extension("lens.tmp");
+    let estimated = estimated_archive_bytes(
+        artifacts
+            .iter()
+            .map(|a| a.data.len() as u64)
+            .chain(std::iter::once(manifest_json.len() as u64)),
+    );
+    if estimated > MAX_BUNDLE_BYTES {
+        return Err(LensError::LimitExceeded {
+            message: format!(
+                "bundle (~{} estimated bytes) would exceed the verify limit of {} bytes",
+                estimated, MAX_BUNDLE_BYTES
+            ),
+        });
+    }
+
+    let parent = path_ref
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| io_err(path_ref, e))?;
+
     let write_result = (|| -> std::result::Result<(), std::io::Error> {
-        let file = File::create(&tmp_path)?;
-        let gz = GzEncoder::new(file, Compression::default());
+        let gz = GzEncoder::new(tmp.as_file(), Compression::default());
         let mut tar = Builder::new(gz);
         let mut append = |name: &str, data: &[u8]| -> std::result::Result<(), std::io::Error> {
             let mut header = Header::new_gnu();
@@ -145,14 +189,30 @@ pub fn create_bundle_archive<P: AsRef<Path>>(
         Ok(())
     })();
 
-    match write_result {
-        Ok(()) => {
-            std::fs::rename(&tmp_path, path_ref).map_err(|e| io_err(path_ref, e))?;
-            Ok(manifest)
-        }
+    if let Err(e) = write_result {
+        // The NamedTempFile is deleted on drop — no partial bundle.
+        return Err(io_err(path_ref, e));
+    }
+
+    let persisted = if overwrite {
+        tmp.persist(path_ref).map(|_| ())
+    } else {
+        tmp.persist_noclobber(path_ref).map(|_| ())
+    };
+    match persisted {
+        Ok(()) => Ok(manifest),
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(io_err(path_ref, e))
+            let e = e.error;
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(LensError::Usage {
+                    message: format!(
+                        "output bundle {:?} already exists; pass --force to overwrite",
+                        path_ref
+                    ),
+                })
+            } else {
+                Err(io_err(path_ref, e))
+            }
         }
     }
 }
@@ -269,43 +329,23 @@ where
 }
 
 /// Normalizes an archive entry name for comparison: strips a leading `./`.
-fn normalize_entry_name(name: &str) -> &str {
+pub fn normalize_entry_name(name: &str) -> &str {
     name.strip_prefix("./").unwrap_or(name)
 }
 
-/// Verifies every manifest-listed file's SHA-256 against the archive contents.
-pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVerificationReport> {
-    let path_ref = bundle_path.as_ref();
+/// Compare collected entry hashes against the manifest — the validation
+/// half shared by `verify_bundle_archive` (hashes computed while
+/// streaming) and `extract_bundle` (hashes computed while staging).
+fn evaluate_bundle_contents(
+    path_ref: &Path,
+    file_hashes: HashMap<String, String>,
+    manifest_content: Option<Vec<u8>>,
+    manifest_count: usize,
+) -> BundleVerificationReport {
     let invalid = |report: &mut BundleVerificationReport, msg: String| {
         report.error = Some(msg);
         report.is_valid = false;
     };
-
-    let mut file_hashes: HashMap<String, String> = HashMap::new();
-    let mut manifest_content: Option<Vec<u8>> = None;
-    let mut manifest_count = 0usize;
-
-    stream_entries(path_ref, |name, reader, _size| {
-        // Only an exact top-level `manifest.json` (optionally `./`-prefixed)
-        // is the manifest. `foo/manifest.json` is an ordinary artifact.
-        if normalize_entry_name(name) == MANIFEST_ENTRY {
-            manifest_count += 1;
-            let mut content = Vec::new();
-            reader
-                .take(MAX_BUNDLE_BYTES)
-                .read_to_end(&mut content)
-                .map_err(|e| io_err(path_ref, e))?;
-            manifest_content = Some(content);
-        } else {
-            let hash = digest_reader(reader).map_err(|e| io_err(path_ref, e))?;
-            let key = normalize_entry_name(name).to_string();
-            if file_hashes.insert(key.clone(), hash).is_some() {
-                // Duplicate entry name — archive is not reproducible evidence.
-                file_hashes.insert(key, "DUPLICATE".to_string());
-            }
-        }
-        Ok(())
-    })?;
 
     let mut report = BundleVerificationReport {
         bundle_path: path_ref.display().to_string(),
@@ -324,7 +364,7 @@ pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVer
             &mut report,
             format!("Archive contains {} manifest.json entries", manifest_count),
         );
-        return Ok(report);
+        return report;
     }
 
     let manifest_bytes = match manifest_content {
@@ -334,7 +374,7 @@ pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVer
                 &mut report,
                 "Archive does not contain manifest.json".to_string(),
             );
-            return Ok(report);
+            return report;
         }
     };
     report.manifest_found = true;
@@ -343,7 +383,7 @@ pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVer
         Ok(m) => m,
         Err(e) => {
             invalid(&mut report, format!("Invalid manifest.json: {}", e));
-            return Ok(report);
+            return report;
         }
     };
 
@@ -355,7 +395,7 @@ pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVer
                 manifest.schema, BUNDLE_SCHEMA_V2
             ),
         );
-        return Ok(report);
+        return report;
     }
 
     let mut consumed: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -391,7 +431,45 @@ pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVer
         && report.missing_files.is_empty()
         && report.unexpected_files.is_empty()
         && !manifest.sources.is_empty();
-    Ok(report)
+    report
+}
+
+/// Verifies every manifest-listed file's SHA-256 against the archive contents.
+pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVerificationReport> {
+    let path_ref = bundle_path.as_ref();
+
+    let mut file_hashes: HashMap<String, String> = HashMap::new();
+    let mut manifest_content: Option<Vec<u8>> = None;
+    let mut manifest_count = 0usize;
+
+    stream_entries(path_ref, |name, reader, _size| {
+        // Only an exact top-level `manifest.json` (optionally `./`-prefixed)
+        // is the manifest. `foo/manifest.json` is an ordinary artifact.
+        if normalize_entry_name(name) == MANIFEST_ENTRY {
+            manifest_count += 1;
+            let mut content = Vec::new();
+            reader
+                .take(MAX_BUNDLE_BYTES)
+                .read_to_end(&mut content)
+                .map_err(|e| io_err(path_ref, e))?;
+            manifest_content = Some(content);
+        } else {
+            let hash = digest_reader(reader).map_err(|e| io_err(path_ref, e))?;
+            let key = normalize_entry_name(name).to_string();
+            if file_hashes.insert(key.clone(), hash).is_some() {
+                // Duplicate entry name — archive is not reproducible evidence.
+                file_hashes.insert(key, "DUPLICATE".to_string());
+            }
+        }
+        Ok(())
+    })?;
+
+    Ok(evaluate_bundle_contents(
+        path_ref,
+        file_hashes,
+        manifest_content,
+        manifest_count,
+    ))
 }
 
 /// Reads the manifest and entry listing of a bundle without hashing payloads.
@@ -458,9 +536,103 @@ pub fn read_bundle_entry<P: AsRef<Path>>(bundle_path: P, name: &str) -> Result<V
     })
 }
 
-/// Verify then extract a bundle into `dest_dir`. Refuses to write outside
-/// the destination (entry names are re-validated) and refuses to overwrite
-/// existing files unless `force` is set. Returns extracted paths.
+/// Check (and when `create`, fill in) the ancestor chain of `name`
+/// between `dest_dir` and the target: every existing component must be a
+/// real directory — a symlink or non-directory refuses extraction, so a
+/// prepared destination cannot redirect writes outside it.
+fn check_ancestors(dest_dir: &Path, name: &str, create: bool) -> Result<()> {
+    let Some(rel_parent) = Path::new(name).parent() else {
+        return Ok(());
+    };
+    let mut prefix = dest_dir.to_path_buf();
+    for comp in rel_parent.components() {
+        prefix.push(comp.as_os_str());
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(LensError::InvalidInput {
+                    message: format!("refusing to extract through symlink {:?}", prefix),
+                });
+            }
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => {
+                return Err(LensError::InvalidInput {
+                    message: format!("refusing to extract through non-directory {:?}", prefix),
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if create {
+                    std::fs::create_dir(&prefix).map_err(|e| io_err(&prefix, e))?;
+                }
+            }
+            Err(e) => return Err(io_err(&prefix, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Check whether `target` may be written: existing paths are errors
+/// without `force`; symlinks and directories are errors even with it.
+fn check_target(target: &Path, force: bool) -> Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(md) => {
+            if !force {
+                return Err(LensError::InvalidInput {
+                    message: format!("{:?} already exists; pass --force to overwrite", target),
+                });
+            }
+            // Even with force, never delete a symlink or a directory:
+            // removing a symlink then writing through its name would
+            // plant a file the attacker chose the location of.
+            if md.file_type().is_symlink() || md.is_dir() {
+                return Err(LensError::InvalidInput {
+                    message: format!("refusing to overwrite {:?}: not a regular file", target),
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(target, e)),
+    }
+}
+
+/// Move verified staged entries into place under `dest_dir`. Placement is
+/// all-or-nothing: the ancestor and target-conflict checks run for every
+/// entry first — nothing is created or moved when any entry would fail —
+/// and only then are missing directories created, regular-file targets
+/// replaced (with `force`), and staged files renamed into place. Returns
+/// the sorted list of written paths.
+fn place_staged(
+    staged: &[(String, PathBuf)],
+    dest_dir: &Path,
+    force: bool,
+) -> Result<Vec<PathBuf>> {
+    for (name, _) in staged {
+        check_ancestors(dest_dir, name, false)?;
+        check_target(&dest_dir.join(name), force)?;
+    }
+
+    let mut written = Vec::with_capacity(staged.len());
+    for (name, stage_path) in staged {
+        let target = dest_dir.join(name);
+        check_ancestors(dest_dir, name, true)?;
+        if force && target.symlink_metadata().is_ok() {
+            // Pre-checked: only a regular file reaches this point.
+            std::fs::remove_file(&target).map_err(|e| io_err(&target, e))?;
+        }
+        std::fs::rename(stage_path, &target).map_err(|e| io_err(&target, e))?;
+        written.push(target);
+    }
+    written.sort();
+    Ok(written)
+}
+
+/// Verify then extract a bundle into `dest_dir` in a single streaming
+/// pass: entries are written to a staging directory inside `dest_dir`
+/// (cleaned up on drop) while their SHA-256 is computed, and only if the
+/// integrity check passes are they moved into place — a tampered bundle
+/// never leaves extracted files behind. Entry names are re-validated,
+/// symlinks in the destination are never followed, and existing files
+/// are not overwritten unless `force` is set. Returns extracted paths.
 pub fn extract_bundle<P: AsRef<Path>>(
     bundle_path: P,
     dest_dir: P,
@@ -469,9 +641,78 @@ pub fn extract_bundle<P: AsRef<Path>>(
     let bundle_path = bundle_path.as_ref();
     let dest_dir = dest_dir.as_ref();
 
+    std::fs::create_dir_all(dest_dir).map_err(|e| io_err(dest_dir, e))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".lens-extract-")
+        .tempdir_in(dest_dir)
+        .map_err(|e| io_err(dest_dir, e))?;
+
+    let mut file_hashes: HashMap<String, String> = HashMap::new();
+    let mut manifest_content: Option<Vec<u8>> = None;
+    let mut manifest_count = 0usize;
+    let mut staged: Vec<(String, PathBuf)> = Vec::new();
+
+    stream_entries(bundle_path, |name, reader, _size| {
+        let name = normalize_entry_name(name);
+        if !valid_entry_name(name) {
+            return Err(LensError::InvalidInput {
+                message: format!("unsafe bundle entry name: {:?}", name),
+            });
+        }
+        // Belt-and-braces: join+normalize again, ensure it stays under dest.
+        let target = dest_dir.join(name);
+        let normalized_target = normalize_path_str(&target.to_string_lossy());
+        let normalized_dest = normalize_path_str(&dest_dir.to_string_lossy());
+        if !format!("{normalized_target}/").starts_with(&format!("{normalized_dest}/")) {
+            return Err(LensError::InvalidInput {
+                message: format!("entry {:?} escapes destination", name),
+            });
+        }
+        let stage_path = staging.path().join(name);
+        if let Some(parent) = stage_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        }
+        if name == MANIFEST_ENTRY {
+            // Only an exact top-level `manifest.json` is the manifest.
+            manifest_count += 1;
+            let mut content = Vec::new();
+            reader
+                .take(MAX_BUNDLE_BYTES)
+                .read_to_end(&mut content)
+                .map_err(|e| io_err(bundle_path, e))?;
+            std::fs::write(&stage_path, &content).map_err(|e| io_err(&stage_path, e))?;
+            manifest_content = Some(content);
+            staged.push((name.to_string(), stage_path));
+            return Ok(());
+        }
+        // Stage the entry while hashing it — one pass over the bytes.
+        let mut file = File::create(&stage_path).map_err(|e| io_err(&stage_path, e))?;
+        let mut hasher = crate::hash::IncrementalHasher::new();
+        let mut limited = reader.take(MAX_BUNDLE_BYTES);
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = limited.read(&mut buf).map_err(|e| io_err(bundle_path, e))?;
+            if n == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| io_err(&stage_path, e))?;
+            hasher.update(&buf[..n]);
+        }
+        let hash = hasher.finish();
+        let key = name.to_string();
+        if file_hashes.insert(key.clone(), hash).is_some() {
+            // Duplicate entry name — archive is not reproducible evidence.
+            file_hashes.insert(key, "DUPLICATE".to_string());
+        }
+        staged.push((name.to_string(), stage_path));
+        Ok(())
+    })?;
+
     // Evidence integrity first: never extract a bundle that fails
-    // verification.
-    let report = verify_bundle_archive(bundle_path)?;
+    // verification. The staging dir is dropped (and removed) on error,
+    // so nothing staged survives a failed check.
+    let report =
+        evaluate_bundle_contents(bundle_path, file_hashes, manifest_content, manifest_count);
     if !report.is_valid {
         return Err(LensError::InvalidInput {
             message: format!(
@@ -488,45 +729,7 @@ pub fn extract_bundle<P: AsRef<Path>>(
         });
     }
 
-    std::fs::create_dir_all(dest_dir).map_err(|e| io_err(dest_dir, e))?;
-    let mut written = Vec::new();
-    stream_entries(bundle_path, |name, reader, _size| {
-        let name = normalize_entry_name(name);
-        if !valid_entry_name(name) {
-            return Err(LensError::InvalidInput {
-                message: format!("unsafe bundle entry name: {:?}", name),
-            });
-        }
-        let target = dest_dir.join(name);
-        // Belt-and-braces: join+normalize again, ensure it stays under dest.
-        let normalized_target = normalize_path_str(&target.to_string_lossy());
-        let normalized_dest = normalize_path_str(&dest_dir.to_string_lossy());
-        if !format!("{normalized_target}/").starts_with(&format!("{normalized_dest}/")) {
-            return Err(LensError::InvalidInput {
-                message: format!("entry {:?} escapes destination", name),
-            });
-        }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-        }
-        if !force && target.symlink_metadata().is_ok() {
-            return Err(LensError::InvalidInput {
-                message: format!("{:?} already exists; pass --force to overwrite", target),
-            });
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&target)
-            .map_err(|e| io_err(&target, e))?;
-        std::io::copy(&mut reader.take(MAX_BUNDLE_BYTES), &mut file)
-            .map_err(|e| io_err(&target, e))?;
-        written.push(target);
-        Ok(())
-    })?;
-    written.sort();
-    Ok(written)
+    place_staged(&staged, dest_dir, force)
 }
 
 /// Lexically normalize a path string (`.`/`..`/`//` collapsed).
@@ -572,7 +775,8 @@ mod tests {
     fn test_create_verify_roundtrip() {
         let tmp = NamedTempFile::new().unwrap();
         let manifest =
-            create_bundle_archive(tmp.path(), "0.5.0-test", &sample_artifacts(), vec![]).unwrap();
+            create_bundle_archive(tmp.path(), "0.5.0-test", &sample_artifacts(), vec![], true)
+                .unwrap();
 
         assert_eq!(manifest.schema, BUNDLE_SCHEMA_V2);
         assert_eq!(manifest.sources.len(), 2);
@@ -622,7 +826,7 @@ mod tests {
     #[test]
     fn test_verify_detects_tampering() {
         let tmp = NamedTempFile::new().unwrap();
-        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![]).unwrap();
+        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![], true).unwrap();
 
         // Rebuild the archive deterministically with one artifact's payload
         // altered — bit-flipping the compressed stream is unreliable (the
@@ -644,7 +848,7 @@ mod tests {
     #[test]
     fn test_verify_rejects_spoofed_nested_manifest() {
         let tmp = NamedTempFile::new().unwrap();
-        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![]).unwrap();
+        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![], true).unwrap();
 
         // Attack: tamper an artifact, then append an `evil/manifest.json`
         // claiming the tampered hash. An older suffix-match verifier would
@@ -678,7 +882,7 @@ mod tests {
     #[test]
     fn test_verify_rejects_unlisted_entries() {
         let tmp = NamedTempFile::new().unwrap();
-        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![]).unwrap();
+        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![], true).unwrap();
 
         rebuild_with(tmp.path(), |entries| {
             entries.push((
@@ -701,7 +905,7 @@ mod tests {
                 data: b"{}".to_vec(),
             }];
             assert!(
-                create_bundle_archive(tmp.path(), "x", &artifacts, vec![]).is_err(),
+                create_bundle_archive(tmp.path(), "x", &artifacts, vec![], true).is_err(),
                 "{bad} should be rejected"
             );
         }
@@ -721,7 +925,7 @@ mod tests {
                 data: b"{}".to_vec(),
             },
         ];
-        assert!(create_bundle_archive(&out, "x", &artifacts, vec![]).is_err());
+        assert!(create_bundle_archive(&out, "x", &artifacts, vec![], false).is_err());
         assert!(!out.exists());
         assert!(!dir.path().join("out.lens.tmp").exists());
     }
@@ -729,7 +933,7 @@ mod tests {
     #[test]
     fn test_read_bundle_entry() {
         let tmp = NamedTempFile::new().unwrap();
-        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![]).unwrap();
+        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![], true).unwrap();
 
         let bytes = read_bundle_entry(tmp.path(), "reports/disk_snapshot.json").unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -745,7 +949,7 @@ mod tests {
     fn test_extract_verifies_and_writes() {
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("b.lens");
-        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![]).unwrap();
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
 
         let dest = dir.path().join("out");
         let written = extract_bundle(&bundle, &dest, false).unwrap();
@@ -762,7 +966,7 @@ mod tests {
     fn test_extract_refuses_tampered_bundle() {
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("b.lens");
-        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![]).unwrap();
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
         rebuild_with(&bundle, |entries| {
             for (name, data) in entries.iter_mut() {
                 if name == "reports/disk_snapshot.json" {
@@ -831,5 +1035,142 @@ mod tests {
         let dest = dir.path().join("out");
         assert!(extract_bundle(&bundle, &dest, true).is_err());
         assert!(!dir.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn test_create_no_overwrite_refuses_existing_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("b.lens");
+        create_bundle_archive(&out, "x", &sample_artifacts(), vec![], false).unwrap();
+        let original = std::fs::read(&out).unwrap();
+
+        // Without overwrite, create refuses and the original is intact.
+        let err = create_bundle_archive(&out, "x", &sample_artifacts(), vec![], false).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(std::fs::read(&out).unwrap(), original);
+
+        // With overwrite it succeeds.
+        create_bundle_archive(&out, "x", &sample_artifacts(), vec![], true).unwrap();
+    }
+
+    #[test]
+    fn test_create_refuses_bundles_over_verify_entry_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("big.lens");
+        let artifacts: Vec<BundleArtifact> = (0..MAX_BUNDLE_ENTRIES)
+            .map(|i| BundleArtifact {
+                name: format!("reports/f{i}.json"),
+                data: b"{}".to_vec(),
+            })
+            .collect();
+        let err = create_bundle_archive(&out, "x", &artifacts, vec![], false).unwrap_err();
+        assert!(
+            matches!(err, LensError::LimitExceeded { .. }),
+            "expected LimitExceeded, got {err:?}"
+        );
+        assert!(!out.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_refuses_symlinked_ancestor_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("b.lens");
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
+
+        // dest/reports is a symlink out of the destination: extraction
+        // must refuse rather than write through it.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("reports")).unwrap();
+
+        for force in [false, true] {
+            let err = extract_bundle(&bundle, &dest, force).unwrap_err();
+            assert!(err.to_string().contains("symlink"), "{err}");
+            // Nothing was written outside, and the symlink is untouched.
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+            assert!(dest
+                .join("reports")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_refuses_to_overwrite_symlink_target_even_with_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("b.lens");
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
+
+        // An attacker-planted symlink where an entry would land: force
+        // must not remove it or write through it.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        let dest = dir.path().join("out");
+        let reports = dest.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::os::unix::fs::symlink(&victim, reports.join("disk_snapshot.json")).unwrap();
+
+        let err = extract_bundle(&bundle, &dest, true).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(reports
+            .join("disk_snapshot.json")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn test_extract_conflict_aborts_before_placing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("b.lens");
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
+
+        // dest already holds reports/net_report.json but not the other
+        // entry: the conflict must abort the whole placement — the
+        // earlier-staged disk_snapshot.json is not written either.
+        let dest = dir.path().join("out");
+        let reports = dest.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(reports.join("net_report.json"), "keep").unwrap();
+
+        let err = extract_bundle(&bundle, &dest, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(!reports.join("disk_snapshot.json").exists());
+        assert!(!dest.join("manifest.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(reports.join("net_report.json")).unwrap(),
+            "keep"
+        );
+        // And the staging dir was cleaned up.
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_extract_tampered_bundle_leaves_dest_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("b.lens");
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
+        rebuild_with(&bundle, |entries| {
+            for (name, data) in entries.iter_mut() {
+                if name == "reports/disk_snapshot.json" {
+                    data[0] ^= 0xFF;
+                }
+            }
+        });
+
+        let dest = dir.path().join("out");
+        assert!(extract_bundle(&bundle, &dest, false).is_err());
+        // Staging happened inside dest and was cleaned on drop: no
+        // extracted files and no leftover `.lens-extract-*` dirs.
+        assert!(dest.exists());
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
     }
 }

@@ -20,16 +20,25 @@ Lens는 단일 Rust 워크스페이스다. 각 `lens-*` 크레이트가 하나�
 | `diff` | `Compatibility` 3상태 enum, `SetDiff<T>` |
 | `evidence` | `Evidence`, `Source`, 상한 있는 `BoundedCollector` |
 | `json` | 결정론적 JSON 직렬화(키 정렬) |
+| `glob` | `*`/`?` 미니 글롭(`glob_match`) — `--exclude` 패턴과 테스트 입력 글롭이 공유 |
 | `time` | UTC/로컬 ISO-8601 타임스탬프 유틸 |
 | `bundle` | `lens.bundle/v2` — tar.gz + `manifest.json`(SHA-256, 크기·항목 상한) 생성/검사/검증, `read_bundle_entry`(단일 엔트리 추출), `extract_bundle`(검증 우선 + 이름 검증 + `--force` 없이 덮어쓰기 거부) |
 
 ## lens-disk — 파일시스템 분석
 
 - `ArenaTree`: `u32` 인덱스 연속 아레나. 자식 삽입 O(1)(`last_child`),
-  크기 집계는 반복형 post-order(깊은 트리 스택 안전).
+  크기 집계는 반복형 post-order(깊은 트리 스택 안전). 디렉터리 집계에서
+  `hard_link_count > 1`인 같은 inode는 노드 id 순 첫 등장만 합산한다 —
+  파일 노드 자체는 각자 크기를 유지하고, `(0,0)` identity는 절대
+  중복 제거하지 않는다.
 - `DiskScanner`: 최대 깊이/항목 수, 제외 패턴, 마운트 경계(`one_file_system`),
   심볼링크 루프 감지(링크 **타깃**의 dev/ino 사용). `ScanOptions::parallel`이
-  실제 rayon 병렬 stat을 수행.
+  실제 rayon 병렬 stat을 수행. `exclude_patterns`는 `lens-core`의
+  `glob_match` 규칙 — `/` 포함은 루트 상대 경로 glob, `*`/`?` 포함은 이름
+  glob, 나머지는 이름 정확 일치(`.git`이 `.github`를 제외하지 않음).
+  `depth_limit_is_error`(기본 true)가 false면 `max_depth` 도달이 스캔
+  오류로 기록되지 않고 `complete`를 깎지 않는다 — 절단된 디렉터리 수는
+  `ScanResult::depth_limited`로 양쪽 모드에서 집계된다.
 - `DuplicateFinder`: 크기→inode 묶음→4KB 부분 해시→전체 SHA-256 순으로 필터.
   같은 inode의 하드링크는 회수 가능 용량에서 중복 계산하지 않는다.
   `find_in_tree`는 `DuplicateReport`(groups + 해시 실패 `errors` +
@@ -73,7 +82,9 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   미판별 줄은 `include_unknown`으로 복원). `matches_line`은 no-op
   필터와 substring-only 거절을 파싱 없이 단락.
 - `timestamp`: `--since/--until` 인자 파서(RFC 3339/오프셋 없는
-  ISO/날짜만 — UTC 해석)와 줄 타임스탬프 추출기(ISO·syslog 접두사,
+  ISO/날짜만 — UTC 해석), 줄 타임스탬프 추출기(ISO·syslog 접두사,
+  epoch ms → RFC 3339 변환 헬퍼(`format_rfc3339_ms`/`_secs`) — `log
+  stats`의 버킷 라벨에 사용),
   JSONL `ts`/`time`/`timestamp`). 연도 없는 syslog는 `default_syslog_year()`
   = 현재 UTC 연도, `--year`/`syslog_year`로 재정의.
 - 스키마: `loglens.session/v2`.
@@ -160,13 +171,52 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   `uninspectable_processes`를 기록.
 - 스키마: `lens.net/v1`(additive 필드만 추가).
 
+## lens-ops — 공유 오퍼레이션 레이어
+
+- `lens-cli`와 `lens-mcp`가 공유하는 수집+판정 로직. 각 오퍼레이션은
+  `Result<Report<T>>`를 반환: `data`(도메인 결과) + `findings`
+  (`Severity` Info/Warn/Fail + 안정적 `code`) + `complete`(증거 불완전
+  여부) + `diagnostics`.
+- `Report::is_actionable(threshold)`이 "종료 코드 1" 판정의 단일 근거 —
+  불완전 증거는 항상 actionable.
+- 모듈: `disk`, `abi`, `log`(`open`/`build_filter`), `test`(파일/디렉터리/
+  글롭 입력), `trace`(fail-closed 입력 검증), `sys`, `build`, `env`,
+  `net`, `bundle`(수집기+검증/해제 래퍼+번들간 diff), `doctor`, `json`
+  (스키마 검증 포함 JSON 로더), `detect`(`lens inspect`/`diff`용 입력
+  자동 판별 — 확장자·매직·처음 64 KiB 내용으로 `InputKind` 결정).
+- `env::diff`는 스냅샷 JSON과 venv 디렉터리를 혼합해 받는다(디렉터리는
+  그 자리에서 inspect). `disk::duplicates`는 `ScanOptions`를 통째로 받는다.
+- 모든 도메인 diff는 값 수준 분류기(`diff_values`/`diff_runs`/
+  `diff_snapshots`)로 분리돼 있어 파일 diff와 `bundle::diff`가 같은
+  findings 코드를 공유한다. `bundle::diff`는 양쪽 번들을 무결성 검증
+  후 공통 섹션을 비교하고 `lens.bundle-diff/v1`을 만든다.
+- `doctor`는 실마운트별 용량+inode 검사(`/proc/self/mounts`,
+  가상 fs 제외·fsid 중복 제거), world-writable PATH 검사, WARN/FAIL
+  검사의 `next_command` 제안, `doctor::diff_reports` 리포트 비교를
+  제공한다.
+- `log`은 `expand_inputs`(다중 경로·glob·`-` 중복 거부), `Follower`
+  (byte-offset + (dev,inode) 추적으로 append/부분 줄/truncate/rotate
+  처리), `stats`(`lens.log-stats/v1` 레벨 분포+자동 버킷 히스토그램)
+  까지 제공한다.
+- clap·출력 없음 — 프레젠테이션은 소비자 책임.
+
 ## lens-cli — `lens` 통합 CLI
 
-- `src/cli.rs`: clap 커맨드 트리. `src/ops.rs`: 전 서브커맨드 디스패치
-  (라이브러리로 공개 — lens-mcp가 재사용). `main.rs`는 얇은 래퍼.
-- `doctor`: 스토리지/네트워크/서비스/환경 종합 헬스체크(`--json`,
-  `--fail-on` 지원).
-- `bundle create/inspect/verify/show/extract`: `lens.bundle/v2` 아카이브.
+- `src/cli.rs`: clap 커맨드 트리. `src/ops.rs`: 렌더러 — `lens-ops`
+  결과를 text/JSON으로 출력하고 `is_actionable`을 종료 코드로 변환.
+  `main.rs`는 얇은 래퍼.
+- 전역 옵션(`--format`, `--json`, `--fail-on warn|fail`, `-q/--quiet`)은
+  `Cli`의 global 인자라 서브커맨드 앞·뒤 모두에서 동작한다.
+  `-q`는 `output::diagln!`으로 찍는 비오류 stderr 진단만 끈다.
+- 최상위 `inspect`/`diff`: `lens_ops::detect`로 입력을 판별해 동등한
+  도메인 명령으로 재디스패치한다(출력·종료 코드 동일, `--as`로 강제).
+- `doctor`: 스토리지/네트워크/서비스/환경 종합 헬스체크(구현은
+  `lens-ops`에 있고 `lens_cli::doctor`로 re-export된다).
+- text 모드에서는 도메인 출력 뒤에 `Findings:` 블록([FAIL]/[WARN])
+  이 출력된다. JSON 출력에는 findings가 섞이지 않는다.
+- `bundle create/inspect/verify/show/extract/diff`: `lens.bundle/v2`
+  아카이브(`diff`는 `lens.bundle-diff/v1` 출력). `snapshot`은 호스트
+  기준선 번들(host/net/sys/doctor 자동 수집).
 - `tui`: `lens_tui::run`으로 진입. `completion`: 셸 자동완성 생성.
 
 ## lens-tui — 터미널 대시보드
@@ -181,18 +231,32 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
 
 ## lens-mcp — MCP 서버
 
-- JSON-RPC 2.0 over stdio로 진단 툴을 노출. `initialize`는 요청된
-  `protocolVersion`을 에코하고, 도구 실패는 `result.isError`로 반환한다.
-- 모든 도구에 `limit`/`offset` 페이지네이션(배열 끝 `_truncated` 마커,
-  응답 상한 64KiB). 상대 경로는 서버 cwd 기준.
+- JSON-RPC 2.0 over stdio로 진단 툴을 노출. `initialize`는 지원 버전
+  (`2025-06-18`, `2025-03-26`, `2024-11-05`) 중 요청된 것을 에코하고,
+  미지원/누락이면 `2025-06-18`로 응답한다. `id` 없는 요청(노티피케이션)
+  에는 응답하지 않는다. 도구 실패는 `result.isError`로 반환한다.
+- 도구 결과의 첫 content 아이템은 데이터 JSON, findings/불완전 증거가
+  있으면 두 번째 아이템으로 `{"findings":[...], "complete":bool}`을
+  추가한다.
+- 모든 도구에 `limit`(배열당 최대, 기본 200)/`page_path`/`offset`
+  페이지네이션: `offset`은 `page_path`가 가리키는 배열에만 적용되고,
+  잘린 배열은 최상위 `_pagination`(`path → {total, returned, offset}`)
+  로 보고된다 — 배열 안에 마커 객체를 넣지 않는다. `[]` 경로는 모든
+  발생의 합계를 낸다. 응답 상한 64KiB 초과 시 limit 25로 재시도하고
+  `_response_clamped: true`. 상대 경로는 서버 cwd 기준.
 - `lens_log_filter`는 `tail`(끝 N라인), `regex`, `min_level`,
-  `include_unknown`, `limit`/`offset`을 지원한다.
+  `include_unknown`을 지원하고 `matches`를 자체 페이징한다
+  (`limit`/`offset`).
+- `--allow-root DIR`(반복)로 모든 도구 경로 인자를 canonicalize된
+  루트 안으로 제한한다 — 벗어나는 경로는 in-band 도구 오류. `prompts`
+  capability로 `incident-triage`·`compare-snapshots` 프롬프트를
+  노출한다(`prompts/list`/`prompts/get`).
 
 | 툴 | 용도 |
 |---|---|
 | `lens_disk_scan`, `lens_disk_duplicates` | 스토리지 분석/중복 탐지 |
 | `lens_abi_inspect`, `lens_abi_diff` | ELF/심볼/버전/DWARF 검사·비교 |
-| `lens_log_filter` | 로그 필터(tail/regex/페이지) |
+| `lens_log_filter`, `lens_log_stats` | 로그 필터(tail/regex/페이지)/레벨·히스토그램 집계 |
 | `lens_trace_analyze` | strace 분석 |
 | `lens_sys_cycles`, `lens_sys_diff` | systemd 사이클/스냅샷 비교 |
 | `lens_test_diff` | JUnit 회귀 diff |
@@ -200,7 +264,7 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
 | `lens_build_impact` | 헤더 영향도 |
 | `lens_env_check` | venv 의존성 검사 |
 | `lens_net_inspect` | 소켓/리스너 검사 |
-| `lens_bundle_verify` | 번들 무결성 검증 |
+| `lens_bundle_verify`, `lens_bundle_diff` | 번들 무결성 검증/섹션 비교 |
 | `lens_doctor` | 종합 진단(잘못된 경로 → isError) |
 
 ```json

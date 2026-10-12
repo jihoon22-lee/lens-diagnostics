@@ -1,9 +1,53 @@
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
+use lens_mcp::handler::set_allowed_roots;
+use lens_mcp::protocol::{get_prompt, list_prompts};
 use lens_mcp::{execute_tool, list_tools, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 
+const USAGE: &str = "\
+lens-mcp — MCP (JSON-RPC 2.0 over stdio) server exposing the lens toolkit.
+
+Usage: lens-mcp [--allow-root DIR]...
+
+Options:
+  --allow-root DIR   Restrict all tool path arguments to DIR (repeatable).
+                     Paths are canonicalized; a path resolving outside every
+                     allowed root is rejected with a tool error.
+  -h, --help         Show this help.
+";
+
+/// Parse `--allow-root DIR` (repeatable) and `--help` without pulling in
+/// clap — the binary's interface is otherwise pure stdio JSON-RPC.
+fn parse_args() -> Result<Vec<std::path::PathBuf>, String> {
+    let mut roots = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--allow-root" => {
+                let dir = args
+                    .next()
+                    .ok_or_else(|| "--allow-root requires a directory argument".to_string())?;
+                roots.push(std::path::PathBuf::from(dir));
+            }
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(roots)
+}
+
 fn main() -> io::Result<()> {
+    match parse_args().and_then(set_allowed_roots) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -18,7 +62,30 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
+        let parsed: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                let err_resp = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: None,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32700,
+                        message: format!("Parse error: {}", e),
+                        data: None,
+                    }),
+                };
+                let out = serde_json::to_string(&err_resp)?;
+                writeln!(stdout, "{}", out)?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+        // `"id": null` and a missing `id` differ in JSON-RPC: the null
+        // is a present id (response carries `id: null`), absence makes
+        // the request a notification (no response at all).
+        let id_present = parsed.get("id").is_some();
+        let req: JsonRpcRequest = match serde_json::from_value(parsed) {
             Ok(r) => r,
             Err(e) => {
                 let err_resp = JsonRpcResponse {
@@ -38,7 +105,7 @@ fn main() -> io::Result<()> {
             }
         };
 
-        let resp = handle_request(&req);
+        let resp = handle_request(&req, id_present);
         if let Some(r) = resp {
             let out = serde_json::to_string(&r)?;
             writeln!(stdout, "{}", out)?;
@@ -49,26 +116,37 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+/// Protocol versions this server speaks. Echoed back when the client
+/// asks for one of them; anything else (or a missing version) gets the
+/// newest supported one.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+fn handle_request(req: &JsonRpcRequest, id_present: bool) -> Option<JsonRpcResponse> {
+    // A JSON-RPC notification (no `id` member) never gets a response —
+    // for any method, including tools/call and unknown methods. An
+    // `id` member that IS present (even null) expects a response whose
+    // `id` echoes it (`Some(Value::Null)` → `"id":null`).
+    if !id_present {
+        return None;
+    }
+    let rid = Some(req.id.clone().unwrap_or(Value::Null));
     match req.method.as_str() {
         "initialize" => {
-            // Protocol negotiation: echo the client's requested version
-            // (we implement the tools/call surface identically for all
-            // 2024-11-05+ clients); fall back to our baseline when the
-            // request omits it.
             let protocol_version = req
                 .params
                 .as_ref()
                 .and_then(|p| p.get("protocolVersion"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("2024-11-05");
+                .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+                .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0]);
             Some(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
-                id: req.id.clone(),
+                id: rid.clone(),
                 result: Some(serde_json::json!({
                     "protocolVersion": protocol_version,
                     "capabilities": {
-                        "tools": {}
+                        "tools": {},
+                        "prompts": {}
                     },
                     "serverInfo": {
                         "name": "lens-mcp",
@@ -82,7 +160,7 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
         // MCP ping: an empty result keeps the session liveness check cheap.
         "ping" => Some(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
-            id: req.id.clone(),
+            id: rid.clone(),
             result: Some(serde_json::json!({})),
             error: None,
         }),
@@ -90,12 +168,41 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
             let tools = list_tools();
             Some(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
-                id: req.id.clone(),
+                id: rid.clone(),
                 result: Some(serde_json::json!({
                     "tools": tools
                 })),
                 error: None,
             })
+        }
+        "prompts/list" => Some(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: rid.clone(),
+            result: Some(list_prompts()),
+            error: None,
+        }),
+        "prompts/get" => {
+            let params = req.params.as_ref().unwrap_or(&Value::Null);
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params.get("arguments").unwrap_or(&Value::Null);
+            match get_prompt(name, args) {
+                Ok(prompt) => Some(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: rid.clone(),
+                    result: Some(prompt),
+                    error: None,
+                }),
+                Err(e) => Some(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: rid.clone(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: e,
+                        data: None,
+                    }),
+                }),
+            }
         }
         "tools/call" => {
             let params = req.params.as_ref().unwrap_or(&Value::Null);
@@ -108,7 +215,7 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
             if !list_tools().iter().any(|t| t.name == name) {
                 Some(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
-                    id: req.id.clone(),
+                    id: rid.clone(),
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32602,
@@ -118,22 +225,30 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                 })
             } else {
                 match execute_tool(name, args) {
-                    Ok(text) => Some(JsonRpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: req.id.clone(),
-                        result: Some(serde_json::json!({
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": text
-                                }
-                            ]
-                        })),
-                        error: None,
-                    }),
+                    Ok(output) => {
+                        // First content item is the data JSON; when the
+                        // operation produced findings or incomplete
+                        // evidence a second item carries them.
+                        let mut content = vec![serde_json::json!({
+                            "type": "text",
+                            "text": output.data
+                        })];
+                        if let Some(f) = output.findings {
+                            content.push(serde_json::json!({
+                                "type": "text",
+                                "text": f
+                            }));
+                        }
+                        Some(JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: rid.clone(),
+                            result: Some(serde_json::json!({ "content": content })),
+                            error: None,
+                        })
+                    }
                     Err(err) => Some(JsonRpcResponse {
                         jsonrpc: "2.0".to_string(),
-                        id: req.id.clone(),
+                        id: rid.clone(),
                         result: Some(serde_json::json!({
                             "content": [
                                 {
@@ -148,9 +263,9 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                 }
             }
         }
-        _ => req.id.as_ref().map(|id| JsonRpcResponse {
+        _ => Some(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
-            id: Some(id.clone()),
+            id: rid,
             result: None,
             error: Some(JsonRpcError {
                 code: -32601,

@@ -100,10 +100,16 @@ impl LogIndexer {
             });
         }
 
-        let lossy_lines = spans
-            .iter()
-            .filter(|s| std::str::from_utf8(&bytes[s.offset..s.offset + s.length]).is_err())
-            .count();
+        // Fast path: one whole-buffer UTF-8 check instead of a per-line
+        // one — the overwhelmingly common case is fully valid input.
+        let lossy_lines = if std::str::from_utf8(bytes).is_ok() {
+            0
+        } else {
+            spans
+                .iter()
+                .filter(|s| std::str::from_utf8(&bytes[s.offset..s.offset + s.length]).is_err())
+                .count()
+        };
 
         Self {
             data,
@@ -144,6 +150,17 @@ impl LogIndexer {
     pub fn get_raw_bytes(&self, index: usize) -> Option<&[u8]> {
         let span = self.spans.get(index)?;
         Some(&self.data.data()[span.offset..span.offset + span.length])
+    }
+
+    /// Byte offset where `index`'s line starts in the backing buffer —
+    /// used by `--follow` to resume exactly at an unterminated tail.
+    pub fn line_offset(&self, index: usize) -> Option<usize> {
+        self.spans.get(index).map(|s| s.offset)
+    }
+
+    /// The full backing bytes — decoded content for `.gz`/stdin inputs.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.data.data()
     }
 }
 

@@ -6,6 +6,48 @@ pub use diff::diff_snapshots;
 pub use model::*;
 pub use parser::{parse_strace_line, TraceAnalyzer};
 
+/// The input text was readable but is not usable strace output —
+/// either empty of recognizable lines or mostly unparseable.
+#[derive(Debug)]
+pub struct TraceInputError {
+    message: String,
+}
+
+impl TraceInputError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl std::fmt::Display for TraceInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TraceInputError {}
+
+/// Analyze strace text and fail closed when it is not strace output:
+/// a snapshot built mostly from unparsed lines is meaningless, so
+/// callers (CLI `trace analyze`/`diff`, `bundle create --trace`, MCP)
+/// share this gate instead of analyzing anything readable.
+pub fn analyze_strace_text(content: &str) -> Result<TraceSnapshot, TraceInputError> {
+    let snapshot = TraceAnalyzer::new().analyze_lines(content.lines());
+    let unparsed = snapshot.total_events.saturating_sub(snapshot.total_calls);
+    if snapshot.total_events == 0 {
+        return Err(TraceInputError::new(
+            "contains no recognizable strace lines".to_string(),
+        ));
+    }
+    if unparsed > snapshot.total_calls {
+        return Err(TraceInputError::new(format!(
+            "does not look like strace output: {} of {} lines failed to parse",
+            unparsed, snapshot.total_events
+        )));
+    }
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

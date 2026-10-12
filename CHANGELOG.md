@@ -2,6 +2,159 @@
 
 Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.Z` 형식이다.
 
+## Unreleased
+
+### 추가
+
+- 새 크레이트 `lens-ops`: 수집+판정 로직을 `Report<T>`(`findings`,
+  `complete`, `diagnostics`)로 반환하는 공유 오퍼레이션 레이어.
+  `lens-cli`와 `lens-mcp`가 더 이상 도메인 로직을 복제하지 않고 같은
+  구현을 소비한다. `doctor` 구현도 이 크레이트로 이동했다.
+- text 모드 출력에 `Findings:` 블록 — 도메인 출력 뒤에
+  `Findings: N fail, M warn`과 `[FAIL]`/`[WARN]` 항목(안정적 `code` +
+  메시지)을 출력한다. JSON 출력은 변경되지 않는다.
+- MCP 도구 결과에 findings 두 번째 content 아이템 — findings 또는
+  불완전 증거가 있으면 `{"findings": [...], "complete": bool}` JSON이
+  데이터 아이템 뒤에 추가된다.
+- MCP `page_path` 페이지네이션 인자 — `offset`을 적용할 배열을 점
+  경로로 지정한다(배열 원소 내부는 `units[].diagnostics`처럼 `[]`).
+- diff 입력 스키마 검증 — `env diff`/`sys diff`/`net diff`가 스냅샷
+  JSON의 `schema`/`schema_version`을 생산자 값과 비교하고, 다른
+  스키마의 파일을 넣으면 `expected schema` 오류(exit 2)로 거부한다.
+- MCP `lens_test_diff`가 글롭 입력도 받는다(CLI와 같은 입력 확장).
+- 전역 CLI 옵션: `--format text|json|jsonl`, `--json`, `--fail-on
+  warn|fail`, `-q/--quiet`가 `Cli`의 global 인자가 됐다 — 서브커맨드
+  앞·뒤 어느 쪽에 두어도 동일하게 파싱된다. `-q`는 비오류 stderr
+  진단만 끄고 stdout과 실제 오류 출력은 그대로다.
+- 최상위 `lens inspect <path>` / `lens diff <a> <b>`: 입력을 자동
+  판별(ELF·JUnit·strace·compile_commands·venv·systemd·스냅샷
+  JSON·번들·로그·디렉터리)해 해당 도메인 명령과 동일한 출력·종료
+  코드를 낸다. `--as`로 판별을 강제할 수 있다.
+- `disk duplicates`에 `--exclude`(반복), `-x/--one-file-system`,
+  `--max-depth` 추가 — `disk scan`과 같은 스캔 범위 제한을 지원한다.
+- `env diff`와 `lens diff`가 venv 디렉터리를 입력으로 받는다 —
+  디렉터리는 그 자리에서 inspect돼 스냅샷 JSON과 자유롭게 혼합된다.
+- `lens snapshot`: `snapshot-<hostname>-<UTC>.lens` 기준선 번들 —
+  호스트/네트워크/systemd/doctor 리포트와 syslog를 항상 수집하고,
+  `--disk`/`--env`/`--test`/`--trace`/`--log`로 소스를 추가한다.
+  `bundle create`에도 `--doctor`로 doctor 리포트를 넣을 수 있다.
+- `lens bundle diff <a> <b>`와 `lens diff a.lens b.lens`: 두 번들을
+  무결성 검증 후 공통 섹션(sys/test/trace/env/net/doctor/disk/log)을
+  도메인 diff 분류기로 비교한다 — findings 코드는 파일 diff와 동일.
+  출력 스키마는 `lens.bundle-diff/v1`, 한쪽에만 있는 엔트리는
+  `bundle.only_in_*` Info.
+- MCP `lens_bundle_diff` 도구(도구 수 15 → 16).
+- `log filter`/`log inspect`/`log stats`가 다중 입력을 받는다 — 각
+  항목은 `-`, 파일, `.gz`, `*`/`?` 파일명 glob. 다중 입력 시
+  `--limit`은 전체 합산, text는 `[<file>:<line>]` 접두사, jsonl은
+  `"file"` 필드, json은 `{"inputs": […], "matched", "total"}`.
+- `log filter --follow`(`-f`): 초기 필터 패스 뒤 파일을 폴링해 추가
+  줄을 같은 필터로 낸다 — truncate/rotate 시 처음부터 재개하며
+  stderr에 안내. 정규 파일 하나, `--context 0`, text/jsonl에서만
+  유효.
+- `lens log stats`: 필터가 통과시킨 줄의 레벨 분포 + 시간 히스토그램
+  (`lens.log-stats/v1`, `--bucket 1m|5m|15m|1h|1d`, 미지정 시 ~60
+  버킷이 되도록 자동 선택).
+- MCP `lens_log_stats` 도구(도구 수 16 → 17), `lens-mcp --allow-root
+  DIR` 경로 샌드박스(반복 가능 — canonicalize된 루트 밖 경로는
+  도구 오류로 거부), `prompts` capability(`incident-triage`,
+  `compare-snapshots`).
+- doctor: 실마운트별 용량 검사(`/proc/self/mounts`의 실파일시스템,
+  `/`는 `Root Disk Capacity`) + inode 여유율(<5% Fail, <15% Warn) +
+  world-writable PATH 디렉터리 WARN + WARN/FAIL 검사의 `-> Next:`
+  명령 제안(`lens disk scan <mount> --top 20` 등). `DoctorCheck`에
+  `next_command` 필드 추가(스키마 additive).
+
+### 수정
+
+- `lens` stdout이 이제 64 KiB 버퍼로 출력된다 — 라인마다 write+flush
+  하던 것을 없애 `log filter` 등 대량 출력이 빨라졌다. stdout 쓰기
+  실패 시 종료 코드가 1에서 2로 변경됐다(1은 findings 전용).
+- `bundle create --test`가 디렉터리·glob 입력을 받는다. 이전에는
+  디렉터리를 주면 `Is a directory` I/O 오류로 수집이 실패했다.
+- `bundle create --log`가 `.gz`와 stdin(`-`)을 올바르게 임베드한다.
+  내용은 해제된 바이트로 저장되며 엔트리 이름은 `.gz` 접미사를 뗀다
+  (`app.log.gz` → `logs/app.log`, stdin은 `logs/stdin.log`). 이전에는
+  압축 바이트의 꼬리를 그대로 넣어 손상된 gzip이 임베드됐고, `-`는
+  파일을 못 찾아 내용이 빠졌다.
+- `trace diff`와 `bundle create --trace`가 `trace analyze`와 같은
+  fail-closed 입력 검증을 적용한다. 비-strace 입력은 diff/analyze에서
+  exit 2이고, 번들에는 진단으로 기록된다.
+- `doctor --root`가 네트워크·서비스 검사를 루트로 스코프한다. 호스트
+  `/proc`와 호스트 systemd 유닛을 더 이상 읽지 않으며, 루트에 없는
+  검사는 새 `SKIP` 상태로 보고한다. 명시한 `--systemd-dir` 로드 실패는
+  PASS 대신 WARN으로 보고한다.
+- MCP `lens_log_filter`가 무효 UTF-8 라인을 lossy로 매칭하고 스캔
+  범위의 `lossy_lines`를 보고한다(이전에는 조용히 건너뛰었다). MCP
+  `lens_trace_analyze`도 같은 fail-closed 게이트를 적용한다.
+- `bundle create`가 verify와 같은 엔트리 수·크기 상한을 사전에
+  강제하고, `--force` 없이는 기존 번들을 덮어쓰지 않는다.
+- `bundle extract`가 단일 패스로 스테이징·검증한다. 목적지의
+  심볼링크는 절대 따라가지 않고(`--force`여도 심볼링크·디렉터리
+  덮어쓰기 거부), 검증 실패 시 스테이징된 파일은 남지 않는다.
+- `disk scan` 디렉터리 집계에서 `hard_link_count > 1`인 같은 inode를
+  한 번만 계산한다 — 하드링크가 있는 트리의 `size`·`allocated_size`
+  합계가 실제 사용량으로 줄어든다(파일 노드 자체는 변경 없음).
+- 사용자가 지정한 `disk scan --max-depth`는 더 이상 스캔 오류가 아니다
+  — `complete`가 true로 유지돼 exit 0이고, 텍스트 출력에 절단된
+  디렉터리 수가 표시된다(기본 안전 상한 512 도달은 여전히 불완전).
+- MCP `initialize`의 프로토콜 협상이 지원 버전(`2025-06-18`,
+  `2025-03-26`, `2024-11-05`)만 에코하고, 미지원·누락 버전에는
+  `2025-06-18`로 응답한다(이전에는 임의 버전을 그대로 에코하고
+  누락 시 `2024-11-05`였다).
+- TUI Logs 탭이 invalid UTF-8 줄도 U+FFFD로 표시한다(이전에는 조용히
+  누락). 명시한 `--log` 파일이 열리지 않으면 상태바에 오류 이유를
+  표시한다.
+- `id` 없는 JSON-RPC 요청(노티피케이션)에는 어떤 메서드에도 응답하지
+  않는다(이전에는 `initialize`/`tools/call` 등에도 응답했다). 파싱
+  오류는 계속 `id: null` 에러를 반환한다.
+- `lens-mcp --allow-root`에서 생략된 경로 인자가 호스트 기본값을 읽지
+  않는다 — `lens_net_inspect`는 `proc_dir`, `lens_doctor`는
+  `root_path`가 필요하다(기본값 자체가 허용 루트 안이면 예외).
+  `lens_build_impact`는 compile DB의 `directory`/`file`/include
+  디렉터리/`-include` 경로를 모두 루트 안으로 검증한다.
+- `lens log stats`가 연도 없는 syslog 타임스탬프를 `--year`에 지정된
+  연도로 집계한다(이전에는 항상 현재 연도로 해석됐다).
+- `lens inspect`/`lens diff` 입력 판별이 `{`로 시작하는 비스냅샷
+  JSON·JSONL을 usage 오류 대신 Log로 판별한다. 이름이 다른 compile
+  DB도 첫 배열 원소를 스트리밍 파싱해 64 KiB를 넘어도 인식한다.
+- `log filter --follow`가 개행 없이 끝나는 마지막 줄을 초기 패스에서
+  내지 않는다 — append로 완성될 때 한 번만 번호가 매겨진다.
+- doctor의 마운트별 용량 검사가 `/`의 파일시스템 ID를 먼저 등록한다 —
+  `/`의 바인드 마운트·서브볼륨이 중복 용량 검사를 만들지 않는다.
+- JSON-RPC 요청의 `"id": null`은 누락된 `id`와 구분된다 — null id에도
+  `id: null`로 응답하고, `id` 멤버가 아예 없을 때만 노티피케이션이다.
+- MCP findings content 아이템이 `limit`(기본 200)으로 제한되고
+  `findings_total`/`findings_truncated`를 보고한다 — 대량 findings가
+  응답 크기 상한을 넘기지 않는다.
+- `bundle diff`가 `./`로 시작하는 엔트리 이름을 verify와 같은 규칙으로
+  정규화한다 — `./reports/…`로 패킹된 번들이 정상 이름의 번들과
+  섹션별로 비교된다(`only_in_*` 오탐 없음).
+
+### Breaking changes
+
+- `doctor` JSON에 `SKIP` 상태와 `summary.skipped` 필드가 추가됐다.
+  비systemd 환경의 services 검사는 PASS 대신 SKIP으로 보고한다.
+- 라이브러리 `lens_core::create_bundle_archive` 시그니처에 `overwrite`
+  매개변수가 추가됐다.
+- 새 exit-1 조건(findings): `disk duplicates` 불완전 스캔/해시 오류,
+  `test parse` 불완전 JUnit, `trace diff` 신규 에러,
+  `sys inspect`/`sys cycles` 사이클, `sys diff` 신규 사이클,
+  `env inspect`/`env check` 누락·충돌, `net diff` 신규 리스너,
+  `bundle create` 수집 경고(번들은 계속 생성되나 exit 1).
+- MCP 페이지네이션 의미론 변경: `offset`은 이제 `page_path`가
+  가리키는 배열에만 적용되고, 배열 안의 `_truncated` 마커는 최상위
+  `_pagination` 메타데이터로 대체됐다.
+- 스키마가 다른 JSON을 diff 입력으로 주면 exit 2다(이전에는 잘못된
+  스키마로 역직렬화되거나 모호한 오류가 났다).
+- `disk scan --exclude` 의미론: `/` 포함 패턴은 스캔 루트 상대 경로
+  글롭, `*`/`?` 포함은 이름 글롭, 그 외는 이름 정확 일치로 바뀌었다
+  (이전에는 이름 부분 문자열 매칭이라 `.git`이 `.github`·`.gitignore`도
+  제외했다). 같은 규칙이 `disk duplicates --exclude`에도 적용된다.
+- `--fail-on`이 전역 옵션이 됐다 — 이제 `doctor`뿐 아니라 모든 명령에
+  적용된다(기본 `fail`은 변경 없음). 옵션을 서브커맨드 뒤에 두는 기존
+  호출 형태는 계속 유효하다.
+
 ## 0.6.1
 
 의존성 보안·릴리스 자동화·문서 정합성 후속 정리 릴리스. 상세 내역은 아래 섹션 참고.

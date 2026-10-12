@@ -8,7 +8,7 @@
 
 ## 1. 아키텍처 및 워크스페이스 구조 (`crates/`)
 
-플랫폼은 13개의 고성능 모듈식 Rust 크레이트로 구성되어 있습니다.
+플랫폼은 14개의 고성능 모듈식 Rust 크레이트로 구성되어 있습니다.
 
 ```text
 toy-projects/
@@ -24,6 +24,7 @@ toy-projects/
 │   ├── lens-build/     compile_commands.json 파서, 플래그 정규화, 헤더 영향도 역방향 DAG
 │   ├── lens-env/       Zero-Code Python venv 분석기, 미충족 패키지 검사, import 섀도잉 탐지
 │   ├── lens-net/       네트워크 소켓 포렌식, IPv4/IPv6 /proc/net 무실행 파싱, 프로세스 FD 상관관계, 포트 Diff
+│   ├── lens-ops/       공유 오퍼레이션 레이어 — 수집+판정 `Report<T>`/findings, doctor 구현, 번들 수집
 │   ├── lens-cli/       단일 통합 CLI (`lens`), 시스템 종합 진단 (`doctor`), 셸 자동완성, 포렌식 번들
 │   ├── lens-tui/       대화형 터미널 UI 대시보드 (Storage, Services, Logs, Network 실데이터)
 │   └── lens-mcp/       AI 어시스턴트(Claude, Antigravity) 연동용 Model Context Protocol 서버
@@ -51,7 +52,7 @@ toy-projects/
 
 ## 3. 빌드 및 테스트
 
-### 전체 테스트 실행 (13개 크레이트 동시 검증)
+### 전체 테스트 실행 (14개 크레이트 동시 검증)
 ```bash
 cargo test --workspace --jobs 2
 ```
@@ -90,6 +91,16 @@ cargo build --release -p lens-cli --jobs 2
 
 단일 실행 파일 `lens` 하나로 9개 진단 도메인(disk, abi, log, test, trace, sys, build, env, net)의 기능과 포렌식 번들링을 모두 실행할 수 있습니다.
 
+**가장 쉬운 사용법** — 도메인을 몰라도 자동 판별됩니다:
+
+```bash
+$ lens doctor            # 시스템 종합 점검
+$ lens inspect <path>    # 무엇인지 자동 감지 후 해당 검사 실행
+$ lens diff <a> <b>      # 양쪽 입력을 감지해 호환되는 diff 실행
+$ lens snapshot          # 기준선 번들 생성 (snapshot-<host>-<시각>.lens)
+$ lens diff old.lens new.lens   # 두 시점의 시스템 상태 비교
+```
+
 ```bash
 # 1. 파일시스템 초고속 스캔 & 중복 파일 탐지 (동일 inode 하드링크 자동 인식)
 $ lens disk scan .
@@ -101,6 +112,8 @@ $ lens abi diff lib_v1.so lib_v2.so
 
 # 3. 수 GB 로그 파일 무할당 제로카피 고속 필터링
 $ lens log filter /var/log/syslog --query "error" --min-level warn
+$ lens log filter /var/log/syslog -f --min-level warn   # tail -f처럼 실시간 팔로우
+$ lens log stats /var/log/syslog                       # 레벨 분포 + 시간 히스토그램
 
 # 4. 스트리밍 테스트 리포트 파싱 및 회귀(Regression) 자동 탐지
 $ lens test parse target/junit.xml --project backend

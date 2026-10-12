@@ -1,15 +1,8 @@
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use lens_abi::inspect_elf;
-use lens_build::{parse_command_entry, CompileCommandEntry, ImpactGraph};
-use lens_disk::{DiskScanner, DuplicateFinder, ScanOptions, SnapshotV2};
-use lens_env::inspect_venv;
-use lens_log::{parse_line, LogFilter, LogIndexer, LogLevel};
-use lens_sys::{OrderingGraph, SystemdSnapshot, SystemdUnit};
-use lens_trace::TraceAnalyzer;
+use lens_log::parse_line;
+use lens_ops::{Finding, Report};
 
 /// Cap on a serialized tool result — a single `tools/call` result must
 /// stay well inside an LLM context window. When pagination cannot shrink
@@ -39,65 +32,153 @@ fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Keep `offset..offset+limit` of every array in `v` and append a
-/// structured truncation marker so callers see the cut and can page
-/// further. Applied uniformly to every tool result: a 700 KB ABI report
-/// becomes pageable instead of blowing the context window.
-fn paginate_arrays(v: &mut Value, offset: usize, limit: usize) {
+/// Walk `v` truncating every array to its first `limit` items. `offset`
+/// applies only to the array at `page_path` (dot path; array elements
+/// are traversed as `[]`, e.g. `units[].diagnostics`). Every cut is
+/// merged into `meta` as `path -> {total, returned, offset}` — `[]`
+/// paths sum total/returned across occurrences. No marker objects are
+/// ever injected into the data.
+fn paginate_arrays(
+    v: &mut Value,
+    path: &str,
+    page_path: Option<&str>,
+    offset: usize,
+    limit: usize,
+    meta: &mut serde_json::Map<String, Value>,
+) {
     match v {
         Value::Array(arr) => {
             let total = arr.len();
-            if offset > 0 {
-                let drop = offset.min(total);
-                arr.drain(..drop);
+            let off = if Some(path) == page_path {
+                offset.min(total)
+            } else {
+                0
+            };
+            if off > 0 {
+                arr.drain(..off);
             }
-            let omitted = arr.len().saturating_sub(limit);
-            if omitted > 0 {
-                arr.truncate(limit);
-            }
+            let returned = arr.len().min(limit);
+            arr.truncate(limit);
+            // Elements live under `path[]` — their arrays and objects are
+            // children of every occurrence of this array.
+            let elem_path = format!("{path}[]");
             for item in arr.iter_mut() {
-                paginate_arrays(item, offset, limit);
+                paginate_arrays(item, &elem_path, page_path, offset, limit, meta);
             }
-            if omitted > 0 {
-                arr.push(serde_json::json!({
-                    "_truncated": true,
-                    "total_before_truncation": total,
-                    "omitted": omitted,
-                }));
+            if returned < total {
+                let entry = meta
+                    .entry(path.to_string())
+                    .or_insert_with(|| serde_json::json!({"total": 0, "returned": 0, "offset": 0}));
+                if let Some(m) = entry.as_object_mut() {
+                    let t = m["total"].as_u64().unwrap_or(0) + total as u64;
+                    let r = m["returned"].as_u64().unwrap_or(0) + returned as u64;
+                    m.insert("total".to_string(), serde_json::json!(t));
+                    m.insert("returned".to_string(), serde_json::json!(r));
+                    if off > 0 {
+                        m.insert("offset".to_string(), serde_json::json!(off));
+                    }
+                }
             }
         }
         Value::Object(map) => {
-            for val in map.values_mut() {
-                paginate_arrays(val, offset, limit);
+            for (key, val) in map.iter_mut() {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                paginate_arrays(val, &child, page_path, offset, limit, meta);
             }
         }
         _ => {}
     }
 }
 
-/// Serialize a tool result: array pagination with `limit`/`offset` args,
-/// then a hard size guard that re-clamps aggressively if the result still
-/// exceeds the response budget. A tool that paginated its own output
-/// (log_filter's `matches`) sets `_self_paginated` so the fallback does
-/// not apply `offset` a second time.
-fn serialize_result(mut v: Value, args: &Value) -> Result<String, String> {
+/// Serialize a tool result: array truncation with `limit`, `offset`
+/// applied only at `page_path`, then a hard size guard that re-clamps
+/// aggressively if the result still exceeds the response budget. A tool
+/// that paginated its own output (log_filter's `matches`) sets
+/// `_self_paginated` so the fallback does not apply `offset` a second
+/// time.
+fn serialize_result(v: Value, args: &Value) -> Result<String, String> {
     let limit = arg_usize(args, "limit", DEFAULT_ARRAY_LIMIT);
+    let page_path = arg_opt(args, "page_path").map(str::to_string);
     let mut offset = arg_usize(args, "offset", 0);
-    if let Value::Object(m) = &mut v {
+    let mut value = v;
+    if let Value::Object(m) = &mut value {
         if m.remove("_self_paginated").is_some() {
             offset = 0;
         }
     }
-    paginate_arrays(&mut v, offset, limit);
-    let mut text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-    if text.len() > MAX_RESPONSE_BYTES {
-        paginate_arrays(&mut v, offset, CLAMPED_ARRAY_LIMIT);
-        if let Value::Object(m) = &mut v {
-            m.insert("_response_clamped".to_string(), serde_json::json!(true));
+    // Re-pagination always starts from the untruncated value so the
+    // `_pagination` totals describe the real data, not the first pass.
+    for clamp in [limit, CLAMPED_ARRAY_LIMIT] {
+        let mut out = value.clone();
+        let mut meta = serde_json::Map::new();
+        paginate_arrays(&mut out, "", page_path.as_deref(), offset, clamp, &mut meta);
+        if let Value::Object(m) = &mut out {
+            if !meta.is_empty() {
+                m.insert("_pagination".to_string(), Value::Object(meta));
+            }
+            if clamp != limit {
+                m.insert("_response_clamped".to_string(), serde_json::json!(true));
+            }
         }
-        text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+        let text = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+        if text.len() <= MAX_RESPONSE_BYTES || clamp == CLAMPED_ARRAY_LIMIT {
+            return Ok(text);
+        }
     }
-    Ok(text)
+    unreachable!()
+}
+
+/// `--allow-root` sandboxes filesystem access: when non-empty, every
+/// path a tool call touches must canonicalize to a location under one of
+/// these (already canonicalized) roots. Set once at startup by main.
+static ALLOWED_ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// Install the canonicalized `--allow-root` list. Repeated roots are
+/// fine; an unreadable root fails fast at startup rather than silently
+/// disabling the sandbox.
+pub fn set_allowed_roots(roots: Vec<PathBuf>) -> Result<(), String> {
+    let mut canon = Vec::with_capacity(roots.len());
+    for r in roots {
+        canon.push(
+            std::fs::canonicalize(&r)
+                .map_err(|e| format!("cannot canonicalize --allow-root {}: {}", r.display(), e))?,
+        );
+    }
+    let _ = ALLOWED_ROOTS.set(canon);
+    Ok(())
+}
+
+/// Enforce `--allow-root` on one path: the path (or, for paths that do
+/// not exist yet, its nearest existing ancestor) must canonicalize to a
+/// location under an allowed root — otherwise a symlink could resolve
+/// outside the sandbox.
+fn check_allowed(p: &Path) -> Result<(), String> {
+    let Some(roots) = ALLOWED_ROOTS.get() else {
+        return Ok(());
+    };
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let mut candidate = p.to_path_buf();
+    let canon = loop {
+        match std::fs::canonicalize(&candidate) {
+            Ok(c) => break c,
+            Err(_) => {
+                if !candidate.pop() {
+                    return Err(format!("path {} is outside the allowed roots", p.display()));
+                }
+            }
+        }
+    };
+    if roots.iter().any(|r| canon.starts_with(r)) {
+        Ok(())
+    } else {
+        Err(format!("path {} is outside the allowed roots", p.display()))
+    }
 }
 
 /// Resolve a caller-supplied path string. Paths are interpreted relative
@@ -106,94 +187,95 @@ fn serialize_result(mut v: Value, args: &Value) -> Result<String, String> {
 fn tool_path(args: &Value, key: &str) -> Result<PathBuf, String> {
     let s = arg_str(args, key)?;
     let p = Path::new(s);
-    if p.is_absolute() {
-        return Ok(p.to_path_buf());
-    }
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    Ok(cwd.join(p))
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        cwd.join(p)
+    };
+    check_allowed(&p)?;
+    Ok(p)
 }
 
-fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
-    let content = fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
-    serde_json::from_str(&content).map_err(|e| format!("{}: {}", path.display(), e))
+/// True once `--allow-root` installed a non-empty root list.
+fn roots_active() -> bool {
+    ALLOWED_ROOTS.get().is_some_and(|r| !r.is_empty())
 }
 
-/// `lens_sys_diff` accepts a saved snapshot JSON or a live unit directory.
-fn sys_snapshot_from(path: &Path) -> Result<SystemdSnapshot, String> {
-    if path.is_dir() {
-        let units = lens_sys::load_units(path).map_err(|e| e.to_string())?;
-        let graph = OrderingGraph::build(&units);
-        return Ok(SystemdSnapshot {
-            schema: lens_sys::SNAPSHOT_SCHEMA_V1.to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            semantics: "systemd-255-subset-v1".to_string(),
-            diagnostics: units
-                .values()
-                .flat_map(|u| u.diagnostics.iter().cloned())
-                .collect(),
-            units,
-            cycles: graph.find_cycles(),
-        });
+/// When roots are active, an *omitted* path argument must not silently
+/// fall back to a host path — unless that default location is itself
+/// inside an allowed root (e.g. the caller allowed `/`).
+fn require_allowed_default(default: &Path, arg: &str) -> Result<(), String> {
+    if roots_active() && check_allowed(default).is_err() {
+        Err(format!("{arg} is required when --allow-root is set"))
+    } else {
+        Ok(())
     }
-    read_json_file(path)
 }
 
-/// Collect JUnit XML inputs: a single file, or a directory scanned for
-/// `*.xml` (sorted for determinism). No shell globs — MCP callers pass
-/// concrete paths.
-fn junit_inputs(path: &Path) -> Result<Vec<PathBuf>, String> {
-    if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
-    }
-    if !path.is_dir() {
-        return Err(format!("{}: not a file or directory", path.display()));
-    }
-    let mut files: Vec<PathBuf> = fs::read_dir(path)
-        .map_err(|e| format!("{}: {}", path.display(), e))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "xml").unwrap_or(false))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(format!("{} contains no *.xml files", path.display()));
-    }
-    Ok(files)
+/// Optional-path variant of [`tool_path`] for `proc_dir`, `root_path`,
+/// `systemd_dir` — absent key → `None`; present → resolved + checked.
+fn tool_opt_path(args: &Value, key: &str) -> Result<Option<PathBuf>, String> {
+    arg_opt(args, key)
+        .map(|s| {
+            let fake = serde_json::json!({key: s});
+            tool_path(&fake, key)
+        })
+        .transpose()
 }
 
-fn parse_test_run(path: &Path, label: &str) -> Result<lens_test::TestRun, String> {
-    let files = junit_inputs(path)?;
-    let mut runs = Vec::new();
-    for f in &files {
-        let bytes = fs::read(f).map_err(|e| format!("{}: {}", f.display(), e))?;
-        runs.push(lens_test::parse_junit_xml(&bytes, label).map_err(|e| e.to_string())?);
-    }
-    Ok(lens_test::merge_test_runs(runs, label))
+/// What a tool produced: the JSON payload plus the `Report` judgement —
+/// findings and the completeness flag ride to the caller as a second
+/// content item so agents see degraded evidence.
+struct ToolOutcome {
+    value: Value,
+    findings: Vec<Finding>,
+    complete: bool,
 }
 
-fn execute_tool_value(name: &str, args: &Value) -> Result<Value, String> {
+impl<T: serde::Serialize> From<Report<T>> for ToolOutcome {
+    fn from(report: Report<T>) -> Self {
+        Self {
+            value: serde_json::to_value(&report.data).unwrap_or(Value::Null),
+            findings: report.findings,
+            complete: report.complete,
+        }
+    }
+}
+
+fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
     match name {
         "lens_disk_scan" => {
             let path = tool_path(args, "path")?;
-            let scanner = DiskScanner::new(ScanOptions::default());
-            let res = scanner.scan(&path).map_err(|e| e.to_string())?;
-
-            if args.get("json").and_then(|v| v.as_bool()).unwrap_or(false) {
-                let snap =
-                    SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.truncated);
-                return serde_json::to_value(&snap).map_err(|e| e.to_string());
-            }
-            let children_count = res.tree.children_ids(res.root_id).len();
-            let root = &res.tree.nodes[res.root_id as usize];
-            Ok(serde_json::json!({
-                "path": path.to_string_lossy(),
-                "scanned_entries": res.scanned_entries,
-                "logical_bytes": root.size,
-                "allocated_bytes": root.allocated_size,
-                "children_count": children_count,
-                "complete": res.complete,
-                "errors": res.errors,
-            }))
+            let report = lens_ops::disk::scan(&path, lens_disk::ScanOptions::default())
+                .map_err(|e| e.to_string())?;
+            let res = &report.data;
+            let value = if args.get("json").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let snap = lens_disk::SnapshotV2::from_tree(
+                    &res.tree,
+                    res.root_id,
+                    res.complete,
+                    res.truncated,
+                );
+                serde_json::to_value(&snap).map_err(|e| e.to_string())?
+            } else {
+                let children_count = res.tree.children_ids(res.root_id).len();
+                let root = &res.tree.nodes[res.root_id as usize];
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "scanned_entries": res.scanned_entries,
+                    "logical_bytes": root.size,
+                    "allocated_bytes": root.allocated_size,
+                    "children_count": children_count,
+                    "complete": res.complete,
+                    "errors": res.errors,
+                })
+            };
+            Ok(ToolOutcome {
+                value,
+                findings: report.findings,
+                complete: report.complete,
+            })
         }
         "lens_disk_duplicates" => {
             let path = tool_path(args, "path")?;
@@ -201,81 +283,39 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<Value, String> {
                 .get("min_size")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1024);
-            let scanner = DiskScanner::new(ScanOptions::default());
-            let res = scanner.scan(&path).map_err(|e| e.to_string())?;
-            let finder = DuplicateFinder::new(min_size);
-            let report = finder
-                .find_in_tree(&res.tree, &path)
-                .map_err(|e| e.to_string())?;
-            serde_json::to_value(&report).map_err(|e| e.to_string())
+            lens_ops::disk::duplicates(&path, min_size, lens_disk::ScanOptions::default())
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_abi_inspect" => {
             let p = tool_path(args, "binary")?;
-            let bytes = fs::read(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
-            let report = inspect_elf(&p, &bytes);
-            serde_json::to_value(&report).map_err(|e| e.to_string())
+            lens_ops::abi::inspect(&p, false)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_abi_diff" => {
             let b = tool_path(args, "baseline")?;
             let c = tool_path(args, "candidate")?;
-            let b_bytes = fs::read(&b).map_err(|e| format!("{}: {}", b.display(), e))?;
-            let c_bytes = fs::read(&c).map_err(|e| format!("{}: {}", c.display(), e))?;
-            let left = inspect_elf(&b, &b_bytes);
-            let right = inspect_elf(&c, &c_bytes);
-            let diff = lens_abi::diff_reports(&left, &right);
-            serde_json::to_value(&diff).map_err(|e| e.to_string())
+            lens_ops::abi::diff(&b, &c, false)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_log_filter" => {
             let path = tool_path(args, "path")?;
-            let indexer = LogIndexer::open(&path).map_err(|e| e.to_string())?;
-            let mut filter = LogFilter::new();
-            if let Some(q) = arg_opt(args, "query") {
-                filter = filter.with_query(q);
-            }
-            if let Some(re) = arg_opt(args, "regex") {
-                filter = filter
-                    .with_regex(re)
-                    .map_err(|e| format!("Invalid 'regex' {re:?}: {e}"))?;
-            }
-            let include_unknown = args
-                .get("include_unknown")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if let Some(lvl) = arg_opt(args, "min_level") {
-                let parsed = LogLevel::parse(lvl);
-                if parsed == LogLevel::Unknown && !lvl.eq_ignore_ascii_case("unknown") {
-                    return Err(format!(
-                        "Invalid 'min_level' {lvl:?}; expected trace|debug|info|warn|error|fatal"
-                    ));
-                }
-                filter = filter.with_min_level(parsed);
-            }
-            filter = filter.with_include_unknown(include_unknown);
-            for (key, set) in [
-                (
-                    "since",
-                    LogFilter::with_since as fn(LogFilter, Option<i64>) -> LogFilter,
-                ),
-                (
-                    "until",
-                    LogFilter::with_until as fn(LogFilter, Option<i64>) -> LogFilter,
-                ),
-            ] {
-                if let Some(bound) = arg_opt(args, key) {
-                    let ms = lens_log::timestamp::parse_bound(bound).ok_or_else(|| {
-                        format!(
-                            "Invalid '{key}' {bound:?}; expected RFC 3339 (e.g. 2026-10-09T12:00:00Z), 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD' (UTC)"
-                        )
-                    })?;
-                    filter = set(filter, Some(ms));
-                }
-            }
-            if let Some(y) = args.get("year").and_then(|v| v.as_i64()) {
-                if !(1..=9999).contains(&y) {
-                    return Err(format!("Invalid 'year' {y}; expected 1..=9999"));
-                }
-                filter = filter.with_syslog_year(y as i32);
-            }
+            let indexer = lens_ops::log::open(&path).map_err(|e| e.to_string())?;
+            let filter = lens_ops::log::build_filter(&lens_ops::log::FilterArgs {
+                query: arg_opt(args, "query").map(String::from),
+                regex: arg_opt(args, "regex").map(String::from),
+                min_level: arg_opt(args, "min_level").map(String::from),
+                include_unknown: args
+                    .get("include_unknown")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                since: arg_opt(args, "since").map(String::from),
+                until: arg_opt(args, "until").map(String::from),
+                year: args.get("year").and_then(|v| v.as_i64()).map(|y| y as i32),
+            })
+            .map_err(|e| e.to_string())?;
 
             // `tail` scans only the last N lines — recent lines are where
             // incident evidence lives. Without it the whole (bounded)
@@ -293,10 +333,17 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<Value, String> {
             let mut truncated = false;
             let mut scanned = 0usize;
             let mut seen = 0usize;
+            let mut lossy_lines = 0usize;
             for idx in start..total {
                 scanned += 1;
-                if let Some(line) = indexer.get_line(idx) {
-                    let record = parse_line(line, idx + 1);
+                // Lossy view: invalid-UTF-8 lines are still matched (shown
+                // with U+FFFD) and counted, not silently skipped. An Owned
+                // Cow means from_utf8_lossy had to repair invalid bytes.
+                if let Some(line) = indexer.get_line_lossy(idx) {
+                    if matches!(line, std::borrow::Cow::Owned(_)) {
+                        lossy_lines += 1;
+                    }
+                    let record = parse_line(&line, idx + 1);
                     if filter.matches(&record) {
                         seen += 1;
                         if seen > offset + limit {
@@ -313,104 +360,106 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<Value, String> {
                     }
                 }
             }
-            Ok(serde_json::json!({
-                "_self_paginated": true,
-                "matches": matches,
-                "scanned_lines": scanned,
-                "total_lines": total,
-                "tail": tail,
-                "truncated": truncated,
-            }))
+            Ok(ToolOutcome {
+                value: serde_json::json!({
+                    "_self_paginated": true,
+                    "matches": matches,
+                    "scanned_lines": scanned,
+                    "total_lines": total,
+                    "lossy_lines": lossy_lines,
+                    "tail": tail,
+                    "truncated": truncated,
+                }),
+                findings: Vec::new(),
+                complete: true,
+            })
+        }
+        "lens_log_stats" => {
+            let path = tool_path(args, "path")?;
+            let filter = lens_ops::log::build_filter(&lens_ops::log::FilterArgs {
+                query: arg_opt(args, "query").map(String::from),
+                regex: arg_opt(args, "regex").map(String::from),
+                min_level: arg_opt(args, "min_level").map(String::from),
+                include_unknown: false,
+                since: arg_opt(args, "since").map(String::from),
+                until: arg_opt(args, "until").map(String::from),
+                year: args.get("year").and_then(|v| v.as_i64()).map(|y| y as i32),
+            })
+            .map_err(|e| e.to_string())?;
+            let bucket_secs = arg_opt(args, "bucket")
+                .map(|b| match b {
+                    "1m" => Ok(60u64),
+                    "5m" => Ok(300),
+                    "15m" => Ok(900),
+                    "1h" => Ok(3600),
+                    "1d" => Ok(86_400),
+                    _ => Err(format!("invalid 'bucket' {b:?}; expected 1m|5m|15m|1h|1d")),
+                })
+                .transpose()?;
+            lens_ops::log::stats(&[path], &filter, bucket_secs)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_trace_analyze" => {
             let p = tool_path(args, "trace_file")?;
-            let content = fs::read_to_string(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
-            let analyzer = TraceAnalyzer::new();
-            let snap = analyzer.analyze_lines(content.lines());
-            serde_json::to_value(&snap).map_err(|e| e.to_string())
+            lens_ops::trace::analyze(&p)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_sys_cycles" => {
             let dir = tool_path(args, "dir")?;
-            let units = load_sys_units(&dir).map_err(|e| e.to_string())?;
-            let graph = OrderingGraph::build(&units);
-            let cycles = graph.find_cycles();
-            Ok(serde_json::json!({
-                "scanned_units": units.len(),
-                "cycle_count": cycles.len(),
-                "cycles": cycles,
-            }))
+            let report = lens_ops::sys::cycles(Some(&dir)).map_err(|e| e.to_string())?;
+            let value = serde_json::json!({
+                "scanned_units": report.data.scanned_units,
+                "cycle_count": report.data.cycles.len(),
+                "cycles": report
+                    .data
+                    .cycles
+                    .iter()
+                    .map(|c| c.members.clone())
+                    .collect::<Vec<_>>(),
+            });
+            Ok(ToolOutcome {
+                value,
+                findings: report.findings,
+                complete: report.complete,
+            })
         }
         "lens_sys_diff" => {
             let baseline = tool_path(args, "baseline")?;
             let candidate = tool_path(args, "candidate")?;
-            let s1 = sys_snapshot_from(&baseline)?;
-            let s2 = sys_snapshot_from(&candidate)?;
-            let diff = lens_sys::diff_systemd(&s1, &s2);
-            serde_json::to_value(&diff).map_err(|e| e.to_string())
+            lens_ops::sys::diff(&baseline, &candidate)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_test_diff" => {
             let baseline = tool_path(args, "baseline")?;
             let candidate = tool_path(args, "candidate")?;
-            let r1 = parse_test_run(&baseline, "baseline")?;
-            let r2 = parse_test_run(&candidate, "candidate")?;
-            let diff = lens_test::diff_test_runs(&r1, &r2);
-            serde_json::to_value(&diff).map_err(|e| e.to_string())
+            lens_ops::test::diff(&baseline, &candidate)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_net_diff" => {
             let baseline = tool_path(args, "baseline")?;
             let candidate = tool_path(args, "candidate")?;
-            let b: lens_net::NetReport = read_json_file(&baseline)?;
-            let c: lens_net::NetReport = read_json_file(&candidate)?;
-            let diff = lens_net::diff_net_reports(&b, &c);
-            serde_json::to_value(&diff).map_err(|e| e.to_string())
+            lens_ops::net::diff(&baseline, &candidate)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_build_impact" => {
             let file = tool_path(args, "compile_commands")?;
             let header = arg_str(args, "header")?;
-            let entries: Vec<CompileCommandEntry> = read_json_file(&file)?;
-            let mut graph = ImpactGraph::new();
-            for entry in &entries {
-                let unit = parse_command_entry(entry);
-                graph.add_translation_unit(&unit);
-            }
-            // Relative headers resolve against the compile database
-            // directory and each entry's `directory` — the server cwd is
-            // only a last resort.
-            let db_dir = file
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| ".".to_string());
-            let mut bases: Vec<String> = vec![db_dir.clone()];
-            for e in &entries {
-                if !e.directory.is_empty() && !bases.contains(&e.directory) {
-                    bases.push(e.directory.clone());
+            // The database itself is checked, but it *references* paths
+            // — source files, include dirs, forced includes — that the
+            // graph builder then reads. Confine those too.
+            if roots_active() {
+                for p in lens_ops::build::referenced_paths(&file).map_err(|e| e.to_string())? {
+                    check_allowed(&p)?;
                 }
             }
-            if let Ok(cwd) = std::env::current_dir() {
-                let cwd = cwd.to_string_lossy().into_owned();
-                if !bases.contains(&cwd) {
-                    bases.push(cwd);
-                }
-            }
-            let target = lens_build::resolve_header_target(&graph, header, &bases);
-            let mut report = graph.compute_impact(&target);
-            if !graph.header_in_graph(&report.target_header) {
-                let candidates = graph.closest_headers(header, 5);
-                let mut hint = format!(
-                    "header {:?} is not in the include graph (resolved as {})",
-                    header, report.target_header
-                );
-                if !candidates.is_empty() {
-                    hint.push_str(&format!("; similar: {}", candidates.join(", ")));
-                }
-                hint.push_str(&format!(
-                    "; pass an absolute path or one relative to the compile database directory ({})",
-                    db_dir
-                ));
-                report.hint = Some(hint);
-            }
-            serde_json::to_value(&report).map_err(|e| e.to_string())
+            lens_ops::build::impact(&file, header)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_env_check" => {
             let path = tool_path(args, "venv_path")?;
@@ -423,56 +472,248 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<Value, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let venv = inspect_venv(&path, &extras).map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({
-                "python_version": venv.python_version,
-                "packages_count": venv.packages.len(),
-                "missing_dependencies": venv.missing_dependencies,
-                "version_conflicts": venv.version_conflicts,
-                "unevaluated_dependencies": venv.unevaluated_dependencies,
-                "shadowing_issues": venv.shadowing_issues,
-            }))
+            let report = lens_ops::env::check(&path, &extras).map_err(|e| e.to_string())?;
+            let venv = &report.data;
+            Ok(ToolOutcome {
+                value: serde_json::json!({
+                    "python_version": venv.python_version,
+                    "packages_count": venv.packages.len(),
+                    "missing_dependencies": venv.missing_dependencies,
+                    "version_conflicts": venv.version_conflicts,
+                    "unevaluated_dependencies": venv.unevaluated_dependencies,
+                    "shadowing_issues": venv.shadowing_issues,
+                }),
+                findings: report.findings,
+                complete: report.complete,
+            })
         }
         "lens_net_inspect" => {
-            let proc_dir = arg_opt(args, "proc_dir").map(Path::new);
-            let report = lens_net::inspect_network(proc_dir).map_err(|e| e.to_string())?;
-            serde_json::to_value(&report).map_err(|e| e.to_string())
+            let proc_dir = tool_opt_path(args, "proc_dir")?;
+            // Without proc_dir the tool reads the host /proc — require
+            // it explicitly when that default escapes the sandbox.
+            if proc_dir.is_none() {
+                require_allowed_default(Path::new("/proc"), "proc_dir")?;
+            }
+            lens_ops::net::inspect(proc_dir.as_deref(), false)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_bundle_verify" => {
             let p = tool_path(args, "bundle_path")?;
-            let report = lens_core::verify_bundle_archive(&p).map_err(|e| e.to_string())?;
-            serde_json::to_value(&report).map_err(|e| e.to_string())
+            lens_ops::bundle::verify(&p)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
+        }
+        "lens_bundle_diff" => {
+            let baseline = tool_path(args, "baseline")?;
+            let candidate = tool_path(args, "candidate")?;
+            lens_ops::bundle::diff(&baseline, &candidate)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
         }
         "lens_doctor" => {
-            // Explicit override paths are validated up front — a typo'd
-            // --systemd-dir must be an in-band tool error (isError), not
-            // a vacuous "everything looks fine" report.
-            let root_path = arg_opt(args, "root_path").map(Path::new);
-            let proc_dir = arg_opt(args, "proc_dir").map(Path::new);
-            let systemd_dir = arg_opt(args, "systemd_dir").map(Path::new);
-            for (flag, dir) in [
-                ("root_path", root_path),
-                ("proc_dir", proc_dir),
-                ("systemd_dir", systemd_dir),
-            ] {
-                if let Some(p) = dir {
-                    if !p.exists() {
-                        return Err(format!("{} path {:?} does not exist", flag, p));
-                    }
-                }
+            // Explicit override paths are validated inside lens_ops —
+            // a typo'd `systemd_dir` is an in-band tool error (isError),
+            // not a vacuous "everything looks fine" report.
+            let root_path = tool_opt_path(args, "root_path")?;
+            let proc_dir = tool_opt_path(args, "proc_dir")?;
+            let systemd_dir = tool_opt_path(args, "systemd_dir")?;
+            // With a root_path, every doctor input derives under it
+            // (<root>/proc, re-rooted systemd dirs, <root>/etc/…); a
+            // host-scoped run without one is unreachable in a sandbox.
+            if root_path.is_none() {
+                require_allowed_default(Path::new("/"), "root_path")?;
             }
-            let report = lens_cli::doctor::run_doctor(root_path, proc_dir, systemd_dir);
-            serde_json::to_value(&report).map_err(|e| e.to_string())
+            lens_ops::doctor::run(
+                root_path.as_deref(),
+                proc_dir.as_deref(),
+                systemd_dir.as_deref(),
+            )
+            .map(ToolOutcome::from)
+            .map_err(|e| e.to_string())
         }
         other => Err(format!("Unknown tool: {}", other)),
     }
 }
 
-pub fn execute_tool(name: &str, args: &Value) -> Result<String, String> {
-    let value = execute_tool_value(name, args)?;
-    serialize_result(value, args)
+/// Serialized tool result: the data JSON text plus, when the operation
+/// produced findings or incomplete evidence, a second content item's
+/// text — `{"findings":[...], "complete":bool}` as compact JSON.
+pub struct ToolOutput {
+    pub data: String,
+    pub findings: Option<String>,
 }
 
-fn load_sys_units(dir: &Path) -> std::io::Result<BTreeMap<String, SystemdUnit>> {
-    lens_sys::load_units(dir).map_err(|e| std::io::Error::other(e.to_string()))
+/// The findings content item is bounded like the data item: the same
+/// `limit` argument caps the list, `findings_total`/`findings_truncated`
+/// keep the full count honest, and an oversized serialization falls
+/// back to the clamped array limit.
+fn serialize_findings(outcome: &ToolOutcome, args: &Value) -> Option<String> {
+    if outcome.findings.is_empty() && outcome.complete {
+        return None;
+    }
+    let total = outcome.findings.len();
+    let emit = |cap: usize| {
+        let shown = total.min(cap);
+        serde_json::json!({
+            "findings": &outcome.findings[..shown],
+            "findings_total": total,
+            "findings_truncated": total > shown,
+            "complete": outcome.complete,
+        })
+        .to_string()
+    };
+    let mut text = emit(arg_usize(args, "limit", DEFAULT_ARRAY_LIMIT));
+    if text.len() > MAX_RESPONSE_BYTES {
+        text = emit(CLAMPED_ARRAY_LIMIT);
+    }
+    Some(text)
+}
+
+pub fn execute_tool(name: &str, args: &Value) -> Result<ToolOutput, String> {
+    let outcome = execute_tool_value(name, args)?;
+    let findings = serialize_findings(&outcome, args);
+    Ok(ToolOutput {
+        data: serialize_result(outcome.value, args)?,
+        findings,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn paginate(v: &Value, page_path: Option<&str>, offset: usize, limit: usize) -> Value {
+        let mut out = v.clone();
+        let mut meta = serde_json::Map::new();
+        paginate_arrays(&mut out, "", page_path, offset, limit, &mut meta);
+        if let Value::Object(m) = &mut out {
+            if !meta.is_empty() {
+                m.insert("_pagination".to_string(), Value::Object(meta));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pagination_truncates_without_marker_objects() {
+        // String arrays must never gain injected marker objects.
+        let v = json!({
+            "items": ["a", "b", "c", "d", "e"],
+            "nested": { "deps": ["x", "y", "z"] }
+        });
+        let out = paginate(&v, None, 0, 2);
+        assert_eq!(out["items"], json!(["a", "b"]));
+        assert_eq!(out["nested"]["deps"], json!(["x", "y"]));
+        assert!(out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i.is_string()));
+        let p = &out["_pagination"];
+        assert_eq!(p["items"]["total"], 5);
+        assert_eq!(p["items"]["returned"], 2);
+        assert_eq!(p["nested.deps"]["total"], 3);
+    }
+
+    #[test]
+    fn pagination_offset_only_at_page_path() {
+        // offset must not shift every array — only the paged one.
+        let v = json!({
+            "imports": ["i0", "i1", "i2", "i3", "i4"],
+            "needed": ["libc", "libm"]
+        });
+        let out = paginate(&v, Some("imports"), 2, 2);
+        assert_eq!(out["imports"], json!(["i2", "i3"]));
+        assert_eq!(out["needed"], json!(["libc", "libm"]));
+        assert_eq!(out["_pagination"]["imports"]["offset"], 2);
+        assert_eq!(out["_pagination"]["imports"]["total"], 5);
+        // `needed` was under the limit — no metadata entry.
+        assert!(out["_pagination"]["needed"].is_null());
+    }
+
+    #[test]
+    fn pagination_bracket_path_aggregates_occurrences() {
+        // `units[].diagnostics` traverses array elements; metadata sums
+        // total/returned across every occurrence.
+        let v = json!({
+            "units": [
+                {"name": "a", "diagnostics": ["d1", "d2", "d3"]},
+                {"name": "b", "diagnostics": ["d4", "d5", "d6"]}
+            ]
+        });
+        let out = paginate(&v, None, 0, 2);
+        assert_eq!(out["units"][0]["diagnostics"], json!(["d1", "d2"]));
+        assert_eq!(out["units"][1]["diagnostics"], json!(["d4", "d5"]));
+        let m = &out["_pagination"]["units[].diagnostics"];
+        assert_eq!(m["total"], 6);
+        assert_eq!(m["returned"], 4);
+        // The outer `units` array fit — no entry for it.
+        assert!(out["_pagination"]["units"].is_null());
+    }
+
+    #[test]
+    fn pagination_self_paginated_disables_offset() {
+        let args = json!({"limit": 2, "offset": 3});
+        let text = serialize_result(
+            json!({"_self_paginated": true, "matches": ["m1", "m2", "m3", "m4"]}),
+            &args,
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&text).unwrap();
+        // The tool already applied offset — the paginator must not eat
+        // the first items again.
+        assert_eq!(out["matches"], json!(["m1", "m2"]));
+        assert!(out.get("_self_paginated").is_none());
+    }
+
+    #[test]
+    fn findings_item_is_capped_and_reports_total() {
+        let many: Vec<lens_ops::Finding> = (0..1000)
+            .map(|i| lens_ops::Finding {
+                severity: lens_ops::Severity::Warn,
+                code: "x.finding".to_string(),
+                message: format!("finding number {i}"),
+            })
+            .collect();
+        let outcome = ToolOutcome {
+            value: json!({}),
+            findings: many,
+            complete: true,
+        };
+        let text = serialize_findings(&outcome, &json!({})).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["findings_total"], 1000);
+        assert_eq!(v["findings_truncated"], true);
+        assert_eq!(v["findings"].as_array().unwrap().len(), DEFAULT_ARRAY_LIMIT);
+
+        // `limit` is honored; a pathological case still fits the byte
+        // budget after clamping.
+        let text = serialize_findings(&outcome, &json!({"limit": 3})).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["findings"].as_array().unwrap().len(), 3);
+        assert_eq!(v["findings_total"], 1000);
+
+        let huge: Vec<lens_ops::Finding> = (0..1000)
+            .map(|i| lens_ops::Finding {
+                severity: lens_ops::Severity::Fail,
+                code: "x.finding".to_string(),
+                message: format!("{}:{}", i, "y".repeat(2000)),
+            })
+            .collect();
+        let outcome = ToolOutcome {
+            value: json!({}),
+            findings: huge,
+            complete: true,
+        };
+        let text = serialize_findings(&outcome, &json!({})).unwrap();
+        assert!(
+            text.len() <= MAX_RESPONSE_BYTES,
+            "clamped findings item exceeded budget: {}",
+            text.len()
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["findings"].as_array().unwrap().len(), CLAMPED_ARRAY_LIMIT);
+    }
 }

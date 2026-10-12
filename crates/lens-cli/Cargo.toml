@@ -25,6 +25,7 @@ lens-sys = { path = "../lens-sys" }
 lens-build = { path = "../lens-build" }
 lens-env = { path = "../lens-env" }
 lens-net = { path = "../lens-net" }
+lens-ops = { path = "../lens-ops" }
 lens-tui = { path = "../lens-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
