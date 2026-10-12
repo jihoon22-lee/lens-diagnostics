@@ -58,7 +58,7 @@ pub fn snapshot(path: Option<&Path>) -> Result<SystemdSnapshot> {
 /// a live unit directory, which is loaded and graphed into an
 /// equivalent snapshot.
 pub fn snapshot_from(path: &Path) -> Result<SystemdSnapshot> {
-    if path.is_dir() {
+    if path.is_dir() || crate::detect::has_unit_extension(path) {
         return Ok(snapshot_from_units(lens_sys::load_units(path)?));
     }
     json::read_json_schema(path, "schema", lens_sys::SNAPSHOT_SCHEMA_V1)
@@ -150,4 +150,49 @@ pub fn diff_snapshots(s1: &SystemdSnapshot, s2: &SystemdSnapshot) -> Report<Syst
         );
     }
     report
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn followup_all_supported_unit_suffixes_compare() {
+        let dir = tempfile::tempdir().unwrap();
+        for suffix in [
+            "service",
+            "socket",
+            "target",
+            "timer",
+            "mount",
+            "automount",
+            "swap",
+            "path",
+            "slice",
+            "scope",
+        ] {
+            let path = dir.path().join(format!("a.{suffix}"));
+            std::fs::write(&path, "[Unit]\nDescription=valid unit\n").unwrap();
+            assert_eq!(
+                crate::detect::detect(&path).unwrap(),
+                crate::detect::InputKind::SystemdUnit,
+                "{suffix}"
+            );
+            assert!(super::diff(&path, &path).is_ok(), "{suffix}");
+        }
+    }
+    #[test]
+    fn diff_accepts_individual_units_and_dropins() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.service");
+        let b = dir.path().join("b.service");
+        std::fs::write(&a, "[Unit]\nDescription=baseline\n").unwrap();
+        std::fs::write(&b, "[Unit]\nDescription=candidate\n").unwrap();
+        std::fs::create_dir(dir.path().join("b.service.d")).unwrap();
+        std::fs::write(
+            dir.path().join("b.service.d/cycle.conf"),
+            "[Unit]\nAfter=b.service\n",
+        )
+        .unwrap();
+        let report = super::diff(&a, &b).unwrap();
+        assert!(report.findings.iter().any(|f| f.code == "sys.new_cycle"));
+    }
 }

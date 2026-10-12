@@ -174,16 +174,7 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
 
     if let Some(ref d) = req.disk {
         collect!("disk", "reports/disk_snapshot.json", {
-            let res = DiskScanner::new(ScanOptions::default()).scan(d)?;
-            // Per-entry scan failures are evidence gaps — record them in
-            // the manifest diagnostics.
-            diagnostics.extend(res.errors.iter().map(|e| format!("disk scan: {e}")));
-            Ok(SnapshotV2::from_tree(
-                &res.tree,
-                res.root_id,
-                res.complete,
-                res.truncated,
-            ))
+            collect_disk(d, ScanOptions::default(), &mut diagnostics)
         });
     }
 
@@ -229,7 +220,13 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
     }
 
     if let Some(ref t) = req.test {
-        collect!("test", "reports/test_run.json", test::load_run(t, "bundle"));
+        collect!("test", "reports/test_run.json", {
+            let run = test::load_run(t, "bundle")?;
+            if !run.complete {
+                diagnostics.push("test: incomplete JUnit evidence".to_string());
+            }
+            Ok(run)
+        });
     }
 
     if req.host {
@@ -306,6 +303,27 @@ pub fn inspect(bundle: &PathBuf) -> Result<Report<BundleInspection>> {
     Ok(Report::new(inspect_bundle(bundle)?))
 }
 
+fn collect_disk(
+    path: &std::path::Path,
+    options: ScanOptions,
+    diagnostics: &mut Vec<String>,
+) -> Result<SnapshotV2> {
+    let res = DiskScanner::new(options).scan(path)?;
+    diagnostics.extend(res.errors.iter().map(|e| format!("disk scan: {e}")));
+    if !res.complete || res.truncated {
+        diagnostics.push(format!(
+            "disk scan: incomplete evidence (truncated={})",
+            res.truncated
+        ));
+    }
+    Ok(SnapshotV2::from_tree(
+        &res.tree,
+        res.root_id,
+        res.complete,
+        res.truncated,
+    ))
+}
+
 /// `lens.bundle-diff/v1`: section diffs of two verified bundles. Each
 /// `sections` value is that domain's normal diff JSON (e.g. the
 /// `sys` section is a `SystemdDiff`); `only_in_*` lists entries present
@@ -332,9 +350,98 @@ const SECTION_ENTRIES: &[(&str, &str)] = &[
     ("reports/log_summary.json", "log"),
 ];
 
-fn read_entry_json<T: serde::de::DeserializeOwned>(bundle: &PathBuf, entry: &str) -> Result<T> {
+trait SectionSchema {
+    fn section_schema(&self) -> Option<&str>;
+}
+
+macro_rules! section_schema {
+    ($type:ty, $field:ident) => {
+        impl SectionSchema for $type {
+            fn section_schema(&self) -> Option<&str> {
+                Some(&self.$field)
+            }
+        }
+    };
+}
+section_schema!(lens_sys::SystemdSnapshot, schema);
+section_schema!(lens_env::EnvSnapshot, schema);
+section_schema!(lens_net::NetReport, schema_version);
+section_schema!(lens_test::TestRun, schema);
+section_schema!(lens_trace::TraceSnapshot, schema);
+section_schema!(crate::doctor::DoctorReport, schema_version);
+section_schema!(lens_disk::SnapshotV2, schema_version);
+
+#[derive(serde::Deserialize)]
+struct LogSummary {
+    #[serde(default)]
+    total_lines: i64,
+}
+
+impl SectionSchema for LogSummary {
+    fn section_schema(&self) -> Option<&str> {
+        None
+    }
+}
+
+fn read_entry_json<T: serde::de::DeserializeOwned + SectionSchema>(
+    bundle: &PathBuf,
+    entry: &str,
+) -> Result<T> {
     let bytes = read_bundle_entry(bundle, entry)?;
-    serde_json::from_slice(&bytes).map_err(LensError::Json)
+    // Deserialize directly: unknown extensions are skipped, not allocated as
+    // an intermediate JSON tree before being discarded by the typed parser.
+    let value: T = serde_json::from_slice(&bytes)?;
+    let expected = match entry {
+        "reports/sys_snapshot.json" => Some(("schema", lens_sys::SNAPSHOT_SCHEMA_V1)),
+        "reports/env_snapshot.json" => Some(("schema", lens_env::SNAPSHOT_SCHEMA_V1)),
+        "reports/net_report.json" => Some(("schema_version", lens_net::REPORT_SCHEMA_V1)),
+        "reports/test_run.json" => Some(("schema", "testlens.run/v1")),
+        "reports/trace_snapshot.json" => Some(("schema", lens_trace::SNAPSHOT_SCHEMA_V1)),
+        "reports/doctor_report.json" => Some(("schema_version", "lens.doctor/v1")),
+        "reports/disk_snapshot.json" => Some(("schema_version", lens_disk::SCHEMA_V2)),
+        _ => None,
+    };
+    if let Some((_, schema)) = expected {
+        if value.section_schema() != Some(schema) {
+            return Err(LensError::InvalidInput {
+                message: format!("{}:{entry}: expected schema {schema}", bundle.display()),
+            });
+        }
+    }
+    Ok(value)
+}
+
+fn append_collection_diagnostics(output: &mut Vec<String>, side: &str, input: &[String]) {
+    // Bound before cloning attacker-controlled strings. Reserve room for a
+    // truncation notice on both sides, and never split UTF-8 code points.
+    let mut remaining =
+        (64 * 1024usize).saturating_sub(output.iter().map(String::len).sum::<usize>() + 128);
+    let mut truncated = false;
+    for diagnostic in input {
+        if output.len() >= 128 || remaining < 128 {
+            truncated = true;
+            break;
+        }
+        let cap = remaining.min(4096) - side.len() - 32;
+        let mut end = diagnostic.len().min(cap);
+        while !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        let suffix = if end < diagnostic.len() {
+            " [truncated]"
+        } else {
+            ""
+        };
+        let message = format!("{side}: {}{suffix}", &diagnostic[..end]);
+        remaining -= message.len();
+        output.push(message);
+    }
+    if truncated {
+        output.push(format!(
+            "{side}: collection diagnostics truncated ({} total)",
+            input.len()
+        ));
+    }
 }
 
 /// Diff two forensic bundles section by section. Both bundles are
@@ -394,6 +501,15 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
         only_in_baseline: only_in_baseline.clone(),
         only_in_candidate: only_in_candidate.clone(),
     });
+
+    for (side, inspection) in [("baseline", &ins_a), ("candidate", &ins_b)] {
+        if let Some(manifest) = &inspection.manifest {
+            if !manifest.diagnostics.is_empty() {
+                report.complete = false;
+                append_collection_diagnostics(&mut report.diagnostics, side, &manifest.diagnostics);
+            }
+        }
+    }
 
     for n in &only_in_baseline {
         report.push(
@@ -495,6 +611,11 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
                         "node_count_delta": b.node_count as i64 - a.node_count as i64,
                     });
                     let mut r = Report::new(value);
+                    r.complete = a.complete && b.complete && !a.truncated && !b.truncated;
+                    if !r.complete {
+                        r.diagnostics
+                            .push("disk: incomplete snapshot evidence".to_string());
+                    }
                     let any = r.data["root_size_delta"] != 0
                         || r.data["root_allocated_delta"] != 0
                         || r.data["node_count_delta"] != 0;
@@ -518,11 +639,9 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
                     }
                 }
                 "log" => {
-                    let a = read_entry_json::<serde_json::Value>(base, entry)?;
-                    let b = read_entry_json::<serde_json::Value>(cand, entry)?;
-                    let lines =
-                        |v: &serde_json::Value| v["total_lines"].as_i64().unwrap_or_default();
-                    let delta = lines(&b) - lines(&a);
+                    let a = read_entry_json::<LogSummary>(base, entry)?;
+                    let b = read_entry_json::<LogSummary>(cand, entry)?;
+                    let delta = b.total_lines - a.total_lines;
                     let mut r = Report::new(serde_json::json!({
                         "total_lines_delta": delta,
                     }));
@@ -594,6 +713,113 @@ pub fn extract(bundle: &PathBuf, dest: &PathBuf, force: bool) -> Result<Report<V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review2_manifest_diagnostics_are_bounded_before_cloning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics.lens");
+        create_bundle_archive(
+            &path,
+            "test",
+            &[json_artifact(
+                "reports/log_summary.json",
+                serde_json::json!({"total_lines":0}),
+            )],
+            vec!["x".repeat(256 * 1024)],
+            false,
+        )
+        .unwrap();
+        let report = diff(&path, &path).unwrap();
+        assert!(!report.complete);
+        assert!(report.diagnostics.iter().map(String::len).sum::<usize>() <= 64 * 1024);
+        assert!(report.diagnostics.iter().any(|d| d.contains("truncated")));
+        let mut messages = Vec::new();
+        let input = vec!["한글".repeat(1024); 300];
+        append_collection_diagnostics(&mut messages, "baseline", &input);
+        append_collection_diagnostics(&mut messages, "candidate", &input);
+        assert!(messages.iter().map(String::len).sum::<usize>() <= 64 * 1024);
+        assert!(messages.len() <= 130);
+    }
+    #[test]
+    fn bundle_records_recoverable_junit_and_disk_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("truncated.xml");
+        std::fs::write(&xml, "<testsuite><testcase name=\"ok\"/>").unwrap();
+        let report = create(&BundleRequest {
+            output: dir.path().join("test.lens"),
+            test: Some(xml),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!report.complete);
+        assert!(report.data.diagnostics.iter().any(|d| d.contains("JUnit")));
+        let mut diagnostics = Vec::new();
+        let snapshot = collect_disk(
+            dir.path(),
+            ScanOptions {
+                max_entries: 1,
+                ..Default::default()
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(snapshot.truncated);
+        assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn bundle_sections_reject_foreign_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        for (entry, _) in SECTION_ENTRIES.iter().filter(|(_, key)| *key != "log") {
+            let path = dir.path().join("schema.lens");
+            create_bundle_archive(
+                &path,
+                "test",
+                &[json_artifact(
+                    entry,
+                    serde_json::json!({"schema": "foreign/v99", "schema_version": "foreign/v99"}),
+                )],
+                vec![],
+                true,
+            )
+            .unwrap();
+            let report = diff(&path, &path).unwrap();
+            assert!(!report.complete, "{entry}");
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.contains("expected schema") || d.contains("missing field")),
+                "{:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_diff_preserves_collection_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.lens");
+        let b = dir.path().join("b.lens");
+        for path in [&a, &b] {
+            create_bundle_archive(
+                path,
+                "test",
+                &[json_artifact(
+                    "reports/log_summary.json",
+                    serde_json::json!({"total_lines": 0}),
+                )],
+                vec!["sys: collection failed".into()],
+                false,
+            )
+            .unwrap();
+        }
+        let report = diff(&a, &b).unwrap();
+        assert!(
+            !report.complete,
+            "failed collections must never appear complete"
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+    }
     use super::*;
 
     fn bundle_with(dir: &std::path::Path, name: &str, artifacts: Vec<BundleArtifact>) -> PathBuf {
@@ -769,5 +995,43 @@ mod tests {
         let report = diff(&a, &b).unwrap();
         assert!(!report.complete);
         assert!(report.diagnostics.iter().any(|d| d.contains("test")));
+    }
+
+    #[test]
+    fn review3_unknown_section_fields_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = serde_json::to_string(&junit_run("passed")).unwrap();
+        // Typed deserialization skips unknown structures without building a
+        // Value tree (which also imposes its recursion limit on unknown data).
+        let payload = format!(
+            "{{\"future_extension\":{}0{},{}",
+            "[".repeat(150),
+            "]".repeat(150),
+            &run[1..]
+        );
+        let path = bundle_with(
+            dir.path(),
+            "unknown.lens",
+            vec![BundleArtifact {
+                name: "reports/test_run.json".into(),
+                data: payload.into_bytes(),
+            }],
+        );
+        let report = diff(&path, &path).unwrap();
+        assert!(report.complete, "{:?}", report.diagnostics);
+        assert!(report.data.sections.contains_key("test"));
+        let mut foreign = junit_run("passed");
+        foreign["schema"] = serde_json::json!("foreign/v99");
+        let path = bundle_with(
+            dir.path(),
+            "foreign.lens",
+            vec![json_artifact("reports/test_run.json", foreign)],
+        );
+        let report = diff(&path, &path).unwrap();
+        assert!(!report.complete);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("expected schema")));
     }
 }

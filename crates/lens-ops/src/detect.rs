@@ -31,7 +31,16 @@ pub enum InputKind {
 const SNIFF_BYTES: usize = 64 * 1024;
 
 const UNIT_EXTENSIONS: &[&str] = &[
-    "service", "socket", "target", "timer", "mount", "path", "slice",
+    "service",
+    "socket",
+    "target",
+    "timer",
+    "mount",
+    "automount",
+    "swap",
+    "path",
+    "slice",
+    "scope",
 ];
 
 fn read_head(path: &Path, cap: usize) -> Result<Vec<u8>> {
@@ -80,7 +89,7 @@ fn looks_like_junit(head: &[u8]) -> bool {
     s.starts_with(b"<testsuite")
 }
 
-fn has_unit_extension(path: &Path) -> bool {
+pub(crate) fn has_unit_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| UNIT_EXTENSIONS.contains(&e))

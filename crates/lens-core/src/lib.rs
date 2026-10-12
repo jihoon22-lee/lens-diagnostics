@@ -20,6 +20,7 @@ pub mod glob;
 pub mod hash;
 pub mod identity;
 pub mod json;
+pub mod read_policy;
 pub mod time;
 
 pub use bundle::{

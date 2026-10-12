@@ -80,7 +80,7 @@ impl ImpactGraph {
             let includes = match self.include_cache.get(&current) {
                 Some(cached) => cached.clone(),
                 None => {
-                    let parsed = std::fs::read_to_string(&current)
+                    let parsed = lens_core::read_policy::read_to_string(&current)
                         .ok()
                         .map(|c| extract_includes(&c));
                     self.include_cache.insert(current.clone(), parsed.clone());

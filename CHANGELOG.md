@@ -2,6 +2,14 @@
 
 Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.Z` 형식이다.
 
+## Unreleased
+
+- Confine discovered systemd, JUnit, environment, network and build evidence reads to MCP allowed roots, including symlinked descendants and drop-ins.
+- Preserve bundle collection failures and incomplete JUnit/disk evidence; validate bundled section schemas before comparison.
+- Preserve MCP diagnostics, honor log-stats `include_unknown`, and enforce the response byte budget even for oversized individual values.
+- Compare individual systemd unit files, wait through log rotation gaps, and retain epoch/pre-epoch log timestamps with correct bucket boundaries.
+- Classify single-file systemd masks/aliases consistently and skip unknown bundle section fields without intermediate JSON allocations.
+
 ## 0.7.0
 
 코드리뷰 후속 하드닝·사용성 개선 릴리스: 공유 오퍼레이션 레이어(`lens-ops`)와 findings 기반 종료 코드, 자동 판별 `lens inspect`/`lens diff`, `lens snapshot`과 번들 간 diff, 로그 follow/stats, MCP 샌드박스·prompts. 종료 코드 등 Breaking changes는 아래 섹션 참고.

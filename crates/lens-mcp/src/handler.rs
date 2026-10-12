@@ -8,6 +8,37 @@ use lens_ops::{Finding, Report};
 /// stay well inside an LLM context window. When pagination cannot shrink
 /// a response below this, the result is re-clamped and marked.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+// Two text content items, including JSON string escaping, plus envelope room.
+const TEXT_BUDGET: usize = (MAX_RESPONSE_BYTES - 1024) / 2;
+
+fn text_fits(text: &str) -> bool {
+    serde_json::to_string(text).is_ok_and(|encoded| encoded.len() <= TEXT_BUDGET)
+}
+
+fn bounded_json_text<T: serde::Serialize>(value: &T) -> Option<String> {
+    let bytes = lens_core::json::to_bounded_vec(value, TEXT_BUDGET).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    text_fits(&text).then_some(text)
+}
+
+/// Keep in-band tool errors bounded too, including JSON escaping overhead.
+pub fn bounded_error(mut error: String) -> String {
+    if text_fits(&error) {
+        return error;
+    }
+    const SUFFIX: &str = "\n[error text truncated to response byte budget]";
+    loop {
+        let mut end = error.len() / 2;
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error.truncate(end);
+        let text = format!("{error}{SUFFIX}");
+        if text_fits(&text) {
+            return text;
+        }
+    }
+}
 /// Default cap on any array inside a tool result (override per call with
 /// the `limit` argument).
 const DEFAULT_ARRAY_LIMIT: usize = 200;
@@ -124,12 +155,16 @@ fn serialize_result(v: Value, args: &Value) -> Result<String, String> {
                 m.insert("_response_clamped".to_string(), serde_json::json!(true));
             }
         }
-        let text = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
-        if text.len() <= MAX_RESPONSE_BYTES || clamp == CLAMPED_ARRAY_LIMIT {
+        if let Some(text) = bounded_json_text(&out) {
             return Ok(text);
         }
     }
-    unreachable!()
+    Ok(serde_json::json!({
+        "_response_clamped": true,
+        "_data_omitted": true,
+        "reason": "Data exceeds the response byte budget; use narrower inputs or a smaller page."
+    })
+    .to_string())
 }
 
 /// `--allow-root` sandboxes filesystem access: when non-empty, every
@@ -148,6 +183,7 @@ pub fn set_allowed_roots(roots: Vec<PathBuf>) -> Result<(), String> {
                 .map_err(|e| format!("cannot canonicalize --allow-root {}: {}", r.display(), e))?,
         );
     }
+    lens_core::read_policy::set_roots(canon.clone()).map_err(str::to_string)?;
     let _ = ALLOWED_ROOTS.set(canon);
     Ok(())
 }
@@ -230,6 +266,7 @@ fn tool_opt_path(args: &Value, key: &str) -> Result<Option<PathBuf>, String> {
 struct ToolOutcome {
     value: Value,
     findings: Vec<Finding>,
+    diagnostics: Vec<String>,
     complete: bool,
 }
 
@@ -238,6 +275,7 @@ impl<T: serde::Serialize> From<Report<T>> for ToolOutcome {
         Self {
             value: serde_json::to_value(&report.data).unwrap_or(Value::Null),
             findings: report.findings,
+            diagnostics: report.diagnostics,
             complete: report.complete,
         }
     }
@@ -274,6 +312,7 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             Ok(ToolOutcome {
                 value,
                 findings: report.findings,
+                diagnostics: report.diagnostics,
                 complete: report.complete,
             })
         }
@@ -371,6 +410,7 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                     "truncated": truncated,
                 }),
                 findings: Vec::new(),
+                diagnostics: Vec::new(),
                 complete: true,
             })
         }
@@ -380,7 +420,10 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                 query: arg_opt(args, "query").map(String::from),
                 regex: arg_opt(args, "regex").map(String::from),
                 min_level: arg_opt(args, "min_level").map(String::from),
-                include_unknown: false,
+                include_unknown: args
+                    .get("include_unknown")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 since: arg_opt(args, "since").map(String::from),
                 until: arg_opt(args, "until").map(String::from),
                 year: args.get("year").and_then(|v| v.as_i64()).map(|y| y as i32),
@@ -422,6 +465,7 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             Ok(ToolOutcome {
                 value,
                 findings: report.findings,
+                diagnostics: report.diagnostics,
                 complete: report.complete,
             })
         }
@@ -484,6 +528,7 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                     "shadowing_issues": venv.shadowing_issues,
                 }),
                 findings: report.findings,
+                diagnostics: report.diagnostics,
                 complete: report.complete,
             })
         }
@@ -549,29 +594,61 @@ pub struct ToolOutput {
 /// keep the full count honest, and an oversized serialization falls
 /// back to the clamped array limit.
 fn serialize_findings(outcome: &ToolOutcome, args: &Value) -> Option<String> {
-    if outcome.findings.is_empty() && outcome.complete {
+    #[derive(serde::Serialize)]
+    struct Metadata<'a> {
+        findings: &'a [Finding],
+        findings_total: usize,
+        findings_truncated: bool,
+        complete: bool,
+        diagnostics: &'a [String],
+        diagnostics_total: usize,
+        diagnostics_truncated: bool,
+    }
+    if outcome.findings.is_empty() && outcome.diagnostics.is_empty() && outcome.complete {
         return None;
     }
     let total = outcome.findings.len();
-    let emit = |cap: usize| {
-        let shown = total.min(cap);
-        serde_json::json!({
-            "findings": &outcome.findings[..shown],
-            "findings_total": total,
-            "findings_truncated": total > shown,
-            "complete": outcome.complete,
-        })
-        .to_string()
-    };
-    let mut text = emit(arg_usize(args, "limit", DEFAULT_ARRAY_LIMIT));
-    if text.len() > MAX_RESPONSE_BYTES {
-        text = emit(CLAMPED_ARRAY_LIMIT);
+    let mut shown = total.min(arg_usize(args, "limit", DEFAULT_ARRAY_LIMIT));
+    let diagnostics_total = outcome.diagnostics.len();
+    let mut diagnostics_shown =
+        diagnostics_total.min(arg_usize(args, "limit", DEFAULT_ARRAY_LIMIT));
+    loop {
+        let metadata = Metadata {
+            findings: &outcome.findings[..shown],
+            findings_total: total,
+            findings_truncated: total > shown,
+            complete: outcome.complete,
+            diagnostics: &outcome.diagnostics[..diagnostics_shown],
+            diagnostics_total,
+            diagnostics_truncated: diagnostics_shown < diagnostics_total,
+        };
+        if let Some(text) = bounded_json_text(&metadata) {
+            return Some(text);
+        }
+        // Halve the more expensive list, preserving the other list when
+        // one finding or diagnostic alone is larger than the budget.
+        let finding_bytes = outcome.findings[..shown]
+            .iter()
+            .map(|f| f.code.len() + f.message.len() + 64)
+            .sum::<usize>();
+        let diagnostic_bytes = outcome.diagnostics[..diagnostics_shown]
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
+        if shown > 0 && finding_bytes >= diagnostic_bytes {
+            shown /= 2;
+        } else {
+            diagnostics_shown /= 2;
+        }
     }
-    Some(text)
 }
 
 pub fn execute_tool(name: &str, args: &Value) -> Result<ToolOutput, String> {
-    let outcome = execute_tool_value(name, args)?;
+    let result = execute_tool_value(name, args);
+    if let Some(denial) = lens_core::read_policy::take_denial() {
+        return Err(denial);
+    }
+    let outcome = result?;
     let findings = serialize_findings(&outcome, args);
     Ok(ToolOutput {
         data: serialize_result(outcome.value, args)?,
@@ -581,6 +658,32 @@ pub fn execute_tool(name: &str, args: &Value) -> Result<ToolOutput, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oversized_single_items_and_diagnostics_are_bounded() {
+        let outcome = ToolOutcome {
+            value: json!({"huge": "\"\\\n".repeat(100_000)}),
+            findings: vec![Finding {
+                severity: lens_ops::Severity::Fail,
+                code: "test.regression".into(),
+                message: "x".repeat(100_000),
+            }],
+            diagnostics: vec!["bad section".into()],
+            complete: false,
+        };
+        let text = serialize_findings(&outcome, &json!({})).unwrap();
+        assert!(text_fits(&text));
+        let metadata: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(metadata["findings_total"], 1);
+        assert_eq!(metadata["findings_truncated"], true);
+        assert_eq!(metadata["diagnostics"][0], "bad section");
+        assert_eq!(metadata["complete"], false);
+        let data = serialize_result(outcome.value, &json!({})).unwrap();
+        assert!(text_fits(&data));
+        let wire = json!({"content": [{"type":"text", "text":data}, {"type":"text", "text":text}]})
+            .to_string();
+        assert!(wire.len() < MAX_RESPONSE_BYTES);
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -680,6 +783,7 @@ mod tests {
         let outcome = ToolOutcome {
             value: json!({}),
             findings: many,
+            diagnostics: Vec::new(),
             complete: true,
         };
         let text = serialize_findings(&outcome, &json!({})).unwrap();
@@ -705,6 +809,7 @@ mod tests {
         let outcome = ToolOutcome {
             value: json!({}),
             findings: huge,
+            diagnostics: Vec::new(),
             complete: true,
         };
         let text = serialize_findings(&outcome, &json!({})).unwrap();
@@ -714,6 +819,7 @@ mod tests {
             text.len()
         );
         let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["findings"].as_array().unwrap().len(), CLAMPED_ARRAY_LIMIT);
+        assert!(v["findings_truncated"].as_bool().unwrap());
+        assert!(text_fits(&text));
     }
 }

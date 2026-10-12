@@ -150,7 +150,7 @@ impl DiskScanner {
                     continue;
                 }
 
-                let read_dir = match fs::read_dir(&current_dir) {
+                let read_dir = match lens_core::read_policy::read_dir(&current_dir) {
                     Ok(rd) => rd,
                     Err(e) => {
                         errors.push(format!("Cannot read dir {:?}: {}", current_dir, e));
@@ -202,7 +202,7 @@ impl DiskScanner {
                     match fs::symlink_metadata(&path) {
                         Ok(sym_meta) => {
                             let target = if sym_meta.file_type().is_symlink() {
-                                fs::metadata(&path).ok()
+                                lens_core::read_policy::metadata(&path).ok()
                             } else {
                                 None
                             };

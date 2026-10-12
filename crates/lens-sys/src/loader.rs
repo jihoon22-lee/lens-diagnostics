@@ -23,6 +23,14 @@ const UNIT_SUFFIXES: [&str; 10] = [
     ".scope",
 ];
 
+fn unit_symlink_target(path: &Path) -> std::io::Result<PathBuf> {
+    // A /dev/null mask is a fixed sentinel: classify it without opening it.
+    if std::fs::read_link(path).is_ok_and(|target| target == Path::new("/dev/null")) {
+        return Ok(PathBuf::from("/dev/null"));
+    }
+    lens_core::read_policy::canonicalize(path)
+}
+
 /// Load one unit file, then merge every `*.conf` in its `<name>.d/` directory.
 pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
     let name = path
@@ -30,7 +38,7 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
         .and_then(|n| n.to_str())
         .unwrap_or("unit")
         .to_string();
-    let content = std::fs::read_to_string(path).map_err(|e| LensError::Io {
+    let content = lens_core::read_policy::read_to_string(path).map_err(|e| LensError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -39,10 +47,10 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
     // systemd precedence: for an instance `foo@bar.service`, template-level
     // `foo@.service.d/*.conf` merges first, then `foo@bar.service.d/*.conf`.
     for drop_dir in drop_in_dirs(path, &name) {
-        if !drop_dir.is_dir() {
+        if !lens_core::read_policy::metadata(&drop_dir).is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        let mut confs: Vec<PathBuf> = match std::fs::read_dir(&drop_dir) {
+        let mut confs: Vec<PathBuf> = match lens_core::read_policy::read_dir(&drop_dir) {
             Ok(rd) => rd
                 .flatten()
                 .map(|e| e.path())
@@ -61,7 +69,7 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
         };
         confs.sort();
         for conf in confs {
-            match std::fs::read_to_string(&conf) {
+            match lens_core::read_policy::read_to_string(&conf) {
                 Ok(c) => apply_drop_in(&mut unit, &c, &conf.to_string_lossy()),
                 Err(e) => unit.diagnostics.push(Diagnostic {
                     code: "DROPIN_UNREADABLE".to_string(),
@@ -80,7 +88,7 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
 /// unit files — each with its drop-ins applied.
 pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
     let mut units = BTreeMap::new();
-    if !path.exists() {
+    if !path.exists() && !path.is_symlink() {
         // Fail closed: a misspelled --systemd-dir must not yield a vacuous
         // "0 units, no cycles" report.
         return Err(LensError::Io {
@@ -88,11 +96,10 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "unit path does not exist"),
         });
     }
-    if path.is_file() {
-        let unit = load_unit(path)?;
-        units.insert(unit.name.clone(), unit);
+    let paths = if path.is_symlink() && unit_name_of(path).is_some() || path.is_file() {
+        vec![path.to_path_buf()]
     } else if path.is_dir() {
-        let entries = std::fs::read_dir(path).map_err(|e| LensError::Io {
+        let entries = lens_core::read_policy::read_dir(path).map_err(|e| LensError::Io {
             path: path.to_path_buf(),
             source: e,
         })?;
@@ -111,88 +118,68 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
             .map(|e| e.path())
             .collect();
         paths.sort();
+        paths
+    } else {
+        Vec::new()
+    };
 
-        // (link name, canonical target unit name) for alias symlinks.
-        let mut alias_pairs: Vec<(String, String)> = Vec::new();
-        for p in paths {
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            if p.is_symlink() {
-                match std::fs::canonicalize(&p) {
-                    Ok(target) if target == Path::new("/dev/null") => {
-                        // Masked unit: cannot be ordered, must not
-                        // participate in the graph.
-                        let mut unit = SystemdUnit {
-                            name: name.clone(),
-                            path: Some(p.to_string_lossy().into_owned()),
-                            masked: true,
-                            ..Default::default()
-                        };
-                        unit.diagnostics.push(Diagnostic {
-                            code: "UNIT_MASKED".to_string(),
-                            severity: "info".to_string(),
-                            message: "unit is masked (symlink to /dev/null)".to_string(),
-                            path: Some(p.to_string_lossy().into_owned()),
-                            line: None,
-                        });
-                        units.insert(name, unit);
-                        continue;
-                    }
-                    Ok(target) => {
-                        let target_name = target
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        // A symlink whose basename differs from the link's
-                        // is an alias (e.g. dbus-org.foo.service).
-                        if !target_name.is_empty() && target_name != name {
-                            let mut unit = SystemdUnit {
-                                name: name.clone(),
-                                path: Some(p.to_string_lossy().into_owned()),
-                                alias_of: Some(target_name.clone()),
-                                ..Default::default()
-                            };
-                            unit.diagnostics.push(Diagnostic {
-                                code: "UNIT_ALIAS".to_string(),
-                                severity: "info".to_string(),
-                                message: format!("alias for {}", target_name),
-                                path: Some(p.to_string_lossy().into_owned()),
-                                line: None,
-                            });
-                            units.insert(name.clone(), unit);
-                            alias_pairs.push((name, target_name));
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        let mut unit = SystemdUnit {
-                            name: name.clone(),
-                            path: Some(p.to_string_lossy().into_owned()),
-                            ..Default::default()
-                        };
-                        unit.diagnostics.push(Diagnostic {
-                            code: "UNIT_UNREADABLE".to_string(),
-                            severity: "error".to_string(),
-                            message: format!("broken symlink: {}", e),
-                            path: Some(p.to_string_lossy().into_owned()),
-                            line: None,
-                        });
-                        units.insert(name, unit);
-                        continue;
-                    }
+    // (link name, canonical target unit name) for alias symlinks.
+    let mut alias_pairs: Vec<(String, String)> = Vec::new();
+    for p in paths {
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        if p.is_symlink() {
+            match unit_symlink_target(&p) {
+                Ok(target) if target == Path::new("/dev/null") => {
+                    // Masked unit: cannot be ordered, must not
+                    // participate in the graph.
+                    let mut unit = SystemdUnit {
+                        name: name.clone(),
+                        path: Some(p.to_string_lossy().into_owned()),
+                        masked: true,
+                        ..Default::default()
+                    };
+                    unit.diagnostics.push(Diagnostic {
+                        code: "UNIT_MASKED".to_string(),
+                        severity: "info".to_string(),
+                        message: "unit is masked (symlink to /dev/null)".to_string(),
+                        path: Some(p.to_string_lossy().into_owned()),
+                        line: None,
+                    });
+                    units.insert(name, unit);
+                    continue;
                 }
-            }
-            match load_unit(&p) {
-                Ok(unit) => {
-                    units.insert(unit.name.clone(), unit);
+                Ok(target) => {
+                    let target_name = target
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // A symlink whose basename differs from the link's
+                    // is an alias (e.g. dbus-org.foo.service).
+                    if !target_name.is_empty() && target_name != name {
+                        let mut unit = SystemdUnit {
+                            name: name.clone(),
+                            path: Some(p.to_string_lossy().into_owned()),
+                            alias_of: Some(target_name.clone()),
+                            ..Default::default()
+                        };
+                        unit.diagnostics.push(Diagnostic {
+                            code: "UNIT_ALIAS".to_string(),
+                            severity: "info".to_string(),
+                            message: format!("alias for {}", target_name),
+                            path: Some(p.to_string_lossy().into_owned()),
+                            line: None,
+                        });
+                        units.insert(name.clone(), unit);
+                        alias_pairs.push((name, target_name));
+                        continue;
+                    }
                 }
                 Err(e) => {
-                    // Fail-closed: an unreadable unit is recorded rather than
-                    // silently skipped, so diagnostics surface the gap.
                     let mut unit = SystemdUnit {
                         name: name.clone(),
                         path: Some(p.to_string_lossy().into_owned()),
@@ -201,19 +188,42 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
                     unit.diagnostics.push(Diagnostic {
                         code: "UNIT_UNREADABLE".to_string(),
                         severity: "error".to_string(),
-                        message: format!("{}", e),
+                        message: format!("broken symlink: {}", e),
                         path: Some(p.to_string_lossy().into_owned()),
                         line: None,
                     });
                     units.insert(name, unit);
+                    continue;
                 }
             }
         }
-        // Fold alias names onto their canonical units.
-        for (alias_name, target_name) in alias_pairs {
-            if let Some(target) = units.get_mut(&target_name) {
-                target.aliases.push(alias_name);
+        match load_unit(&p) {
+            Ok(unit) => {
+                units.insert(unit.name.clone(), unit);
             }
+            Err(e) => {
+                // Fail-closed: an unreadable unit is recorded rather than
+                // silently skipped, so diagnostics surface the gap.
+                let mut unit = SystemdUnit {
+                    name: name.clone(),
+                    path: Some(p.to_string_lossy().into_owned()),
+                    ..Default::default()
+                };
+                unit.diagnostics.push(Diagnostic {
+                    code: "UNIT_UNREADABLE".to_string(),
+                    severity: "error".to_string(),
+                    message: format!("{}", e),
+                    path: Some(p.to_string_lossy().into_owned()),
+                    line: None,
+                });
+                units.insert(name, unit);
+            }
+        }
+    }
+    // Fold alias names onto their canonical units.
+    for (alias_name, target_name) in alias_pairs {
+        if let Some(target) = units.get_mut(&target_name) {
+            target.aliases.push(alias_name);
         }
     }
     flag_missing_references(&mut units);
@@ -337,10 +347,10 @@ fn drop_in_confs(dir: &Path, unit_name: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let unit_path = dir.join(unit_name);
     for drop_dir in drop_in_dirs(&unit_path, unit_name) {
-        if !drop_dir.is_dir() {
+        if !lens_core::read_policy::metadata(&drop_dir).is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        let mut confs: Vec<PathBuf> = match std::fs::read_dir(&drop_dir) {
+        let mut confs: Vec<PathBuf> = match lens_core::read_policy::read_dir(&drop_dir) {
             Ok(rd) => rd
                 .flatten()
                 .map(|e| e.path())
@@ -366,7 +376,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
     let dir_names: Vec<std::collections::BTreeSet<String>> = dirs
         .iter()
         .map(|d| {
-            std::fs::read_dir(d.as_ref())
+            lens_core::read_policy::read_dir(d.as_ref())
                 .map(|rd| {
                     rd.flatten()
                         .filter(|e| {
@@ -423,7 +433,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
         // Masked / alias / broken symlinks are handled at the winning dir —
         // a mask in /etc shadows the vendor unit entirely.
         if p.is_symlink() {
-            match std::fs::canonicalize(&p) {
+            match unit_symlink_target(&p) {
                 Ok(target) if target == Path::new("/dev/null") => {
                     let mut unit = SystemdUnit {
                         name: name.clone(),
@@ -484,7 +494,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
             }
         }
 
-        let mut unit = match std::fs::read_to_string(&p) {
+        let mut unit = match lens_core::read_policy::read_to_string(&p) {
             Ok(content) => parse_unit_content(&content, &name, Some(&p.to_string_lossy())),
             Err(e) => {
                 let mut unit = SystemdUnit {
@@ -525,7 +535,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
 fn apply_merged_drop_ins(unit: &mut SystemdUnit, dirs: &[impl AsRef<Path>], unit_name: &str) {
     for dir in dirs.iter().rev() {
         for conf in drop_in_confs(dir.as_ref(), unit_name) {
-            match std::fs::read_to_string(&conf) {
+            match lens_core::read_policy::read_to_string(&conf) {
                 Ok(c) => apply_drop_in(unit, &c, &conf.to_string_lossy()),
                 Err(e) => unit.diagnostics.push(Diagnostic {
                     code: "DROPIN_UNREADABLE".to_string(),
@@ -606,6 +616,30 @@ mod tests {
     fn test_load_units_rejects_missing_path() {
         let missing = std::path::Path::new("/nonexistent-lens-sys-dir-xyz");
         assert!(load_units(missing).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review3_single_file_links_match_directory_classification() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("real.service"),
+            "[Unit]\nAfter=real.service\n",
+        )
+        .unwrap();
+        symlink("real.service", dir.path().join("alias.service")).unwrap();
+        symlink("/dev/null", dir.path().join("masked.service")).unwrap();
+        symlink("missing.service", dir.path().join("broken.service")).unwrap();
+        let all = load_units(dir.path()).unwrap();
+        for name in ["alias.service", "masked.service", "broken.service"] {
+            let single = load_units(&dir.path().join(name)).unwrap();
+            let unit = &single[name];
+            assert_eq!(unit.masked, all[name].masked);
+            assert_eq!(unit.alias_of, all[name].alias_of);
+            assert_eq!(unit.after, all[name].after);
+            assert_eq!(unit.diagnostics, all[name].diagnostics);
+        }
     }
 
     #[test]

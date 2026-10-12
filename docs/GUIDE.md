@@ -501,3 +501,28 @@ cargo build --release -p lens-mcp
   `errors`, `diagnostics`, `scan_truncated` 등의 필드로 표면화.
 - **스키마 버전**: 모든 스냅샷/리포트에 `schema` 문자열 필드.
 - **버전 정합**: 런타임 버전은 `env!("CARGO_PKG_VERSION")`에서만 취함.
+
+### MCP evidence and response bounds
+
+MCP findings metadata also includes `diagnostics`, `diagnostics_total` and
+`diagnostics_truncated`; collection failures remain visible even with no findings.
+The byte budget includes escaped JSON text for both content items. If pagination
+cannot fit an individual value, the data item contains `_data_omitted: true` and
+`_response_clamped: true`; use narrower inputs to retrieve the evidence. Findings
+and diagnostics retain totals and explicit truncation flags when entries are omitted.
+`lens_log_stats` supports `include_unknown` just like `lens_log_filter`.
+
+Allowed roots apply to discovered evidence files, including systemd drop-ins,
+JUnit directory/glob entries and secondary environment/network/build reads.
+This is an application read boundary, not an operating-system sandbox.
+It does not hide all external path metadata: an out-and-back symlink chain
+ending inside a root, or an optional environment/doctor existence precheck,
+can reveal whether an external hop/target exists. Do not use allowed roots as
+an isolation boundary against an actor who can modify the input filesystem.
+
+Bundle manifests have a 1 MiB metadata limit, checked before buffering or
+parsing. Bundle diff bounds imported collection diagnostics to 128 messages,
+64 KiB in total and 4 KiB per message, with explicit truncation notices;
+the report remains incomplete when collection evidence is missing.
+Bundle sections deserialize directly into their report types, skipping unknown
+fields without allocating an intermediate JSON tree.

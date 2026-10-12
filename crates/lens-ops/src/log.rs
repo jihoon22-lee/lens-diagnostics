@@ -178,7 +178,19 @@ impl Follower {
     /// is lossy-decoded (U+FFFD) and a trailing `\r` is stripped, matching
     /// how indexed lines are shown.
     pub fn poll(&mut self) -> Result<FollowPoll> {
-        let md = fs::metadata(&self.path).map_err(|e| LensError::Io {
+        // Open first: metadata and bytes must refer to the same inode even
+        // if rotation happens during this poll.
+        let mut file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FollowPoll::default()),
+            Err(source) => {
+                return Err(LensError::Io {
+                    path: self.path.clone(),
+                    source,
+                })
+            }
+        };
+        let md = file.metadata().map_err(|e| LensError::Io {
             path: self.path.clone(),
             source: e,
         })?;
@@ -206,10 +218,6 @@ impl Follower {
                 note,
             });
         }
-        let mut file = fs::File::open(&self.path).map_err(|e| LensError::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
         file.seek(SeekFrom::Start(self.offset))
             .map_err(|e| LensError::Io {
                 path: self.path.clone(),
@@ -328,11 +336,7 @@ pub fn stats(
             // Aggregation uses the filter's syslog_year — `parse_line`
             // would stamp yearless syslog lines with the *current*
             // year, scattering them into wrong buckets under --year.
-            let ts =
-                lens_log::timestamp::extract_timestamp_ms(&line, filter.syslog_year).unwrap_or(0);
-            if ts <= 0 {
-                unknown_timestamp += 1;
-            } else {
+            if let Some(ts) = lens_log::timestamp::extract_timestamp_ms(&line, filter.syslog_year) {
                 first_ms = first_ms.min(ts);
                 last_ms = last_ms.max(ts);
                 // `Unknown` sorts above `Fatal` in the derived Ord, so
@@ -342,6 +346,8 @@ pub fn stats(
                     ts,
                     record.level >= LogLevel::Warn && record.level != LogLevel::Unknown,
                 ));
+            } else {
+                unknown_timestamp += 1;
             }
         }
     }
@@ -355,7 +361,7 @@ pub fn stats(
     });
     let mut acc: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
     for (ts, warn_plus) in stamped {
-        let b = (ts / 1000) / bucket_secs as i64 * bucket_secs as i64;
+        let b = ts.div_euclid(1000).div_euclid(bucket_secs as i64) * bucket_secs as i64;
         let e = acc.entry(b).or_default();
         e.0 += 1;
         if warn_plus {
@@ -392,6 +398,34 @@ pub fn stats(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn follower_waits_for_rotation_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "old\npartial").unwrap();
+        let mut follower = Follower::new(&path, 0).unwrap();
+        assert_eq!(follower.poll().unwrap().lines, vec!["old"]);
+        std::fs::rename(&path, dir.path().join("log.1")).unwrap();
+        assert!(follower.poll().unwrap().lines.is_empty());
+        assert!(follower.poll().unwrap().lines.is_empty());
+        std::fs::write(&path, "replacement\n").unwrap();
+        assert_eq!(follower.poll().unwrap().lines, vec!["replacement"]);
+    }
+
+    #[test]
+    fn stats_preserve_epoch_and_negative_timestamp_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "1969-12-31T23:59:59.500Z INFO before\n1970-01-01T00:00:00Z INFO epoch\nDec 31 23:59:59 host kernel: <6>syslog\nunknown\n").unwrap();
+        let report = stats(&[path], &LogFilter::new().with_syslog_year(1969), Some(60)).unwrap();
+        assert_eq!(report.data.unknown_timestamp, 1);
+        assert_eq!(report.data.buckets.len(), 2);
+        assert_eq!(report.data.buckets[0].start, "1969-12-31T23:59:00Z");
+        assert_eq!(report.data.buckets[0].total, 2);
+        assert_eq!(report.data.buckets[1].total, 1);
+        assert_eq!(report.data.last_ts.as_deref(), Some("1970-01-01T00:00:00Z"));
+    }
+
     use super::*;
     use std::io::Write;
 

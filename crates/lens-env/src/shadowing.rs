@@ -220,7 +220,7 @@ const STDLIB_MODULES: &[&str] = &[
 /// so they must not be flagged — only depth-1 names shadow.
 fn candidate_modules(dir: &Path) -> Vec<(String, std::path::PathBuf)> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = lens_core::read_policy::read_dir(dir) else {
         return out;
     };
     for entry in entries.flatten() {
