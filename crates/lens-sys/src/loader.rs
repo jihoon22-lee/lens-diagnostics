@@ -23,6 +23,14 @@ const UNIT_SUFFIXES: [&str; 10] = [
     ".scope",
 ];
 
+fn unit_symlink_target(path: &Path) -> std::io::Result<PathBuf> {
+    // A /dev/null mask is a fixed sentinel: classify it without opening it.
+    if std::fs::canonicalize(path).is_ok_and(|target| target == Path::new("/dev/null")) {
+        return Ok(PathBuf::from("/dev/null"));
+    }
+    lens_core::read_policy::canonicalize(path)
+}
+
 /// Load one unit file, then merge every `*.conf` in its `<name>.d/` directory.
 pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
     let name = path
@@ -121,7 +129,7 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
                 .unwrap_or("unknown")
                 .to_string();
             if p.is_symlink() {
-                match std::fs::canonicalize(&p) {
+                match unit_symlink_target(&p) {
                     Ok(target) if target == Path::new("/dev/null") => {
                         // Masked unit: cannot be ordered, must not
                         // participate in the graph.
@@ -423,7 +431,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
         // Masked / alias / broken symlinks are handled at the winning dir —
         // a mask in /etc shadows the vendor unit entirely.
         if p.is_symlink() {
-            match std::fs::canonicalize(&p) {
+            match unit_symlink_target(&p) {
                 Ok(target) if target == Path::new("/dev/null") => {
                     let mut unit = SystemdUnit {
                         name: name.clone(),

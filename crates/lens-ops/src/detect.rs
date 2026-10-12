@@ -31,7 +31,16 @@ pub enum InputKind {
 const SNIFF_BYTES: usize = 64 * 1024;
 
 const UNIT_EXTENSIONS: &[&str] = &[
-    "service", "socket", "target", "timer", "mount", "path", "slice",
+    "service",
+    "socket",
+    "target",
+    "timer",
+    "mount",
+    "automount",
+    "swap",
+    "path",
+    "slice",
+    "scope",
 ];
 
 fn read_head(path: &Path, cap: usize) -> Result<Vec<u8>> {

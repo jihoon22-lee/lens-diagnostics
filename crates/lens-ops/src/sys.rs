@@ -155,6 +155,31 @@ pub fn diff_snapshots(s1: &SystemdSnapshot, s2: &SystemdSnapshot) -> Report<Syst
 #[cfg(test)]
 mod tests {
     #[test]
+    fn followup_all_supported_unit_suffixes_compare() {
+        let dir = tempfile::tempdir().unwrap();
+        for suffix in [
+            "service",
+            "socket",
+            "target",
+            "timer",
+            "mount",
+            "automount",
+            "swap",
+            "path",
+            "slice",
+            "scope",
+        ] {
+            let path = dir.path().join(format!("a.{suffix}"));
+            std::fs::write(&path, "[Unit]\nDescription=valid unit\n").unwrap();
+            assert_eq!(
+                crate::detect::detect(&path).unwrap(),
+                crate::detect::InputKind::SystemdUnit,
+                "{suffix}"
+            );
+            assert!(super::diff(&path, &path).is_ok(), "{suffix}");
+        }
+    }
+    #[test]
     fn diff_accepts_individual_units_and_dropins() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.service");

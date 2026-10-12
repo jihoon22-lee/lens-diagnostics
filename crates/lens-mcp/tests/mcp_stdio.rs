@@ -1041,3 +1041,72 @@ fn allow_root_rejects_descendant_symlink_reads() {
         );
     }
 }
+#[cfg(unix)]
+#[test]
+fn followup_alias_target_must_be_allowed() {
+    let mut sys_denial = None;
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("target.service");
+    std::fs::write(&target, "[Unit]\n").unwrap();
+    std::os::unix::fs::symlink(&target, root.path().join("alias.service")).unwrap();
+    for (name, arguments) in [
+        ("lens_sys_cycles", serde_json::json!({"dir":root.path()})),
+        (
+            "lens_doctor",
+            serde_json::json!({"root_path":root.path(),"systemd_dir":root.path()}),
+        ),
+    ] {
+        let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}}).to_string();
+        let response =
+            roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+        assert_eq!(
+            response[0]["result"]["isError"], true,
+            "{name}: {:?}",
+            response[0]
+        );
+        if name == "lens_sys_cycles" {
+            sys_denial = Some(response[0]["result"].clone());
+        }
+    }
+    std::fs::remove_file(&target).unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_sys_cycles","arguments":{"dir":root.path()}}}).to_string();
+    let response = roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+    assert_eq!(
+        response[0]["result"]["isError"], true,
+        "dangling external alias must also be denied"
+    );
+    assert_eq!(Some(response[0]["result"].clone()), sys_denial);
+    // In-root aliases and fixed /dev/null mask sentinels remain usable.
+    std::fs::remove_file(root.path().join("alias.service")).unwrap();
+    let local = root.path().join("local.service");
+    std::fs::write(&local, "[Unit]\n").unwrap();
+    std::os::unix::fs::symlink(&local, root.path().join("alias.service")).unwrap();
+    std::os::unix::fs::symlink("/dev/null", root.path().join("masked.service")).unwrap();
+    let response = roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+    assert!(
+        response[0]["result"].get("isError").is_none(),
+        "{:?}",
+        response[0]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn followup_disk_target_metadata_must_be_allowed() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_disk_scan","arguments":{"path":root.path(),"json":true}}}).to_string();
+    let response = roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+    assert_eq!(response[0]["result"]["isError"], true, "{:?}", response[0]);
+}
+
+#[test]
+fn followup_oversized_validation_error_is_bounded() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_log_stats","arguments":{"path":file.path(),"min_level":"\"\\\n".repeat(100_000)}}}).to_string();
+    let response = roundtrip(&[&call]);
+    assert_eq!(response[0]["result"]["isError"], true);
+    assert!(response[0].to_string().len() <= 64 * 1024);
+}

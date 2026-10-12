@@ -14,6 +14,25 @@ const TEXT_BUDGET: usize = (MAX_RESPONSE_BYTES - 1024) / 2;
 fn text_fits(text: &str) -> bool {
     serde_json::to_string(text).is_ok_and(|encoded| encoded.len() <= TEXT_BUDGET)
 }
+
+/// Keep in-band tool errors bounded too, including JSON escaping overhead.
+pub fn bounded_error(mut error: String) -> String {
+    if text_fits(&error) {
+        return error;
+    }
+    const SUFFIX: &str = "\n[error text truncated to response byte budget]";
+    loop {
+        let mut end = error.len() / 2;
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error.truncate(end);
+        let text = format!("{error}{SUFFIX}");
+        if text_fits(&text) {
+            return text;
+        }
+    }
+}
 /// Default cap on any array inside a tool result (override per call with
 /// the `limit` argument).
 const DEFAULT_ARRAY_LIMIT: usize = 200;

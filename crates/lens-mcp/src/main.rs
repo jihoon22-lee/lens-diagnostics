@@ -253,7 +253,7 @@ fn handle_request(req: &JsonRpcRequest, id_present: bool) -> Option<JsonRpcRespo
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": err
+                                    "text": lens_mcp::handler::bounded_error(err)
                                 }
                             ],
                             "isError": true

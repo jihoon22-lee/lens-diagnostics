@@ -43,7 +43,7 @@ Before fixes, both new P1 regressions failed on that source:
 ## Verification
 
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `cargo test --workspace`: 309 tests passed, including actual MCP subprocess
+- `cargo test --workspace`: 313 tests passed, including actual MCP subprocess
   tests for systemd/JUnit/doctor escapes, drop-ins, XML globs, secondary readers,
   multiple allowed roots, diagnostics and an oversized JUnit failure response.
 - `cargo build --release --workspace`: passed.
@@ -64,3 +64,29 @@ symlink fixtures are covered. Concurrent hostile filesystem mutation between
 canonicalization and opening has not been claimed as validated. The MCP server
 dispatches calls synchronously; its denial accumulator follows that contract.
 Windows-native binaries and non-Linux filesystem behavior are not validated.
+
+## PR #146 follow-up review
+
+The first code review identified four additional P2 cases. All four new
+`followup_` regressions failed on `ef1d9d7` before the follow-up fixes:
+
+- External systemd aliases of a different basename were classified before a
+  guarded read. Alias resolution is now checked, including dangling targets;
+  the denial is identical whether the external target exists or not. Local
+  aliases remain supported. `/dev/null` masks are an explicit fixed sentinel
+  exception and are classified without opening the device.
+- Disk scans exposed symlink target metadata. Target stat and directory reads
+  now use the read policy, including scans performed by worker threads.
+- A large caller-controlled validation error bypassed the output budget.
+  In-band tool errors are now capped by encoded size with a truncation notice.
+- `.automount`, `.swap`, and `.scope` were missing from the detector. All ten
+  loader-supported suffixes are now exercised through detection and diff.
+
+The initial security review completed with no findings. Follow-up changes
+require a new review on their exact head before merge.
+
+After the follow-up fixes, all 313 workspace tests, strict clippy, release
+build, documentation checks and six release-flow tests passed. Actual release
+CLI/MCP runs also confirmed identical denials for existing/dangling external
+aliases, blocked disk target metadata, bounded large validation errors, and
+successful comparisons for the three previously omitted suffixes.
