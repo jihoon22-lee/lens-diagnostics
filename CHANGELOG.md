@@ -8,6 +8,7 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
 - Preserve bundle collection failures and incomplete JUnit/disk evidence; validate bundled section schemas before comparison.
 - Preserve MCP diagnostics, honor log-stats `include_unknown`, and enforce the response byte budget even for oversized individual values.
 - Compare individual systemd unit files, wait through log rotation gaps, and retain epoch/pre-epoch log timestamps with correct bucket boundaries.
+- Classify single-file systemd masks/aliases consistently and skip unknown bundle section fields without intermediate JSON allocations.
 
 ## 0.7.0
 

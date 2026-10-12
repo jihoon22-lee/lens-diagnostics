@@ -350,9 +350,47 @@ const SECTION_ENTRIES: &[(&str, &str)] = &[
     ("reports/log_summary.json", "log"),
 ];
 
-fn read_entry_json<T: serde::de::DeserializeOwned>(bundle: &PathBuf, entry: &str) -> Result<T> {
+trait SectionSchema {
+    fn section_schema(&self) -> Option<&str>;
+}
+
+macro_rules! section_schema {
+    ($type:ty, $field:ident) => {
+        impl SectionSchema for $type {
+            fn section_schema(&self) -> Option<&str> {
+                Some(&self.$field)
+            }
+        }
+    };
+}
+section_schema!(lens_sys::SystemdSnapshot, schema);
+section_schema!(lens_env::EnvSnapshot, schema);
+section_schema!(lens_net::NetReport, schema_version);
+section_schema!(lens_test::TestRun, schema);
+section_schema!(lens_trace::TraceSnapshot, schema);
+section_schema!(crate::doctor::DoctorReport, schema_version);
+section_schema!(lens_disk::SnapshotV2, schema_version);
+
+#[derive(serde::Deserialize)]
+struct LogSummary {
+    #[serde(default)]
+    total_lines: i64,
+}
+
+impl SectionSchema for LogSummary {
+    fn section_schema(&self) -> Option<&str> {
+        None
+    }
+}
+
+fn read_entry_json<T: serde::de::DeserializeOwned + SectionSchema>(
+    bundle: &PathBuf,
+    entry: &str,
+) -> Result<T> {
     let bytes = read_bundle_entry(bundle, entry)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    // Deserialize directly: unknown extensions are skipped, not allocated as
+    // an intermediate JSON tree before being discarded by the typed parser.
+    let value: T = serde_json::from_slice(&bytes)?;
     let expected = match entry {
         "reports/sys_snapshot.json" => Some(("schema", lens_sys::SNAPSHOT_SCHEMA_V1)),
         "reports/env_snapshot.json" => Some(("schema", lens_env::SNAPSHOT_SCHEMA_V1)),
@@ -363,14 +401,14 @@ fn read_entry_json<T: serde::de::DeserializeOwned>(bundle: &PathBuf, entry: &str
         "reports/disk_snapshot.json" => Some(("schema_version", lens_disk::SCHEMA_V2)),
         _ => None,
     };
-    if let Some((key, schema)) = expected {
-        if value.get(key).and_then(|v| v.as_str()) != Some(schema) {
+    if let Some((_, schema)) = expected {
+        if value.section_schema() != Some(schema) {
             return Err(LensError::InvalidInput {
                 message: format!("{}:{entry}: expected schema {schema}", bundle.display()),
             });
         }
     }
-    serde_json::from_value(value).map_err(LensError::Json)
+    Ok(value)
 }
 
 fn append_collection_diagnostics(output: &mut Vec<String>, side: &str, input: &[String]) {
@@ -601,11 +639,9 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
                     }
                 }
                 "log" => {
-                    let a = read_entry_json::<serde_json::Value>(base, entry)?;
-                    let b = read_entry_json::<serde_json::Value>(cand, entry)?;
-                    let lines =
-                        |v: &serde_json::Value| v["total_lines"].as_i64().unwrap_or_default();
-                    let delta = lines(&b) - lines(&a);
+                    let a = read_entry_json::<LogSummary>(base, entry)?;
+                    let b = read_entry_json::<LogSummary>(cand, entry)?;
+                    let delta = b.total_lines - a.total_lines;
                     let mut r = Report::new(serde_json::json!({
                         "total_lines_delta": delta,
                     }));
@@ -752,7 +788,7 @@ mod tests {
                 report
                     .diagnostics
                     .iter()
-                    .any(|d| d.contains("expected schema")),
+                    .any(|d| d.contains("expected schema") || d.contains("missing field")),
                 "{:?}",
                 report.diagnostics
             );
@@ -959,5 +995,43 @@ mod tests {
         let report = diff(&a, &b).unwrap();
         assert!(!report.complete);
         assert!(report.diagnostics.iter().any(|d| d.contains("test")));
+    }
+
+    #[test]
+    fn review3_unknown_section_fields_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = serde_json::to_string(&junit_run("passed")).unwrap();
+        // Typed deserialization skips unknown structures without building a
+        // Value tree (which also imposes its recursion limit on unknown data).
+        let payload = format!(
+            "{{\"future_extension\":{}0{},{}",
+            "[".repeat(150),
+            "]".repeat(150),
+            &run[1..]
+        );
+        let path = bundle_with(
+            dir.path(),
+            "unknown.lens",
+            vec![BundleArtifact {
+                name: "reports/test_run.json".into(),
+                data: payload.into_bytes(),
+            }],
+        );
+        let report = diff(&path, &path).unwrap();
+        assert!(report.complete, "{:?}", report.diagnostics);
+        assert!(report.data.sections.contains_key("test"));
+        let mut foreign = junit_run("passed");
+        foreign["schema"] = serde_json::json!("foreign/v99");
+        let path = bundle_with(
+            dir.path(),
+            "foreign.lens",
+            vec![json_artifact("reports/test_run.json", foreign)],
+        );
+        let report = diff(&path, &path).unwrap();
+        assert!(!report.complete);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("expected schema")));
     }
 }

@@ -116,3 +116,34 @@ build, documentation checks and all six release-flow tests passed. Direct
 release execution rejected an 8,573-byte compressed bundle containing an
 8 MiB diagnostic before parsing; `/usr/bin/time` measured peak RSS 4,552 KiB
 for that MCP process. All earlier release CLI/MCP smoke checks still passed.
+
+## Third review: material fixes and explicit residual limits
+
+Two further material regressions were reproduced on `275771f` before fixing:
+single-file unit aliases were parsed as ordinary units and masks were omitted;
+unknown section fields allocated an intermediate JSON tree. The latter also
+failed on a deeply nested unknown extension that typed deserialization skips.
+
+Single-file and directory inputs now share unit classification. Bundle reports
+deserialize once into typed structures, then validate their schema; the small
+log summary also uses a typed structure. Foreign schemas still fail closed.
+
+All 320 workspace tests, strict clippy, fmt, release build, docs checks and six
+release-flow tests passed. Actual release CLI output confirms alias/mask
+classification. An 8,328-byte bundle with 4 million unknown numeric values
+(8,000,310-byte section) used 298,900 KiB peak RSS before the fix and 13,384 KiB
+after it. Existing release smoke regressions still pass.
+
+Two metadata-only findings were reproduced and intentionally deferred under
+the user's instruction to avoid blocking completion on minor hardening:
+
+- An out-and-back symlink chain can reveal an external hop's existence, even
+  though the content endpoint is inside an allowed root.
+- Optional environment/doctor descendant existence prechecks can distinguish
+  existing from dangling external targets; an attempted external content read
+  is still denied.
+
+These are acknowledged limitations, not claims of fixes or full isolation.
+The guide documents them. No external content escape was observed in these
+fixtures. Full per-component resolution/probe isolation remains future work;
+concurrent hostile filesystem replacement and native Windows remain untested.

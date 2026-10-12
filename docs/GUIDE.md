@@ -515,8 +515,14 @@ and diagnostics retain totals and explicit truncation flags when entries are omi
 Allowed roots apply to discovered evidence files, including systemd drop-ins,
 JUnit directory/glob entries and secondary environment/network/build reads.
 This is an application read boundary, not an operating-system sandbox.
+It does not hide all external path metadata: an out-and-back symlink chain
+ending inside a root, or an optional environment/doctor existence precheck,
+can reveal whether an external hop/target exists. Do not use allowed roots as
+an isolation boundary against an actor who can modify the input filesystem.
 
 Bundle manifests have a 1 MiB metadata limit, checked before buffering or
 parsing. Bundle diff bounds imported collection diagnostics to 128 messages,
 64 KiB in total and 4 KiB per message, with explicit truncation notices;
 the report remains incomplete when collection evidence is missing.
+Bundle sections deserialize directly into their report types, skipping unknown
+fields without allocating an intermediate JSON tree.
