@@ -101,8 +101,14 @@ fn change_message(c: &lens_test::CaseChange) -> String {
 pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<TestDiff>> {
     let run_base = load_run(baseline, "baseline")?;
     let run_cand = load_run(candidate, "candidate")?;
+    Ok(diff_runs(&run_base, &run_cand))
+}
+
+/// Value-level classifier shared by the file diff and `bundle diff`.
+/// An incomplete run on either side marks the report incomplete.
+pub fn diff_runs(run_base: &TestRun, run_cand: &TestRun) -> Report<TestDiff> {
     let complete = run_base.complete && run_cand.complete;
-    let diff = diff_test_runs(&run_base, &run_cand);
+    let diff = diff_test_runs(run_base, run_cand);
     let (regressions, new_failures, removed): (Vec<String>, Vec<String>, Vec<String>) = (
         diff.regressions.iter().map(change_message).collect(),
         diff.new_failures.iter().map(change_message).collect(),
@@ -123,5 +129,5 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<TestDiff>> {
             format!("{r} removed from candidate run"),
         );
     }
-    Ok(report)
+    report
 }

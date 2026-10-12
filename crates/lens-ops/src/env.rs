@@ -93,7 +93,12 @@ fn load_env_input(path: &Path) -> Result<EnvSnapshot> {
 pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<EnvDiff>> {
     let s1 = load_env_input(baseline)?;
     let s2 = load_env_input(candidate)?;
-    let diff = diff_environments(&s1.venv, &s2.venv);
+    Ok(diff_values(&s1.venv, &s2.venv))
+}
+
+/// Value-level classifier shared by the file diff and `bundle diff`.
+pub fn diff_values(v1: &PyVenv, v2: &PyVenv) -> Report<EnvDiff> {
+    let diff = diff_environments(v1, v2);
     let mut report = Report::new(diff);
     let (a, r, m, s) = (
         report.data.added_packages.len(),
@@ -108,5 +113,5 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<EnvDiff>> {
             format!("+{a} -{r} ~{m} package(s), {s} new shadowing issue(s)"),
         );
     }
-    Ok(report)
+    report
 }

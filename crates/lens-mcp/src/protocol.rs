@@ -258,6 +258,20 @@ pub fn list_tools() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "lens_bundle_diff".to_string(),
+            description: desc(
+                "Diff two .lens forensic bundles section by section (sys/test/trace/env/net/doctor/disk/log). Both bundles are verified first; returns lens.bundle-diff/v1 with per-section domain diffs.",
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": with_pag(serde_json::json!({
+                    "baseline": { "type": "string", "description": "Path to older/reference .lens bundle" },
+                    "candidate": { "type": "string", "description": "Path to newer .lens bundle" }
+                }).as_object().unwrap().clone()),
+                "required": ["baseline", "candidate"]
+            }),
+        },
+        McpTool {
             name: "lens_bundle_verify".to_string(),
             description: desc(
                 "Verify a .lens forensic archive's contents against the SHA-256 checksums in its embedded manifest.",

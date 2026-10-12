@@ -22,8 +22,8 @@ source <(lens completion bash)   # zsh, fish도 지원
 | 코드 | 의미 | 예시 |
 |------|------|------|
 | 0 | clean — findings 없음 | 정상 스캔, 회귀 없는 `test diff` |
-| 1 | findings 있음 | `test diff` 회귀/신규 실패, `test parse` 불완전 JUnit, `abi diff` incompatible·uncertain(수동 검토 필요), `sys inspect`/`sys cycles` 사이클, `sys diff` 신규 사이클, `env inspect`/`env check` 누락·충돌 의존성, `net diff` 신규 리스너, `trace analyze` fd 누수, `trace diff` 신규 에러, `disk scan`/`disk duplicates` incomplete(권한 오류·절단·해시 실패), `bundle create` 수집 경고, `bundle verify` 무결성 불일치, `doctor`의 `--fail-on` 기준 이상 |
-| 2 | 사용·입력·런타임 오류 | 존재하지 않는 경로, 잘못된 플래그 값, 파싱 불가 입력, `abi inspect`/`abi diff`의 비ELF 입력, diff 입력의 스키마 불일치(`expected schema`) |
+| 1 | findings 있음 | `test diff` 회귀/신규 실패, `test parse` 불완전 JUnit, `abi diff` incompatible·uncertain(수동 검토 필요), `sys inspect`/`sys cycles` 사이클, `sys diff` 신규 사이클, `env inspect`/`env check` 누락·충돌 의존성, `net diff` 신규 리스너, `trace analyze` fd 누수, `trace diff` 신규 에러, `disk scan`/`disk duplicates` incomplete(권한 오류·절단·해시 실패), `bundle create`/`snapshot` 수집 경고, `bundle verify` 무결성 불일치, `bundle diff` 섹션 findings·섹션 역직렬화 실패, `doctor`의 `--fail-on` 기준 이상 |
+| 2 | 사용·입력·런타임 오류 | 존재하지 않는 경로, 잘못된 플래그 값, 파싱 불가 입력, `abi inspect`/`abi diff`의 비ELF 입력, diff 입력의 스키마 불일치(`expected schema`), `bundle diff`의 무결성 검증 실패 번들 |
 
 판정은 공유 레이어(`lens-ops`)의 `Report<T>`에서 나온다: 각 오퍼레이션이
 `findings`(Info/Warn/Fail)과 `complete`를 채우고, CLI는
@@ -337,6 +337,35 @@ lens bundle extract incident.lens out/ [--force]
   먼저 통과한 번들만 풀고, `..`/절대/역슬래시 엔트리를 거부하며
   `--force` 없이는 기존 파일을 덮어쓰지 않는다.
 - 생성은 임시 파일 + 원자적 rename(부분 쓰기·심볼링크 덮어쓰기 방지).
+- `bundle diff <a.lens> <b.lens>`는 두 번들을 먼저 무결성 검증하고
+  (실패 시 exit 2) 양쪽에 모두 있는 섹션(`sys/test/trace/env/net/
+  doctor/disk/log`)을 도메인 diff와 동일한 분류기로 비교한다 — findings
+  코드(`sys.new_cycle`, `test.regression`, …)도 동일하다. 한쪽에만
+  있는 엔트리는 `bundle.only_in_baseline`/`only_in_candidate` Info다.
+  `lens diff a.lens b.lens`도 같은 경로로 디스패치된다. JSON 출력은
+  `lens.bundle-diff/v1`이다.
+
+## 기준선 워크플로 (`snapshot` + `lens diff`)
+
+```bash
+lens snapshot                          # snapshot-<host>-<UTC>.lens 생성
+lens snapshot -o before.lens
+# ... 변경/배포/사고 ...
+lens snapshot -o after.lens
+lens diff before.lens after.lens       # 섹션별 자동 비교
+```
+
+- `lens snapshot`은 사고 대응용 기준선 번들이다: 항상 `reports/
+  host.json`(호스트명·커널·OS·수집 시각), `reports/net_report.json`,
+  `reports/sys_snapshot.json`(`--systemd-dir` 또는 병합 검색 경로),
+  `reports/doctor_report.json`을 수집하고, 로그는 `--log` 또는
+  `/var/log`의 첫 표준 syslog를 임베드한다. `--disk`/`--env`/`--test`/
+  `--trace`로 소스를 추가하고 `--procfs`로 근거 루트를 바꾼다.
+- 기본 출력명은 `snapshot-<hostname>-<UTC YYYYMMDDTHHMMSSZ>.lens`.
+- 수집 진단이 있으면 번들은 만들어지지만 exit 1이다. doctor 자체의
+  Warn/Fail 판정은 스냅샷 종료 코드에 영향을 주지 않는다(번들 안의
+  데이터일 뿐이다). `bundle create --doctor`로 일반 번들에도 doctor
+  리포트를 넣을 수 있다.
 
 ## 시스템 종합 점검 (`doctor`)
 
@@ -348,7 +377,21 @@ lens doctor [--root PATH] [--procfs PATH] [--systemd-dir PATH]
 스토리지 용량(statvfs), 네트워크, 서비스, 환경 검사를 PASS/WARN/FAIL로
 집계하고 권장 조치를 출력합니다. `--fail-on`(기본 `fail`) 미만의
 심각도는 exit 0을 유지한다 — 권한 부족으로 검사 불가한 소켓은 orphan
-WARN이 아니라 PASS + "sudo로 재실행" 권고로 보고한다.
+WARN이 아니라 PASS + "sudo로 재실행" 권고로 보고한다. WARN/FAIL
+검사에는 다음 조치 명령이 `-> Next:`로 인쇄된다.
+
+- 스토리지: `--root` 없이 실행하면 `/proc/self/mounts`(또는 `--procfs`
+  지정분)의 실파일시스템마다 용량 검사를 추가한다(가상 fs·snap 패키지
+  마운트 제외, `f_fsid` 중복 제거, `/`는 `Root Disk Capacity`, 나머지는
+  `Disk Capacity <mountpoint>`). 각 검사는 inode 여유율도 평가한다 —
+  여유 inode <5%는 Fail, <15%는 Warn이고 최종 상태는 용량과 중 나쁜 쪽.
+- 네트워크: wildcard 민감 리스너는 `-> Next: lens net inspect`, orphan
+  소켓은 `-> Next: lens net inspect --format json`.
+- 서비스: 사이클은 `-> Next: lens sys cycles`; 유닛 파싱 진단이
+  있으면 `Systemd Unit Parsing` WARN 검사를 추가하고 `-> Next: lens
+  sys inspect --format json`.
+- PATH: `.`/빈 항목 외에 **world-writable 디렉터리**도 WARN이다.
+- ld.so.preload에 항목이 있으면 `-> Next: lens abi inspect <첫 라이브러리>`.
 
 `--root PATH`는 검사를 루트 이미지로 스코프한다: 네트워크는 `<root>/proc`,
 서비스는 `<root>` 아래로 재배치된 systemd 검색 디렉터리(`/etc/systemd/system`
@@ -378,7 +421,8 @@ AI 어시스턴트 연동용 stdio JSON-RPC 서버. 도구: `lens_disk_scan`,
 `lens_disk_duplicates`, `lens_abi_inspect`, `lens_abi_diff`,
 `lens_log_filter`, `lens_trace_analyze`, `lens_sys_cycles`,
 `lens_sys_diff`, `lens_test_diff`, `lens_net_diff`, `lens_build_impact`,
-`lens_env_check`, `lens_net_inspect`, `lens_bundle_verify`, `lens_doctor`.
+`lens_env_check`, `lens_net_inspect`, `lens_bundle_verify`,
+`lens_bundle_diff`, `lens_doctor`.
 
 ```bash
 cargo build --release -p lens-mcp

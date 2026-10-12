@@ -489,3 +489,74 @@ fn abi_diff_identical_binary_is_compatible() {
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["compatibility"], "compatible", "{text}");
 }
+
+fn junit_run_json(status: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": "testlens.run/v1",
+        "version": "0.6.1",
+        "producer": {"name": "testlens", "version": "0.6.1"},
+        "project": "p",
+        "run_id": "r",
+        "collected_at": "2026-01-01T00:00:00Z",
+        "complete": true,
+        "cases": [{
+            "identity": "C.t1",
+            "name": "t1",
+            "classname": "C",
+            "status": status,
+            "duration_sec": 0.0
+        }],
+        "summary": {"total": 1, "passed": 1, "failed": 0,
+                    "errors": 0, "skipped": 0, "duration_sec": 0.0}
+    }))
+    .unwrap()
+}
+
+#[test]
+fn lens_bundle_diff_returns_sections_and_findings_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk = |name: &str, status: &str| {
+        let p = dir.path().join(name);
+        lens_core::create_bundle_archive(
+            &p,
+            "0.0.0-test",
+            &[lens_core::BundleArtifact {
+                name: "reports/test_run.json".to_string(),
+                data: junit_run_json(status),
+            }],
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        p
+    };
+    let a = mk("a.lens", "passed");
+    let b = mk("b.lens", "failed");
+
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"lens_bundle_diff","arguments":{{"baseline":{:?},"candidate":{:?}}}}}}}"#,
+        a.to_string_lossy(),
+        b.to_string_lossy()
+    );
+    let responses = roundtrip(&[&call]);
+    assert_eq!(responses.len(), 1);
+    let result = &responses[0]["result"];
+    assert!(result.get("isError").is_none(), "{result}");
+
+    // First content item: the bundle-diff JSON with a `test` section.
+    let data: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(data["schema"], "lens.bundle-diff/v1", "{data}");
+    assert!(data["sections"]["test"].is_object(), "{data}");
+
+    // The test.regression Fail finding appends the findings item.
+    let findings: serde_json::Value =
+        serde_json::from_str(result["content"][1]["text"].as_str().unwrap()).unwrap();
+    let codes: Vec<&str> = findings["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"test.regression"), "{findings}");
+}

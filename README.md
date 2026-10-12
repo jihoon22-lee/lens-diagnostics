@@ -97,6 +97,8 @@ cargo build --release -p lens-cli --jobs 2
 $ lens doctor            # 시스템 종합 점검
 $ lens inspect <path>    # 무엇인지 자동 감지 후 해당 검사 실행
 $ lens diff <a> <b>      # 양쪽 입력을 감지해 호환되는 diff 실행
+$ lens snapshot          # 기준선 번들 생성 (snapshot-<host>-<시각>.lens)
+$ lens diff old.lens new.lens   # 두 시점의 시스템 상태 비교
 ```
 
 ```bash

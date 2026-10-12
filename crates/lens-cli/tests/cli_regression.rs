@@ -2547,3 +2547,213 @@ fn disk_duplicates_accepts_scan_options() {
     assert!(stdout.contains("a.bin"), "{stdout}");
     assert!(!stdout.contains("gone"), "{stdout}");
 }
+
+// --- Phase 4: snapshot + bundle diff + doctor ---
+
+fn unit_dir(tag: &str, cyclic: bool) -> TestDir {
+    let dir = tmp_dir(tag);
+    if cyclic {
+        std::fs::write(
+            dir.join("a.service"),
+            "[Unit]\nAfter=b.service\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.service"),
+            "[Unit]\nAfter=a.service\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+    } else {
+        std::fs::write(
+            dir.join("a.service"),
+            "[Unit]\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+    }
+    dir
+}
+
+#[test]
+fn snapshot_collects_host_net_sys_doctor_and_verifies() {
+    let dir = tmp_dir("snapshot");
+    let units = unit_dir("snapshot-units", false);
+    let out_path = dir.join("s.lens");
+
+    let out = lens(&[
+        "snapshot",
+        "-o",
+        out_path.to_str().unwrap(),
+        "--procfs",
+        "/proc",
+        "--systemd-dir",
+        units.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(out_path.exists());
+
+    let inspect = lens(&[
+        "bundle",
+        "inspect",
+        out_path.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert!(inspect.status.success(), "{}", stderr_of(&inspect));
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&inspect)).expect("JSON");
+    let names: Vec<&str> = json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["name"].as_str())
+        .collect();
+    for expected in [
+        "reports/host.json",
+        "reports/net_report.json",
+        "reports/sys_snapshot.json",
+        "reports/doctor_report.json",
+    ] {
+        assert!(names.contains(&expected), "missing {expected} in {names:?}");
+    }
+    let host: serde_json::Value = serde_json::from_str(&stdout_of(&lens(&[
+        "bundle",
+        "show",
+        out_path.to_str().unwrap(),
+        "reports/host.json",
+    ])))
+    .expect("host JSON");
+    assert_eq!(host["schema"], "lens.host/v1", "{host}");
+
+    let verify = lens(&["bundle", "verify", out_path.to_str().unwrap()]);
+    assert_eq!(verify.status.code(), Some(0), "{}", stderr_of(&verify));
+}
+
+#[test]
+fn snapshot_default_name_and_log_fallback() {
+    let dir = tmp_dir("snapshot-name");
+    let cwd = std::env::current_dir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_lens"))
+        .args(["snapshot", "--procfs", "/nonexistent-procfs"])
+        .current_dir(&*dir)
+        .output()
+        .expect("spawn lens");
+    let _ = cwd;
+    // A nonexistent procfs makes net/host collection fail -> the bundle
+    // records diagnostics and exits 1, but is still written.
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let entries: Vec<_> = std::fs::read_dir(&*dir)
+        .unwrap()
+        .filter_map(|e| {
+            let n = e.unwrap().file_name().to_string_lossy().into_owned();
+            n.starts_with("snapshot-").then_some(n)
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(entries[0].ends_with(".lens"), "{}", entries[0]);
+}
+
+#[test]
+fn bundle_diff_finds_new_cycle_and_regression() {
+    let dir = tmp_dir("bundle-diff");
+    let clean = unit_dir("bd-clean", false);
+    let cyclic = unit_dir("bd-cyclic", true);
+    let junit_ok = dir.join("ok.xml");
+    let junit_bad = dir.join("bad.xml");
+    std::fs::write(&junit_ok, JUNIT_XML).unwrap();
+    std::fs::write(
+        &junit_bad,
+        r#"<testsuite tests="1"><testcase name="a" classname="C" time="0"><failure/></testcase></testsuite>"#,
+    )
+    .unwrap();
+
+    let a = dir.join("a.lens");
+    let b = dir.join("b.lens");
+    for (bundle, units, junit) in [(&a, &*clean, &junit_ok), (&b, &*cyclic, &junit_bad)] {
+        let out = lens(&[
+            "bundle",
+            "create",
+            bundle.to_str().unwrap(),
+            "--sys",
+            units.to_str().unwrap(),
+            "--test",
+            junit.to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    }
+
+    let out = lens(&["diff", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("sys:"), "{stdout}");
+    assert!(stdout.contains("test:"), "{stdout}");
+    assert!(stdout.contains("sys.new_cycle"), "{stdout}");
+    assert!(stdout.contains("test.regression"), "{stdout}");
+    assert!(
+        stderr_of(&out).contains("detected: bundle"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // Same bundle vs itself: no actionable delta.
+    let out = lens(&["bundle", "diff", a.to_str().unwrap(), a.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    // JSON exposes the lens.bundle-diff/v1 schema.
+    let out = lens(&[
+        "bundle",
+        "diff",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON");
+    assert_eq!(json["schema"], "lens.bundle-diff/v1", "{json}");
+    assert!(json["sections"]["sys"].is_object(), "{json}");
+    assert!(json["sections"]["test"].is_object(), "{json}");
+}
+
+#[test]
+fn bundle_diff_tampered_bundle_exits_2() {
+    let dir = tmp_dir("bundle-tamper");
+    let a = dir.join("a.lens");
+    let out = lens(&[
+        "bundle",
+        "create",
+        a.to_str().unwrap(),
+        "--test",
+        dir.to_str().unwrap(),
+    ]);
+    // --test on a dir with no XML is a collection failure but still
+    // writes the bundle? If it errors out, create with a real junit.
+    if !a.exists() {
+        let junit = dir.join("ok.xml");
+        std::fs::write(&junit, JUNIT_XML).unwrap();
+        let out2 = lens(&[
+            "bundle",
+            "create",
+            a.to_str().unwrap(),
+            "--test",
+            junit.to_str().unwrap(),
+        ]);
+        assert_eq!(out2.status.code(), Some(0), "{}", stderr_of(&out2));
+    }
+    let _ = out;
+    // Corrupt bytes mid-archive: verify must fail before any diff.
+    let mut bytes = std::fs::read(&a).unwrap();
+    let mid = bytes.len() / 2;
+    for byte in bytes.iter_mut().skip(mid).take(32) {
+        *byte ^= 0xFF;
+    }
+    let tampered = dir.join("tampered.lens");
+    std::fs::write(&tampered, &bytes).unwrap();
+
+    let out = lens(&["diff", a.to_str().unwrap(), tampered.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    let out = lens(&[
+        "bundle",
+        "diff",
+        a.to_str().unwrap(),
+        tampered.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+}

@@ -179,11 +179,19 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   불완전 증거는 항상 actionable.
 - 모듈: `disk`, `abi`, `log`(`open`/`build_filter`), `test`(파일/디렉터리/
   글롭 입력), `trace`(fail-closed 입력 검증), `sys`, `build`, `env`,
-  `net`, `bundle`(수집기+검증/해제 래퍼), `doctor`, `json`(스키마 검증
-  포함 JSON 로더), `detect`(`lens inspect`/`diff`용 입력 자동 판별 —
-  확장자·매직·처음 64 KiB 내용으로 `InputKind` 결정).
+  `net`, `bundle`(수집기+검증/해제 래퍼+번들간 diff), `doctor`, `json`
+  (스키마 검증 포함 JSON 로더), `detect`(`lens inspect`/`diff`용 입력
+  자동 판별 — 확장자·매직·처음 64 KiB 내용으로 `InputKind` 결정).
 - `env::diff`는 스냅샷 JSON과 venv 디렉터리를 혼합해 받는다(디렉터리는
   그 자리에서 inspect). `disk::duplicates`는 `ScanOptions`를 통째로 받는다.
+- 모든 도메인 diff는 값 수준 분류기(`diff_values`/`diff_runs`/
+  `diff_snapshots`)로 분리돼 있어 파일 diff와 `bundle::diff`가 같은
+  findings 코드를 공유한다. `bundle::diff`는 양쪽 번들을 무결성 검증
+  후 공통 섹션을 비교하고 `lens.bundle-diff/v1`을 만든다.
+- `doctor`는 실마운트별 용량+inode 검사(`/proc/self/mounts`,
+  가상 fs 제외·fsid 중복 제거), world-writable PATH 검사, WARN/FAIL
+  검사의 `next_command` 제안, `doctor::diff_reports` 리포트 비교를
+  제공한다.
 - clap·출력 없음 — 프레젠테이션은 소비자 책임.
 
 ## lens-cli — `lens` 통합 CLI
@@ -200,7 +208,9 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   `lens-ops`에 있고 `lens_cli::doctor`로 re-export된다).
 - text 모드에서는 도메인 출력 뒤에 `Findings:` 블록([FAIL]/[WARN])
   이 출력된다. JSON 출력에는 findings가 섞이지 않는다.
-- `bundle create/inspect/verify/show/extract`: `lens.bundle/v2` 아카이브.
+- `bundle create/inspect/verify/show/extract/diff`: `lens.bundle/v2`
+  아카이브(`diff`는 `lens.bundle-diff/v1` 출력). `snapshot`은 호스트
+  기준선 번들(host/net/sys/doctor 자동 수집).
 - `tui`: `lens_tui::run`으로 진입. `completion`: 셸 자동완성 생성.
 
 ## lens-tui — 터미널 대시보드
@@ -244,7 +254,7 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
 | `lens_build_impact` | 헤더 영향도 |
 | `lens_env_check` | venv 의존성 검사 |
 | `lens_net_inspect` | 소켓/리스너 검사 |
-| `lens_bundle_verify` | 번들 무결성 검증 |
+| `lens_bundle_verify`, `lens_bundle_diff` | 번들 무결성 검증/섹션 비교 |
 | `lens_doctor` | 종합 진단(잘못된 경로 → isError) |
 
 ```json

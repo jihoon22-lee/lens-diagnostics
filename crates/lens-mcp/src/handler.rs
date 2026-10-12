@@ -386,6 +386,13 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                 .map(ToolOutcome::from)
                 .map_err(|e| e.to_string())
         }
+        "lens_bundle_diff" => {
+            let baseline = tool_path(args, "baseline")?;
+            let candidate = tool_path(args, "candidate")?;
+            lens_ops::bundle::diff(&baseline, &candidate)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
+        }
         "lens_doctor" => {
             // Explicit override paths are validated inside lens_ops —
             // a typo'd `systemd_dir` is an in-band tool error (isError),

@@ -34,6 +34,21 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
   `--max-depth` 추가 — `disk scan`과 같은 스캔 범위 제한을 지원한다.
 - `env diff`와 `lens diff`가 venv 디렉터리를 입력으로 받는다 —
   디렉터리는 그 자리에서 inspect돼 스냅샷 JSON과 자유롭게 혼합된다.
+- `lens snapshot`: `snapshot-<hostname>-<UTC>.lens` 기준선 번들 —
+  호스트/네트워크/systemd/doctor 리포트와 syslog를 항상 수집하고,
+  `--disk`/`--env`/`--test`/`--trace`/`--log`로 소스를 추가한다.
+  `bundle create`에도 `--doctor`로 doctor 리포트를 넣을 수 있다.
+- `lens bundle diff <a> <b>`와 `lens diff a.lens b.lens`: 두 번들을
+  무결성 검증 후 공통 섹션(sys/test/trace/env/net/doctor/disk/log)을
+  도메인 diff 분류기로 비교한다 — findings 코드는 파일 diff와 동일.
+  출력 스키마는 `lens.bundle-diff/v1`, 한쪽에만 있는 엔트리는
+  `bundle.only_in_*` Info.
+- MCP `lens_bundle_diff` 도구(도구 수 15 → 16).
+- doctor: 실마운트별 용량 검사(`/proc/self/mounts`의 실파일시스템,
+  `/`는 `Root Disk Capacity`) + inode 여유율(<5% Fail, <15% Warn) +
+  world-writable PATH 디렉터리 WARN + WARN/FAIL 검사의 `-> Next:`
+  명령 제안(`lens disk scan <mount> --top 20` 등). `DoctorCheck`에
+  `next_command` 필드 추가(스키마 additive).
 
 ### 수정
 

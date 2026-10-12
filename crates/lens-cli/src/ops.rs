@@ -285,9 +285,12 @@ fn diff_command(domain: Domain, baseline: &Path, candidate: &Path) -> Result<Com
                 candidate: b,
             },
         },
-        Domain::Bundle => {
-            return Err(usage("bundle diff is not supported yet"));
-        }
+        Domain::Bundle => Commands::Bundle {
+            action: BundleCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
         Domain::Log | Domain::Disk => {
             return Err(usage(format!(
                 "cannot diff {} inputs; pass --as",
@@ -315,6 +318,85 @@ fn resolve_inspect(path: &Path, as_kind: Option<AsKind>) -> Result<Commands> {
                 }
             }
         }
+    }
+}
+
+/// Default snapshot filename: `snapshot-<hostname>-<UTC>.lens` with the
+/// name sanitized to `[A-Za-z0-9._-]` so the path is always shell-safe.
+fn default_snapshot_name(procfs: Option<&Path>) -> PathBuf {
+    let proc_root = procfs.unwrap_or_else(|| Path::new("/proc"));
+    let raw_host = std::fs::read_to_string(proc_root.join("sys/kernel/hostname"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "host".to_string());
+    let host: String = raw_host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // `YYYYMMDDTHHMMSSZ` — cut the RFC 3339 stamp at the fractional
+    // second, then drop the punctuation.
+    let iso = lens_core::time::utc_now_iso();
+    let seconds = iso.split('.').next().unwrap_or(&iso);
+    let stamp: String = seconds
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == 'T' || *c == 'Z')
+        .collect();
+    PathBuf::from(format!("snapshot-{host}-{stamp}.lens"))
+}
+
+/// One-line text summary of a bundle-diff section, for the `lens
+/// bundle diff` text renderer.
+fn bundle_section_summary(name: &str, v: &serde_json::Value) -> String {
+    let n = |key: &str| v[key].as_array().map(|a| a.len()).unwrap_or(0);
+    let i = |key: &str| v[key].as_i64().unwrap_or(0);
+    match name {
+        "sys" => format!(
+            "+{} -{} ~{} unit(s), {} new cycle(s)",
+            n("added_units"),
+            n("removed_units"),
+            n("modified_units"),
+            n("new_cycles")
+        ),
+        "test" => format!(
+            "{} regression(s), {} new failure(s), {} removed",
+            n("regressions"),
+            n("new_failures"),
+            n("removed_tests")
+        ),
+        "trace" => format!(
+            "{} new error(s), {} latency shift(s)",
+            n("new_errors"),
+            n("significant_latency_shifts")
+        ),
+        "env" => format!(
+            "+{} -{} ~{} package(s), {} new shadowing",
+            n("added_packages"),
+            n("removed_packages"),
+            n("version_changes"),
+            n("new_shadowing")
+        ),
+        "net" => format!(
+            "+{} -{} listener(s), +{} -{} connection(s)",
+            n("new_listeners"),
+            n("closed_listeners"),
+            n("new_connections"),
+            n("closed_connections")
+        ),
+        "doctor" => format!("{} regressed, {} improved", n("regressed"), n("improved")),
+        "disk" => format!(
+            "root size {:+} B, nodes {:+}",
+            i("root_size_delta"),
+            i("node_count_delta")
+        ),
+        "log" => format!("{:+} line(s)", i("total_lines_delta")),
+        _ => "compared".to_string(),
     }
 }
 
@@ -1254,6 +1336,69 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 print_findings(&report.findings, wants_json(format, json, true));
             }
         },
+        Commands::Snapshot {
+            output,
+            procfs,
+            systemd_dir,
+            log,
+            disk,
+            env,
+            test,
+            trace,
+            force,
+        } => {
+            // The log source defaults to the first conventional syslog
+            // path — its absence is noted quietly, not counted as a
+            // collection failure.
+            let log = log.or_else(|| {
+                const CANDIDATES: &[&str] = &[
+                    "/var/log/syslog",
+                    "/var/log/messages",
+                    "/var/log/kern.log",
+                    "/var/log/daemon.log",
+                ];
+                let found = CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file());
+                if found.is_none() {
+                    diagln!("no standard syslog found under /var/log; log entry omitted");
+                }
+                found
+            });
+            let output = output.unwrap_or_else(|| default_snapshot_name(procfs.as_deref()));
+            let report = bundle::create(&bundle::BundleRequest {
+                output: output.clone(),
+                disk,
+                log,
+                trace,
+                test,
+                env,
+                net: true,
+                host: true,
+                doctor: true,
+                sys_merged: systemd_dir.is_none(),
+                sys: systemd_dir.clone(),
+                systemd_dir,
+                procfs,
+                force,
+            })?;
+            let manifest = &report.data;
+            if wants_json(format, json, false) {
+                outln!("{}", to_deterministic_pretty(manifest)?);
+            } else {
+                outln!("Snapshot bundle written: {:?}", output);
+                outln!("  Artifacts embedded: {}", manifest.sources.len());
+                if !report.diagnostics.is_empty() {
+                    outln!("  Collection warnings recorded in manifest:");
+                    for d in &report.diagnostics {
+                        outln!("    - {}", d);
+                    }
+                }
+                outln!(
+                    "Compare later with: lens diff {:?} <newer snapshot>",
+                    output
+                );
+            }
+            apply(&mut outcome, &report, threshold);
+        }
         Commands::Bundle { action } => match action {
             BundleCommands::Create {
                 output,
@@ -1264,6 +1409,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 sys,
                 env,
                 net,
+                doctor,
                 force,
             } => {
                 let report = bundle::create(&bundle::BundleRequest {
@@ -1272,10 +1418,13 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     log,
                     trace,
                     test,
-                    sys,
                     env,
                     net,
                     force,
+                    doctor,
+                    systemd_dir: sys.clone(),
+                    sys,
+                    ..Default::default()
                 })?;
                 let manifest = &report.data;
                 if wants_json(format, json, false) {
@@ -1294,6 +1443,30 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     }
                 }
                 apply(&mut outcome, &report, threshold);
+            }
+            BundleCommands::Diff {
+                baseline,
+                candidate,
+            } => {
+                let report = bundle::diff(&baseline, &candidate)?;
+                let diff = &report.data;
+                if wants_json(format, json, false) {
+                    outln!("{}", to_deterministic_pretty(diff)?);
+                    apply(&mut outcome, &report, threshold);
+                    return Ok(outcome);
+                }
+                outln!("Bundle diff: {:?} -> {:?}", baseline, candidate);
+                for (name, section) in &diff.sections {
+                    outln!("  {}: {}", name, bundle_section_summary(name, section));
+                }
+                for n in &diff.only_in_baseline {
+                    outln!("  only in baseline: {}", n);
+                }
+                for n in &diff.only_in_candidate {
+                    outln!("  only in candidate: {}", n);
+                }
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, false);
             }
             BundleCommands::Inspect { bundle } => {
                 let report = bundle::inspect(&bundle)?;
@@ -1559,6 +1732,9 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     );
                     if let Some(ref rec) = c.recommendation {
                         outln!("             -> Recommendation: {}", rec);
+                    }
+                    if let Some(ref cmd) = c.next_command {
+                        outln!("             -> Next: {}", cmd);
                     }
                 }
             }

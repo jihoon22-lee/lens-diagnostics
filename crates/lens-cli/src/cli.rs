@@ -150,6 +150,39 @@ pub enum Commands {
         #[arg(long = "as", value_enum)]
         as_kind: Option<AsKind>,
     },
+    /// Capture a point-in-time system snapshot bundle (host, network,
+    /// systemd, doctor + optional sources) to diff later with `lens diff`
+    Snapshot {
+        /// Output .lens path (default: snapshot-<host>-<UTC>.lens in cwd)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        /// procfs root for host/network/doctor evidence (default /proc)
+        #[arg(long)]
+        procfs: Option<PathBuf>,
+        /// systemd unit dir for the sys snapshot and doctor (default:
+        /// merged systemd search path)
+        #[arg(long)]
+        systemd_dir: Option<PathBuf>,
+        /// Log file to embed (default: first existing of
+        /// /var/log/syslog, messages, kern.log, daemon.log)
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Directory to scan for a disk snapshot artifact
+        #[arg(long)]
+        disk: Option<PathBuf>,
+        /// Virtualenv root for an environment snapshot artifact
+        #[arg(long)]
+        env: Option<PathBuf>,
+        /// JUnit XML file/directory to parse into the snapshot
+        #[arg(long)]
+        test: Option<PathBuf>,
+        /// strace output file to analyze into the snapshot
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        /// Overwrite the output file if it already exists
+        #[arg(long)]
+        force: bool,
+    },
     /// Forensic Flight Recorder: bundle multiple diagnostic artifacts into a .lens container
     Bundle {
         #[command(subcommand)]
@@ -483,9 +516,19 @@ pub enum BundleCommands {
         /// Capture a live network socket report from procfs
         #[arg(long)]
         net: bool,
+        /// Embed a doctor health report (host scope)
+        #[arg(long)]
+        doctor: bool,
         /// Overwrite the output file if it already exists
         #[arg(long)]
         force: bool,
+    },
+    /// Diff two .lens bundles section by section (verified first)
+    Diff {
+        /// Older/reference .lens bundle
+        baseline: PathBuf,
+        /// Newer .lens bundle to compare against the baseline
+        candidate: PathBuf,
     },
     /// Inspect contents and diagnostics of a .lens bundle
     Inspect {

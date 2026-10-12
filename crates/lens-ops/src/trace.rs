@@ -39,7 +39,12 @@ pub fn analyze(path: &Path) -> Result<Report<TraceSnapshot>> {
 pub fn diff_files(baseline: &Path, candidate: &Path) -> Result<Report<TraceDiff>> {
     let s1 = analyze_file(baseline)?;
     let s2 = analyze_file(candidate)?;
-    let diff = diff_snapshots(&s1, &s2);
+    Ok(diff_values(&s1, &s2))
+}
+
+/// Value-level classifier shared by the file diff and `bundle diff`.
+pub fn diff_values(s1: &TraceSnapshot, s2: &TraceSnapshot) -> Report<TraceDiff> {
+    let diff = diff_snapshots(s1, s2);
     let (new_errors, shifts) = (
         diff.new_errors.clone(),
         diff.significant_latency_shifts.clone(),
@@ -51,5 +56,5 @@ pub fn diff_files(baseline: &Path, candidate: &Path) -> Result<Report<TraceDiff>
     for s in shifts {
         report.push(Severity::Warn, "trace.latency_shift", s);
     }
-    Ok(report)
+    report
 }

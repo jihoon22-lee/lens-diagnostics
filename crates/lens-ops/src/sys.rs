@@ -116,7 +116,14 @@ pub fn cycles(dir: Option<&Path>) -> Result<Report<CyclesResult>> {
 pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<SystemdDiff>> {
     let s1 = snapshot_from(baseline)?;
     let s2 = snapshot_from(candidate)?;
-    let diff = diff_systemd(&s1, &s2);
+    Ok(diff_snapshots(&s1, &s2))
+}
+
+/// Value-level classifier shared by the file diff and `bundle diff`:
+/// new cycles are Fail findings; unit add/remove/modify counts and
+/// resolved cycles are Info.
+pub fn diff_snapshots(s1: &SystemdSnapshot, s2: &SystemdSnapshot) -> Report<SystemdDiff> {
+    let diff = diff_systemd(s1, s2);
     let (new_cycles, added, removed, modified, resolved) = (
         diff.new_cycles.clone(),
         diff.added_units.len(),
@@ -142,5 +149,5 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<SystemdDiff>> {
             format!("{resolved} cycle(s) resolved"),
         );
     }
-    Ok(report)
+    report
 }

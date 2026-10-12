@@ -39,7 +39,12 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<NetDiffReport>> 
         json::read_json_schema(baseline, "schema_version", lens_net::REPORT_SCHEMA_V1)?;
     let c: NetReport =
         json::read_json_schema(candidate, "schema_version", lens_net::REPORT_SCHEMA_V1)?;
-    let diff = diff_net_reports(&b, &c);
+    Ok(diff_values(&b, &c))
+}
+
+/// Value-level classifier shared by the file diff and `bundle diff`.
+pub fn diff_values(b: &NetReport, c: &NetReport) -> Report<NetDiffReport> {
+    let diff = diff_net_reports(b, c);
     let (new_listeners, closed_listeners, new_conns, closed_conns, tw) = (
         diff.new_listeners.clone(),
         diff.closed_listeners.len(),
@@ -69,5 +74,5 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<NetDiffReport>> 
             format!("+{new_conns} -{closed_conns} connection(s), TIME_WAIT {tw:+}"),
         );
     }
-    Ok(report)
+    report
 }
