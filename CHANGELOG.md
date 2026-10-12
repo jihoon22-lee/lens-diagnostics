@@ -44,6 +44,21 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
   출력 스키마는 `lens.bundle-diff/v1`, 한쪽에만 있는 엔트리는
   `bundle.only_in_*` Info.
 - MCP `lens_bundle_diff` 도구(도구 수 15 → 16).
+- `log filter`/`log inspect`/`log stats`가 다중 입력을 받는다 — 각
+  항목은 `-`, 파일, `.gz`, `*`/`?` 파일명 glob. 다중 입력 시
+  `--limit`은 전체 합산, text는 `[<file>:<line>]` 접두사, jsonl은
+  `"file"` 필드, json은 `{"inputs": […], "matched", "total"}`.
+- `log filter --follow`(`-f`): 초기 필터 패스 뒤 파일을 폴링해 추가
+  줄을 같은 필터로 낸다 — truncate/rotate 시 처음부터 재개하며
+  stderr에 안내. 정규 파일 하나, `--context 0`, text/jsonl에서만
+  유효.
+- `lens log stats`: 필터가 통과시킨 줄의 레벨 분포 + 시간 히스토그램
+  (`lens.log-stats/v1`, `--bucket 1m|5m|15m|1h|1d`, 미지정 시 ~60
+  버킷이 되도록 자동 선택).
+- MCP `lens_log_stats` 도구(도구 수 16 → 17), `lens-mcp --allow-root
+  DIR` 경로 샌드박스(반복 가능 — canonicalize된 루트 밖 경로는
+  도구 오류로 거부), `prompts` capability(`incident-triage`,
+  `compare-snapshots`).
 - doctor: 실마운트별 용량 검사(`/proc/self/mounts`의 실파일시스템,
   `/`는 `Root Disk Capacity`) + inode 여유율(<5% Fail, <15% Warn) +
   world-writable PATH 디렉터리 WARN + WARN/FAIL 검사의 `-> Next:`
@@ -87,6 +102,9 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
   `2025-03-26`, `2024-11-05`)만 에코하고, 미지원·누락 버전에는
   `2025-06-18`로 응답한다(이전에는 임의 버전을 그대로 에코하고
   누락 시 `2024-11-05`였다).
+- TUI Logs 탭이 invalid UTF-8 줄도 U+FFFD로 표시한다(이전에는 조용히
+  누락). 명시한 `--log` 파일이 열리지 않으면 상태바에 오류 이유를
+  표시한다.
 - `id` 없는 JSON-RPC 요청(노티피케이션)에는 어떤 메서드에도 응답하지
   않는다(이전에는 `initialize`/`tools/call` 등에도 응답했다). 파싱
   오류는 계속 `id: null` 에러를 반환한다.

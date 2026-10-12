@@ -313,16 +313,21 @@ pub enum AbiCommands {
 #[derive(Subcommand)]
 pub enum LogCommands {
     /// Inspect log file metrics and line counts.
-    /// PATH may be `-` for stdin; `.gz` files are decompressed (bounded).
+    /// Each PATH may be `-` for stdin, a `.gz` file, or a `*`/`?`
+    /// filename glob (expanded against its parent directory).
     Inspect {
-        /// Log file path, `-` for stdin, or a `.gz` file
-        path: PathBuf,
+        /// Log file path(s), `-` for stdin, `.gz` files, or globs
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
     },
     /// Search and filter log lines (memory-mapped, memchr-accelerated).
-    /// PATH may be `-` for stdin; `.gz` files are decompressed (bounded).
+    /// Each PATH may be `-` for stdin, a `.gz` file, or a `*`/`?`
+    /// filename glob; with several inputs --limit is global and context
+    /// never crosses a file boundary.
     Filter {
-        /// Log file path, `-` for stdin, or a `.gz` file
-        path: PathBuf,
+        /// Log file path(s), `-` for stdin, `.gz` files, or globs
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
         /// Case-insensitive substring to match
         #[arg(long)]
         query: Option<String>,
@@ -354,6 +359,47 @@ pub enum LogCommands {
         /// Show N lines of context around each match
         #[arg(long, default_value_t = 0)]
         context: usize,
+        /// Keep polling the file for appended lines after the initial
+        /// pass (like `tail -f`). Requires exactly one regular,
+        /// non-gz, non-stdin input and --context 0.
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// Level counts and a time histogram over the lines the filter
+    /// keeps, across one or more inputs.
+    Stats {
+        /// Log file path(s), `-` for stdin, `.gz` files, or globs
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+        /// Histogram bucket width: 1m|5m|15m|1h|1d (default: auto-picked
+        /// to keep the histogram at ~60 buckets)
+        #[arg(long)]
+        bucket: Option<String>,
+        /// Case-insensitive substring to match
+        #[arg(long)]
+        query: Option<String>,
+        /// Regex pattern alternative to --query's substring match
+        #[arg(long, conflicts_with = "query")]
+        regex: Option<String>,
+        /// Lowest severity to count: trace|debug|info|warn|error|fatal
+        #[arg(long)]
+        min_level: Option<String>,
+        /// Keep lines whose level could not be determined when --min-level is set,
+        /// or whose timestamp could not be determined when --since/--until is set
+        #[arg(long)]
+        include_unknown: bool,
+        /// Count only lines at/after this timestamp (inclusive). Accepts RFC 3339
+        /// (`2026-10-09T12:00:00Z`, with offset), `YYYY-MM-DD HH:MM:SS`, or
+        /// `YYYY-MM-DD`; forms without an offset are read as UTC
+        #[arg(long)]
+        since: Option<String>,
+        /// Count only lines at/before this timestamp (inclusive); same forms as --since
+        #[arg(long)]
+        until: Option<String>,
+        /// Year assumed for year-less syslog timestamps like `Oct  9 12:00:00`
+        /// (default: current UTC year)
+        #[arg(long)]
+        year: Option<i32>,
     },
 }
 

@@ -560,3 +560,147 @@ fn lens_bundle_diff_returns_sections_and_findings_item() {
         .collect();
     assert!(codes.contains(&"test.regression"), "{findings}");
 }
+
+/// Same as `roundtrip` but passes extra argv (e.g. `--allow-root`).
+fn roundtrip_with_args(requests: &[&str], args: &[&str]) -> Vec<Value> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lens-mcp"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn lens-mcp");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for req in requests {
+            writeln!(stdin, "{req}").unwrap();
+        }
+    }
+
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let status = child.wait().expect("wait");
+    assert!(status.success());
+
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("response is JSON"))
+        .collect()
+}
+
+#[test]
+fn allow_root_rejects_outside_and_accepts_inside() {
+    let dir = tempfile::tempdir().unwrap();
+    let inside = dir.path().join("ok.log");
+    std::fs::write(&inside, "info line\n").unwrap();
+    let root_arg = dir.path().to_str().unwrap().to_string();
+
+    // A file outside the root is an in-band tool error.
+    let call_outside = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_log_stats","arguments":{"path":"/etc/hostname"}}}"#;
+    let call_inside = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"lens_log_stats","arguments":{{"path":{:?}}}}}}}"#,
+        inside.to_string_lossy()
+    );
+    let responses =
+        roundtrip_with_args(&[call_outside, &call_inside], &["--allow-root", &root_arg]);
+    assert_eq!(responses.len(), 2);
+    let outside = &responses[0]["result"];
+    assert_eq!(outside["isError"], true, "{outside}");
+    assert!(
+        outside["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("outside the allowed roots"),
+        "{outside}"
+    );
+    let inside_res = &responses[1]["result"];
+    assert!(inside_res.get("isError").is_none(), "{inside_res}");
+    let data: serde_json::Value =
+        serde_json::from_str(inside_res["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(data["schema"], "lens.log-stats/v1", "{data}");
+
+    // proc_dir is also confined to the root.
+    let responses = roundtrip_with_args(
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lens_net_inspect","arguments":{"proc_dir":"/proc"}}}"#,
+        ],
+        &["--allow-root", &root_arg],
+    );
+    let r = &responses[0]["result"];
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("outside the allowed roots"),
+        "{r}"
+    );
+}
+
+#[test]
+fn prompts_list_and_get() {
+    let list = roundtrip(&[r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list"}"#]);
+    let prompts = list[0]["result"]["prompts"].as_array().unwrap();
+    let names: Vec<&str> = prompts.iter().filter_map(|p| p["name"].as_str()).collect();
+    assert!(names.contains(&"incident-triage"), "{names:?}");
+    assert!(names.contains(&"compare-snapshots"), "{names:?}");
+
+    // compare-snapshots embeds the required args.
+    let get = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"compare-snapshots","arguments":{"baseline":"a.lens","candidate":"b.lens"}}}"#,
+    ]);
+    let text = get[0]["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("lens_bundle_diff"), "{text}");
+    assert!(text.contains("a.lens"), "{text}");
+    assert!(text.contains("b.lens"), "{text}");
+
+    // incident-triage works with or without log_path.
+    let get = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"incident-triage","arguments":{"log_path":"/var/log/app.log"}}}"#,
+    ]);
+    let text = get[0]["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("lens_doctor"), "{text}");
+    assert!(text.contains("/var/log/app.log"), "{text}");
+
+    // Missing required arg and unknown prompt are -32602.
+    let errs = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"compare-snapshots","arguments":{"baseline":"a.lens"}}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"name":"nope"}}"#,
+    ]);
+    assert_eq!(errs[0]["error"]["code"], -32602, "{}", errs[0]);
+    assert_eq!(errs[1]["error"]["code"], -32602, "{}", errs[1]);
+
+    // initialize advertises the prompts capability.
+    let init = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":6,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+    ]);
+    assert!(init[0]["result"]["capabilities"]["prompts"].is_object());
+}
+
+#[test]
+fn lens_log_stats_returns_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("s.log");
+    std::fs::write(&log, "2026-10-09T12:00:01Z ERROR boom\nplain\n").unwrap();
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"lens_log_stats","arguments":{{"path":{:?},"bucket":"1h"}}}}}}"#,
+        log.to_string_lossy()
+    );
+    let responses = roundtrip(&[&call]);
+    let result = &responses[0]["result"];
+    assert!(result.get("isError").is_none(), "{result}");
+    let data: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(data["schema"], "lens.log-stats/v1", "{data}");
+    assert_eq!(data["by_level"]["error"], 1, "{data}");
+}

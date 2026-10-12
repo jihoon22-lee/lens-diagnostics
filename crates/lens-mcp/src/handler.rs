@@ -132,17 +132,80 @@ fn serialize_result(v: Value, args: &Value) -> Result<String, String> {
     unreachable!()
 }
 
+/// `--allow-root` sandboxes filesystem access: when non-empty, every
+/// path a tool call touches must canonicalize to a location under one of
+/// these (already canonicalized) roots. Set once at startup by main.
+static ALLOWED_ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// Install the canonicalized `--allow-root` list. Repeated roots are
+/// fine; an unreadable root fails fast at startup rather than silently
+/// disabling the sandbox.
+pub fn set_allowed_roots(roots: Vec<PathBuf>) -> Result<(), String> {
+    let mut canon = Vec::with_capacity(roots.len());
+    for r in roots {
+        canon.push(
+            std::fs::canonicalize(&r)
+                .map_err(|e| format!("cannot canonicalize --allow-root {}: {}", r.display(), e))?,
+        );
+    }
+    let _ = ALLOWED_ROOTS.set(canon);
+    Ok(())
+}
+
+/// Enforce `--allow-root` on one path: the path (or, for paths that do
+/// not exist yet, its nearest existing ancestor) must canonicalize to a
+/// location under an allowed root — otherwise a symlink could resolve
+/// outside the sandbox.
+fn check_allowed(p: &Path) -> Result<(), String> {
+    let Some(roots) = ALLOWED_ROOTS.get() else {
+        return Ok(());
+    };
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let mut candidate = p.to_path_buf();
+    let canon = loop {
+        match std::fs::canonicalize(&candidate) {
+            Ok(c) => break c,
+            Err(_) => {
+                if !candidate.pop() {
+                    return Err(format!("path {} is outside the allowed roots", p.display()));
+                }
+            }
+        }
+    };
+    if roots.iter().any(|r| canon.starts_with(r)) {
+        Ok(())
+    } else {
+        Err(format!("path {} is outside the allowed roots", p.display()))
+    }
+}
+
 /// Resolve a caller-supplied path string. Paths are interpreted relative
 /// to the lens-mcp server process's working directory — the description
 /// of every path argument says so, and errors name the resolved base.
 fn tool_path(args: &Value, key: &str) -> Result<PathBuf, String> {
     let s = arg_str(args, key)?;
     let p = Path::new(s);
-    if p.is_absolute() {
-        return Ok(p.to_path_buf());
-    }
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    Ok(cwd.join(p))
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        cwd.join(p)
+    };
+    check_allowed(&p)?;
+    Ok(p)
+}
+
+/// Optional-path variant of [`tool_path`] for `proc_dir`, `root_path`,
+/// `systemd_dir` — absent key → `None`; present → resolved + checked.
+fn tool_opt_path(args: &Value, key: &str) -> Result<Option<PathBuf>, String> {
+    arg_opt(args, key)
+        .map(|s| {
+            let fake = serde_json::json!({key: s});
+            tool_path(&fake, key)
+        })
+        .transpose()
 }
 
 /// What a tool produced: the JSON payload plus the `Report` judgement —
@@ -295,6 +358,32 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                 complete: true,
             })
         }
+        "lens_log_stats" => {
+            let path = tool_path(args, "path")?;
+            let filter = lens_ops::log::build_filter(&lens_ops::log::FilterArgs {
+                query: arg_opt(args, "query").map(String::from),
+                regex: arg_opt(args, "regex").map(String::from),
+                min_level: arg_opt(args, "min_level").map(String::from),
+                include_unknown: false,
+                since: arg_opt(args, "since").map(String::from),
+                until: arg_opt(args, "until").map(String::from),
+                year: args.get("year").and_then(|v| v.as_i64()).map(|y| y as i32),
+            })
+            .map_err(|e| e.to_string())?;
+            let bucket_secs = arg_opt(args, "bucket")
+                .map(|b| match b {
+                    "1m" => Ok(60u64),
+                    "5m" => Ok(300),
+                    "15m" => Ok(900),
+                    "1h" => Ok(3600),
+                    "1d" => Ok(86_400),
+                    _ => Err(format!("invalid 'bucket' {b:?}; expected 1m|5m|15m|1h|1d")),
+                })
+                .transpose()?;
+            lens_ops::log::stats(&[path], &filter, bucket_secs)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
+        }
         "lens_trace_analyze" => {
             let p = tool_path(args, "trace_file")?;
             lens_ops::trace::analyze(&p)
@@ -375,8 +464,8 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             })
         }
         "lens_net_inspect" => {
-            let proc_dir = arg_opt(args, "proc_dir").map(Path::new);
-            lens_ops::net::inspect(proc_dir, false)
+            let proc_dir = tool_opt_path(args, "proc_dir")?;
+            lens_ops::net::inspect(proc_dir.as_deref(), false)
                 .map(ToolOutcome::from)
                 .map_err(|e| e.to_string())
         }
@@ -397,12 +486,16 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             // Explicit override paths are validated inside lens_ops —
             // a typo'd `systemd_dir` is an in-band tool error (isError),
             // not a vacuous "everything looks fine" report.
-            let root_path = arg_opt(args, "root_path").map(Path::new);
-            let proc_dir = arg_opt(args, "proc_dir").map(Path::new);
-            let systemd_dir = arg_opt(args, "systemd_dir").map(Path::new);
-            lens_ops::doctor::run(root_path, proc_dir, systemd_dir)
-                .map(ToolOutcome::from)
-                .map_err(|e| e.to_string())
+            let root_path = tool_opt_path(args, "root_path")?;
+            let proc_dir = tool_opt_path(args, "proc_dir")?;
+            let systemd_dir = tool_opt_path(args, "systemd_dir")?;
+            lens_ops::doctor::run(
+                root_path.as_deref(),
+                proc_dir.as_deref(),
+                systemd_dir.as_deref(),
+            )
+            .map(ToolOutcome::from)
+            .map_err(|e| e.to_string())
         }
         other => Err(format!("Unknown tool: {}", other)),
     }

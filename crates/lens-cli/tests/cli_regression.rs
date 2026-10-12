@@ -2757,3 +2757,275 @@ fn bundle_diff_tampered_bundle_exits_2() {
     ]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
 }
+
+// --- Phase 5: log follow/stats/multi-input ---
+
+#[test]
+fn log_filter_multiple_inputs_prefixes_and_globs() {
+    let dir = tmp_dir("log-multi");
+    std::fs::write(dir.join("a.log"), "a1 info\na2 hit\n").unwrap();
+    std::fs::write(dir.join("b.log"), "b1 hit\nb2 info\n").unwrap();
+
+    // Two explicit inputs: lines are prefixed [file:line].
+    let out = lens(&[
+        "log",
+        "filter",
+        dir.join("a.log").to_str().unwrap(),
+        dir.join("b.log").to_str().unwrap(),
+        "--query",
+        "hit",
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains(&format!("[{}:2] a2 hit", dir.join("a.log").display())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("[{}:1] b1 hit", dir.join("b.log").display())),
+        "{stdout}"
+    );
+
+    // A filename glob expands (sorted) like the explicit form.
+    let out = lens(&[
+        "log",
+        "filter",
+        dir.join("*.log").to_str().unwrap(),
+        "--query",
+        "hit",
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), stdout);
+
+    // A glob matching nothing is a usage error.
+    let out = lens(&[
+        "log",
+        "filter",
+        dir.join("*.nope").to_str().unwrap(),
+        "--query",
+        "hit",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("matched nothing"));
+
+    // A single input keeps the un-prefixed format.
+    let out = lens(&[
+        "log",
+        "filter",
+        dir.join("a.log").to_str().unwrap(),
+        "--query",
+        "hit",
+    ]);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("[2] a2 hit"), "{stdout}");
+    assert!(!stdout.contains("a.log"), "{stdout}");
+}
+
+#[test]
+fn log_filter_global_limit_across_inputs() {
+    let dir = tmp_dir("log-limit");
+    std::fs::write(dir.join("a.log"), "hit1\nhit2\n").unwrap();
+    std::fs::write(dir.join("b.log"), "hit3\nhit4\n").unwrap();
+    let out = lens(&[
+        "log",
+        "filter",
+        dir.join("a.log").to_str().unwrap(),
+        dir.join("b.log").to_str().unwrap(),
+        "--query",
+        "hit",
+        "--limit",
+        "3",
+        "--format",
+        "json",
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON");
+    assert_eq!(json["matched"], 3, "{json}");
+    assert_eq!(json["total"], 4, "{json}");
+    assert_eq!(json["inputs"].as_array().unwrap().len(), 2, "{json}");
+    // The global limit cut b.log short.
+    assert_eq!(json["inputs"][1]["matched"], 1, "{json}");
+}
+
+#[test]
+fn log_filter_follow_emits_appended_lines() {
+    let dir = tmp_dir("log-follow");
+    let log_path = dir.join("f.log");
+    std::fs::write(&log_path, "seed hit\n").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lens"))
+        .args([
+            "log",
+            "filter",
+            log_path.to_str().unwrap(),
+            "--query",
+            "hit",
+            "--follow",
+            "--limit",
+            "3",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn lens");
+
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(f, "appended hit one").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(f, "appended hit two").unwrap();
+    }
+
+    // --limit 3 should end the follow shortly after the second append.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(s) => break s,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                panic!("follow did not stop after --limit was reached");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    assert!(status.success());
+    let mut stdout = String::new();
+    use std::io::Read as _;
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(stdout.contains("[1] seed hit"), "{stdout}");
+    assert!(stdout.contains("[2] appended hit one"), "{stdout}");
+    assert!(stdout.contains("[3] appended hit two"), "{stdout}");
+}
+
+#[test]
+fn log_filter_follow_rejects_bad_combinations() {
+    let dir = tmp_dir("log-follow-bad");
+    let a = dir.join("a.log");
+    let b = dir.join("b.log");
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+
+    let out = lens(&[
+        "log",
+        "filter",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--follow",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr_of(&out).contains("exactly one"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    let out = lens(&[
+        "log",
+        "filter",
+        a.to_str().unwrap(),
+        "--follow",
+        "--context",
+        "1",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("--context"), "{}", stderr_of(&out));
+
+    let out = lens(&[
+        "log",
+        "filter",
+        a.to_str().unwrap(),
+        "--follow",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr_of(&out).contains("text or jsonl"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn log_stats_json_schema_and_filter() {
+    let dir = tmp_dir("log-stats");
+    let log = dir.join("s.log");
+    std::fs::write(
+        &log,
+        "2026-10-09T12:00:01Z INFO ok\n         2026-10-09T12:30:02Z WARN low\n         2026-10-09T12:30:03Z ERROR boom\n         no timestamp here\n",
+    )
+    .unwrap();
+
+    let out = lens(&["log", "stats", log.to_str().unwrap(), "--format", "json"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON");
+    assert_eq!(json["schema"], "lens.log-stats/v1", "{json}");
+    assert_eq!(json["total_lines"], 4, "{json}");
+    assert_eq!(json["matched_lines"], 4, "{json}");
+    assert_eq!(json["by_level"]["error"], 1, "{json}");
+    assert_eq!(json["unknown_timestamp"], 1, "{json}");
+    assert!(json["buckets"].is_array(), "{json}");
+
+    // A min-level filter scopes the stats.
+    let out = lens(&[
+        "log",
+        "stats",
+        log.to_str().unwrap(),
+        "--min-level",
+        "warn",
+        "--bucket",
+        "1h",
+        "--format",
+        "json",
+    ]);
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON");
+    assert_eq!(json["matched_lines"], 2, "{json}");
+    assert_eq!(json["total_lines"], 4, "{json}");
+    assert_eq!(json["buckets"].as_array().unwrap().len(), 1, "{json}");
+
+    // Bad bucket string is a usage error.
+    let out = lens(&["log", "stats", log.to_str().unwrap(), "--bucket", "2h"]);
+    assert_eq!(out.status.code(), Some(2));
+
+    // Text output renders a histogram line.
+    let out = lens(&["log", "stats", log.to_str().unwrap()]);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("2026-10-09T12:00:00Z"), "{stdout}");
+    assert!(stdout.contains("!2"), "{stdout}"); // 2 warn+ lines in the bucket
+}
+
+#[test]
+fn log_inspect_multiple_inputs() {
+    let dir = tmp_dir("log-inspect");
+    std::fs::write(dir.join("a.log"), "x\n").unwrap();
+    std::fs::write(dir.join("b.log"), "y\nz\n").unwrap();
+    let out = lens(&[
+        "log",
+        "inspect",
+        dir.join("a.log").to_str().unwrap(),
+        dir.join("b.log").to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON");
+    let arr = json.as_array().expect("array for multi-input");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[1]["total_lines"], 2);
+}

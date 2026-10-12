@@ -100,6 +100,26 @@ pub fn list_tools() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "lens_log_stats".to_string(),
+            description: desc(
+                "Aggregate log stats: level counts and a time histogram over the lines the filter keeps. Lens.log-stats/v1.",
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to log file" },
+                    "bucket": { "type": "string", "description": "Histogram bucket width: 1m|5m|15m|1h|1d (default: auto-picked, ~60 buckets)" },
+                    "query": { "type": "string", "description": "Case-insensitive substring query" },
+                    "regex": { "type": "string", "description": "Regex pattern (alternative to query)" },
+                    "min_level": { "type": "string", "description": "Minimum level (trace, debug, info, warn, error, fatal)" },
+                    "since": { "type": "string", "description": "Only lines at/after this timestamp (RFC 3339, 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD', UTC)" },
+                    "until": { "type": "string", "description": "Only lines at/before this timestamp; same forms as 'since'" },
+                    "year": { "type": "integer", "description": "Year assumed for year-less syslog timestamps (default: current year)" }
+                },
+                "required": ["path"]
+            }),
+        },
+        McpTool {
             name: "lens_abi_inspect".to_string(),
             description: desc(
                 "Inspect ELF binary dynamic symbols, version definitions, and DWARF info.",
@@ -299,4 +319,84 @@ pub fn list_tools() -> Vec<McpTool> {
             }),
         },
     ]
+}
+
+/// One entry of `prompts/list` — name, description, declared arguments.
+pub fn list_prompts() -> Value {
+    serde_json::json!({
+        "prompts": [
+            {
+                "name": "incident-triage",
+                "description": "Triage a live incident: health check, listener inspection, log scan, and a findings summary with next steps.",
+                "arguments": [
+                    {
+                        "name": "log_path",
+                        "description": "Log file to scan (default: the system log)",
+                        "required": false
+                    }
+                ]
+            },
+            {
+                "name": "compare-snapshots",
+                "description": "Compare two lens snapshot/bundle files and explain what regressed.",
+                "arguments": [
+                    {
+                        "name": "baseline",
+                        "description": "Earlier .lens snapshot or bundle",
+                        "required": true
+                    },
+                    {
+                        "name": "candidate",
+                        "description": "Later .lens snapshot or bundle",
+                        "required": true
+                    }
+                ]
+            }
+        ]
+    })
+}
+
+/// One entry of `prompts/get` — a user message instructing the assistant
+/// which tools to run and how to report. `args` supplies the declared
+/// arguments; a missing required argument or unknown prompt returns a
+/// JSON-RPC -32602 via `Err`.
+pub fn get_prompt(name: &str, args: &Value) -> Result<Value, String> {
+    let arg_str =
+        |key: &str| -> Option<String> { args.get(key).and_then(|v| v.as_str()).map(String::from) };
+    let text = match name {
+        "incident-triage" => {
+            let log = arg_str("log_path")
+                .map(|p| format!("`{p}`"))
+                .unwrap_or_else(|| "the system log (e.g. /var/log/syslog)".to_string());
+            format!(
+                "Triage a possible incident on this host. In order:\n\
+                 1. Call `lens_doctor` and note every WARN/FAIL check.\n\
+                 2. Call `lens_net_inspect` and flag sensitive listeners on wildcard addresses.\n\
+                 3. Call `lens_log_filter` on {log} with `min_level: \"warn\"` and `tail: 2000`.\n\
+                 Summarize the findings as a short incident report, and for each \
+                 actionable check include the `next_command` doctor suggested."
+            )
+        }
+        "compare-snapshots" => {
+            let baseline = arg_str("baseline")
+                .ok_or_else(|| "missing required argument 'baseline'".to_string())?;
+            let candidate = arg_str("candidate")
+                .ok_or_else(|| "missing required argument 'candidate'".to_string())?;
+            format!(
+                "Compare two system snapshots. Call `lens_bundle_diff` with \
+                 `baseline: \"{baseline}\"` and `candidate: \"{candidate}\"`. \
+                 Explain the regressions first (any fail-severity findings), \
+                 then improvements, then entries only present on one side."
+            )
+        }
+        other => return Err(format!("unknown prompt: {other}")),
+    };
+    Ok(serde_json::json!({
+        "messages": [
+            {
+                "role": "user",
+                "content": { "type": "text", "text": text }
+            }
+        ]
+    }))
 }

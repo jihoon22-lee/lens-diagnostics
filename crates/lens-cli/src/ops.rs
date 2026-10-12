@@ -219,7 +219,7 @@ fn inspect_command(path: &Path, domain: Domain) -> Result<Commands> {
             action: BundleCommands::Inspect { bundle: p },
         },
         Domain::Log => Commands::Log {
-            action: LogCommands::Inspect { path: p },
+            action: LogCommands::Inspect { paths: vec![p] },
         },
         Domain::Disk => Commands::Disk {
             action: DiskCommands::Scan {
@@ -753,30 +753,48 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
             }
         },
         Commands::Log { action } => match action {
-            LogCommands::Inspect { path } => {
-                let indexer = log::open(&path)?;
+            LogCommands::Inspect { paths } => {
+                let paths = log::expand_inputs(&paths)?;
+                let mut indexers = Vec::with_capacity(paths.len());
+                for path in &paths {
+                    indexers.push(log::open(path)?);
+                }
                 if wants_json(format, json, false) {
-                    outln!(
-                        "{}",
-                        to_deterministic_pretty(&serde_json::json!({
-                            "path": path.to_string_lossy(),
-                            "total_lines": indexer.len(),
-                            "lossy_lines": indexer.lossy_lines(),
-                        }))?
-                    );
+                    let blocks: Vec<serde_json::Value> = paths
+                        .iter()
+                        .zip(&indexers)
+                        .map(|(path, indexer)| {
+                            serde_json::json!({
+                                "path": path.to_string_lossy(),
+                                "total_lines": indexer.len(),
+                                "lossy_lines": indexer.lossy_lines(),
+                            })
+                        })
+                        .collect();
+                    let value = if blocks.len() == 1 {
+                        blocks.into_iter().next().unwrap()
+                    } else {
+                        serde_json::Value::Array(blocks)
+                    };
+                    outln!("{}", to_deterministic_pretty(&value)?);
                 } else {
-                    outln!("Log file: {:?}", path);
-                    outln!("Total lines indexed: {}", indexer.len());
-                    if indexer.lossy_lines() > 0 {
-                        outln!(
-                            "Lossy lines (invalid UTF-8, shown with U+FFFD): {}",
-                            indexer.lossy_lines()
-                        );
+                    for (i, (path, indexer)) in paths.iter().zip(&indexers).enumerate() {
+                        if i > 0 {
+                            outln!();
+                        }
+                        outln!("Log file: {:?}", path);
+                        outln!("Total lines indexed: {}", indexer.len());
+                        if indexer.lossy_lines() > 0 {
+                            outln!(
+                                "Lossy lines (invalid UTF-8, shown with U+FFFD): {}",
+                                indexer.lossy_lines()
+                            );
+                        }
                     }
                 }
             }
             LogCommands::Filter {
-                path,
+                paths,
                 query,
                 regex,
                 min_level,
@@ -786,8 +804,9 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 year,
                 limit,
                 context,
+                follow,
             } => {
-                let indexer = log::open(&path)?;
+                let paths = log::expand_inputs(&paths)?;
                 let filter = log::build_filter(&log::FilterArgs {
                     query,
                     regex,
@@ -800,153 +819,141 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
 
                 let jsonl_mode = format == Some(OutputFormat::Jsonl);
                 let json_mode = wants_json(format, json, false);
+                let multi = paths.len() > 1;
+
+                if follow {
+                    // Polling only makes sense for a live regular file.
+                    if multi {
+                        return Err(usage("--follow accepts exactly one log file input"));
+                    }
+                    let p = &paths[0];
+                    if p.as_os_str() == "-" {
+                        return Err(usage("--follow cannot tail stdin (`-`)"));
+                    }
+                    if p.extension().is_some_and(|e| e == "gz") {
+                        return Err(usage("--follow cannot tail a compressed (.gz) file"));
+                    }
+                    if json_mode {
+                        return Err(usage("--follow requires --format text or jsonl output"));
+                    }
+                    if context != 0 {
+                        return Err(usage(
+                            "--follow does not support --context (appended matches have no surrounding lines)",
+                        ));
+                    }
+                }
+
+                let mut budget = limit;
                 let mut matched = 0usize;
+                let mut total_lines = 0usize;
+                let mut total_lossy = 0usize;
                 let mut excluded_unknown = 0usize;
                 let mut excluded_unknown_ts = 0usize;
-                let mut matched_lines: Vec<serde_json::Value> = Vec::new();
-                // Context bookkeeping: `pending_before` holds the last
-                // `context` non-matching lines; `after_left` counts the
-                // trailing context still owed after the latest match.
-                let mut pending_before: std::collections::VecDeque<(usize, String)> =
-                    std::collections::VecDeque::with_capacity(context);
-                let mut after_left = 0usize;
-                let mut last_printed: Option<usize> = None;
-                let mut limited = false;
+                let mut stopped = false;
+                let mut inputs_json: Vec<serde_json::Value> = Vec::new();
+                let mut follow_indexer = None;
 
-                let emit = |idx: usize,
-                            text: &str,
-                            is_match: bool,
-                            matched_lines: &mut Vec<serde_json::Value>,
-                            last_printed: &mut Option<usize>,
-                            after_left: &mut usize| {
-                    if *last_printed == Some(idx) {
-                        return;
-                    }
-                    *last_printed = Some(idx);
-                    if jsonl_mode {
-                        // One JSON object per emitted line; match/context
-                        // distinguished by the `context` flag.
-                        outln!(
-                            "{}",
-                            serde_json::json!({
-                                "line": idx + 1,
-                                "context": !is_match,
-                                "text": text,
-                            })
-                        );
-                    } else if json_mode {
-                        matched_lines.push(serde_json::json!({
-                            "line": idx + 1,
-                            "context": !is_match,
-                            "text": text,
-                        }));
-                    } else if is_match {
-                        outln!("[{}] {}", idx + 1, text);
-                    } else {
-                        outln!("[{}]- {}", idx + 1, text);
-                    }
-                    if !is_match {
-                        *after_left = after_left.saturating_sub(1);
-                    }
-                };
-
-                for idx in 0..indexer.len() {
-                    // After --limit, only the owed trailing context is emitted.
-                    if limited && after_left == 0 {
-                        break;
-                    }
-                    // Lossy view: invalid-UTF-8 lines are still matched and
-                    // shown (with U+FFFD) rather than silently skipped.
-                    // Kept as a Cow: the borrowed fast path avoids one
-                    // String allocation per scanned line; only context
-                    // lines buffered in `pending_before` are owned.
-                    let line = indexer.get_line_lossy(idx).unwrap_or_default();
-                    let is_match = !limited && {
-                        if filter.min_level.is_some() || filter.time_filter_active() {
-                            // Level/timestamp filtering needs the parsed
-                            // record; it also lets us count evidence
-                            // discarded as undeterminable.
-                            let record = parse_line(&line, idx + 1);
-                            if filter.rejected_only_by_unknown_level(&record) {
-                                excluded_unknown += 1;
-                                false
-                            } else if filter.rejected_only_by_unknown_timestamp(&record) {
-                                excluded_unknown_ts += 1;
-                                false
-                            } else {
-                                filter.matches(&record)
-                            }
-                        } else {
-                            filter.matches_line(&line, idx + 1)
-                        }
-                    };
-
-                    if is_match {
-                        // Flush the buffered leading context.
-                        for (cidx, ctext) in pending_before.drain(..) {
-                            emit(
-                                cidx,
-                                &ctext,
-                                false,
-                                &mut matched_lines,
-                                &mut last_printed,
-                                &mut after_left,
-                            );
-                        }
-                        emit(
-                            idx,
-                            &line,
-                            true,
-                            &mut matched_lines,
-                            &mut last_printed,
-                            &mut after_left,
-                        );
-                        matched += 1;
-                        after_left = context;
-                        if let Some(l) = limit {
-                            if matched >= l {
-                                limited = true;
-                            }
-                        }
-                    } else if after_left > 0 {
-                        emit(
-                            idx,
-                            &line,
-                            false,
-                            &mut matched_lines,
-                            &mut last_printed,
-                            &mut after_left,
-                        );
-                    } else if context > 0 {
-                        pending_before.push_back((idx, line.into_owned()));
-                        while pending_before.len() > context {
-                            pending_before.pop_front();
-                        }
-                    }
-                }
-                if json_mode && !jsonl_mode {
-                    outln!(
-                        "{}",
-                        to_deterministic_pretty(&serde_json::json!({
-                            "path": path.to_string_lossy(),
-                            "matched": matched,
-                            "total": indexer.len(),
-                            "excluded_unknown": excluded_unknown,
-                            "excluded_unknown_ts": excluded_unknown_ts,
-                            "lossy_lines": indexer.lossy_lines(),
-                            "lines": matched_lines,
-                        }))?
+                for path in &paths {
+                    let indexer = log::open(path)?;
+                    total_lines += indexer.len();
+                    total_lossy += indexer.lossy_lines();
+                    let label = path.to_string_lossy();
+                    let res = filter_log_lines(
+                        &indexer, &label, multi, &filter, context, budget, jsonl_mode, json_mode,
                     );
+                    matched += res.matched;
+                    excluded_unknown += res.excluded_unknown;
+                    excluded_unknown_ts += res.excluded_unknown_ts;
+                    stopped |= res.stopped_by_limit;
+                    if let Some(b) = budget.as_mut() {
+                        *b = b.saturating_sub(res.matched);
+                    }
+                    if json_mode && !jsonl_mode {
+                        inputs_json.push(serde_json::json!({
+                            "path": label,
+                            "matched": res.matched,
+                            "total": indexer.len(),
+                            "excluded_unknown": res.excluded_unknown,
+                            "excluded_unknown_ts": res.excluded_unknown_ts,
+                            "lossy_lines": indexer.lossy_lines(),
+                            "lines": res.lines,
+                        }));
+                    }
+                    if follow {
+                        follow_indexer = Some(indexer);
+                    }
                 }
+
+                if json_mode && !jsonl_mode {
+                    let value = if multi {
+                        serde_json::json!({
+                            "inputs": inputs_json,
+                            "matched": matched,
+                            "total": total_lines,
+                        })
+                    } else {
+                        inputs_json.into_iter().next().unwrap()
+                    };
+                    outln!("{}", to_deterministic_pretty(&value)?);
+                }
+
+                if follow && !stopped {
+                    let indexer = follow_indexer.unwrap();
+                    let mut follower =
+                        log::Follower::new(&paths[0], indexer.as_bytes().len() as u64)?;
+                    let mut line_no = indexer.len();
+                    'follow: loop {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let poll = follower.poll()?;
+                        if let Some(note) = &poll.note {
+                            diagln!("{note}");
+                        }
+                        let mut emitted = false;
+                        for line in poll.lines {
+                            line_no += 1;
+                            let is_match =
+                                if filter.min_level.is_some() || filter.time_filter_active() {
+                                    filter.matches(&parse_line(&line, line_no))
+                                } else {
+                                    filter.matches_line(&line, line_no)
+                                };
+                            if !is_match {
+                                continue;
+                            }
+                            matched += 1;
+                            emitted = true;
+                            if jsonl_mode {
+                                outln!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "line": line_no,
+                                        "context": false,
+                                        "text": line,
+                                    })
+                                );
+                            } else {
+                                outln!("[{}] {}", line_no, line);
+                            }
+                            if limit.is_some_and(|l| matched >= l) {
+                                stopped = true;
+                                break 'follow;
+                            }
+                        }
+                        if emitted {
+                            crate::output::flush();
+                        }
+                    }
+                }
+
                 // Diagnostics stay on stderr so json/jsonl stdout stays clean.
-                diagln!("\nMatched {} of {} line(s).", matched, indexer.len());
-                if limited {
+                diagln!("\nMatched {} of {} line(s).", matched, total_lines);
+                if stopped {
                     diagln!("Stopped after {} match(es): --limit reached.", matched);
                 }
-                if indexer.lossy_lines() > 0 {
+                if total_lossy > 0 {
                     diagln!(
                         "{} line(s) contain invalid UTF-8 (shown lossy as U+FFFD).",
-                        indexer.lossy_lines()
+                        total_lossy
                     );
                 }
                 if excluded_unknown > 0 {
@@ -961,6 +968,82 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         excluded_unknown_ts
                     );
                 }
+            }
+            LogCommands::Stats {
+                paths,
+                bucket,
+                query,
+                regex,
+                min_level,
+                include_unknown,
+                since,
+                until,
+                year,
+            } => {
+                let paths = log::expand_inputs(&paths)?;
+                let filter = log::build_filter(&log::FilterArgs {
+                    query,
+                    regex,
+                    min_level,
+                    include_unknown,
+                    since,
+                    until,
+                    year,
+                })?;
+                let bucket_secs = bucket
+                    .as_deref()
+                    .map(|b| match b {
+                        "1m" => Ok(60u64),
+                        "5m" => Ok(300),
+                        "15m" => Ok(900),
+                        "1h" => Ok(3600),
+                        "1d" => Ok(86_400),
+                        _ => Err(usage(format!(
+                            "invalid --bucket {b:?}; expected 1m|5m|15m|1h|1d"
+                        ))),
+                    })
+                    .transpose()?;
+                let report = log::stats(&paths, &filter, bucket_secs)?;
+                let s = &report.data;
+                if wants_json(format, json, false) {
+                    outln!("{}", to_deterministic_pretty(s)?);
+                } else {
+                    outln!(
+                        "Log stats: {} input(s), {} line(s) scanned, {} matched",
+                        s.inputs.len(),
+                        s.total_lines,
+                        s.matched_lines
+                    );
+                    if !s.by_level.is_empty() {
+                        outln!("Levels:");
+                        for (lvl, n) in &s.by_level {
+                            outln!("  {:<8} {}", lvl, n);
+                        }
+                    }
+                    if s.unknown_timestamp > 0 {
+                        outln!("  {:<8} {}", "no-ts", s.unknown_timestamp);
+                    }
+                    if !s.buckets.is_empty() {
+                        outln!("Histogram:");
+                        let max = s.buckets.iter().map(|b| b.total).max().unwrap_or(1);
+                        for b in &s.buckets {
+                            let width = ((b.total * 40).div_ceil(max)).max(1) as usize;
+                            let bar = "#".repeat(width.min(40));
+                            if b.warn_or_higher > 0 {
+                                outln!(
+                                    "{}  {:>6}  {} !{}",
+                                    b.start,
+                                    b.total,
+                                    bar,
+                                    b.warn_or_higher
+                                );
+                            } else {
+                                outln!("{}  {:>6}  {}", b.start, b.total, bar);
+                            }
+                        }
+                    }
+                }
+                apply(&mut outcome, &report, threshold);
             }
         },
         Commands::Test { action } => match action {
@@ -1759,4 +1842,176 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
     }
 
     Ok(outcome)
+}
+
+/// Result of filtering one log input — counts plus the collected line
+/// objects for `--format json` (empty under text/jsonl).
+struct LogFileFilterOut {
+    matched: usize,
+    excluded_unknown: usize,
+    excluded_unknown_ts: usize,
+    lines: Vec<serde_json::Value>,
+    /// The global --limit was exhausted while scanning this input.
+    stopped_by_limit: bool,
+}
+
+/// Scan one indexed log input and emit matching/context lines.
+/// `label` is only used when `show_file` (multi-input mode) prefixes
+/// text lines as `[<file>:<line>]` and adds `"file"` to emitted objects;
+/// `limit` is the remaining global match budget. Context bookkeeping is
+/// local to this call — context never crosses input boundaries.
+#[allow(clippy::too_many_arguments)]
+fn filter_log_lines(
+    indexer: &lens_log::LogIndexer,
+    label: &str,
+    show_file: bool,
+    filter: &lens_log::LogFilter,
+    context: usize,
+    limit: Option<usize>,
+    jsonl_mode: bool,
+    json_mode: bool,
+) -> LogFileFilterOut {
+    let mut matched = 0usize;
+    let mut excluded_unknown = 0usize;
+    let mut excluded_unknown_ts = 0usize;
+    let mut matched_lines: Vec<serde_json::Value> = Vec::new();
+    // Context bookkeeping: `pending_before` holds the last `context`
+    // non-matching lines; `after_left` counts the trailing context still
+    // owed after the latest match.
+    let mut pending_before: std::collections::VecDeque<(usize, String)> =
+        std::collections::VecDeque::with_capacity(context);
+    let mut after_left = 0usize;
+    let mut last_printed: Option<usize> = None;
+    // A zero remaining budget (limit hit in an earlier input) means this
+    // file contributes nothing at all — not even context.
+    let mut limited = limit == Some(0);
+
+    let emit = |idx: usize,
+                text: &str,
+                is_match: bool,
+                matched_lines: &mut Vec<serde_json::Value>,
+                last_printed: &mut Option<usize>,
+                after_left: &mut usize| {
+        if *last_printed == Some(idx) {
+            return;
+        }
+        *last_printed = Some(idx);
+        let obj = |v: &mut serde_json::Map<String, serde_json::Value>| {
+            if show_file {
+                v.insert("file".to_string(), serde_json::json!(label));
+            }
+        };
+        if jsonl_mode {
+            // One JSON object per emitted line; match/context
+            // distinguished by the `context` flag.
+            let mut v = serde_json::json!({
+                "line": idx + 1,
+                "context": !is_match,
+                "text": text,
+            });
+            obj(v.as_object_mut().unwrap());
+            outln!("{}", v);
+        } else if json_mode {
+            let mut v = serde_json::json!({
+                "line": idx + 1,
+                "context": !is_match,
+                "text": text,
+            });
+            obj(v.as_object_mut().unwrap());
+            matched_lines.push(v);
+        } else if is_match {
+            if show_file {
+                outln!("[{}:{}] {}", label, idx + 1, text);
+            } else {
+                outln!("[{}] {}", idx + 1, text);
+            }
+        } else if show_file {
+            outln!("[{}:{}]- {}", label, idx + 1, text);
+        } else {
+            outln!("[{}]- {}", idx + 1, text);
+        }
+        if !is_match {
+            *after_left = after_left.saturating_sub(1);
+        }
+    };
+
+    for idx in 0..indexer.len() {
+        // After --limit, only the owed trailing context is emitted.
+        if limited && after_left == 0 {
+            break;
+        }
+        // Lossy view: invalid-UTF-8 lines are still matched and shown
+        // (with U+FFFD) rather than silently skipped. Kept as a Cow:
+        // the borrowed fast path avoids one String allocation per
+        // scanned line; only context lines buffered in `pending_before`
+        // are owned.
+        let line = indexer.get_line_lossy(idx).unwrap_or_default();
+        let is_match = !limited && {
+            if filter.min_level.is_some() || filter.time_filter_active() {
+                // Level/timestamp filtering needs the parsed record; it
+                // also lets us count evidence discarded as undeterminable.
+                let record = parse_line(&line, idx + 1);
+                if filter.rejected_only_by_unknown_level(&record) {
+                    excluded_unknown += 1;
+                    false
+                } else if filter.rejected_only_by_unknown_timestamp(&record) {
+                    excluded_unknown_ts += 1;
+                    false
+                } else {
+                    filter.matches(&record)
+                }
+            } else {
+                filter.matches_line(&line, idx + 1)
+            }
+        };
+
+        if is_match {
+            // Flush the buffered leading context.
+            for (cidx, ctext) in pending_before.drain(..) {
+                emit(
+                    cidx,
+                    &ctext,
+                    false,
+                    &mut matched_lines,
+                    &mut last_printed,
+                    &mut after_left,
+                );
+            }
+            emit(
+                idx,
+                &line,
+                true,
+                &mut matched_lines,
+                &mut last_printed,
+                &mut after_left,
+            );
+            matched += 1;
+            after_left = context;
+            if limit.is_some_and(|l| matched >= l) {
+                limited = true;
+            }
+        } else if after_left > 0 {
+            emit(
+                idx,
+                &line,
+                false,
+                &mut matched_lines,
+                &mut last_printed,
+                &mut after_left,
+            );
+        } else if context > 0 {
+            pending_before.push_back((idx, line.into_owned()));
+            while pending_before.len() > context {
+                pending_before.pop_front();
+            }
+        }
+    }
+
+    LogFileFilterOut {
+        matched,
+        excluded_unknown,
+        excluded_unknown_ts,
+        lines: matched_lines,
+        stopped_by_limit: limited,
+    }
 }

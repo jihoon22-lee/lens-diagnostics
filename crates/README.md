@@ -82,7 +82,9 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   미판별 줄은 `include_unknown`으로 복원). `matches_line`은 no-op
   필터와 substring-only 거절을 파싱 없이 단락.
 - `timestamp`: `--since/--until` 인자 파서(RFC 3339/오프셋 없는
-  ISO/날짜만 — UTC 해석)와 줄 타임스탬프 추출기(ISO·syslog 접두사,
+  ISO/날짜만 — UTC 해석), 줄 타임스탬프 추출기(ISO·syslog 접두사,
+  epoch ms → RFC 3339 변환 헬퍼(`format_rfc3339_ms`/`_secs`) — `log
+  stats`의 버킷 라벨에 사용),
   JSONL `ts`/`time`/`timestamp`). 연도 없는 syslog는 `default_syslog_year()`
   = 현재 UTC 연도, `--year`/`syslog_year`로 재정의.
 - 스키마: `loglens.session/v2`.
@@ -192,6 +194,10 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   가상 fs 제외·fsid 중복 제거), world-writable PATH 검사, WARN/FAIL
   검사의 `next_command` 제안, `doctor::diff_reports` 리포트 비교를
   제공한다.
+- `log`은 `expand_inputs`(다중 경로·glob·`-` 중복 거부), `Follower`
+  (byte-offset + (dev,inode) 추적으로 append/부분 줄/truncate/rotate
+  처리), `stats`(`lens.log-stats/v1` 레벨 분포+자동 버킷 히스토그램)
+  까지 제공한다.
 - clap·출력 없음 — 프레젠테이션은 소비자 책임.
 
 ## lens-cli — `lens` 통합 CLI
@@ -241,12 +247,16 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
 - `lens_log_filter`는 `tail`(끝 N라인), `regex`, `min_level`,
   `include_unknown`을 지원하고 `matches`를 자체 페이징한다
   (`limit`/`offset`).
+- `--allow-root DIR`(반복)로 모든 도구 경로 인자를 canonicalize된
+  루트 안으로 제한한다 — 벗어나는 경로는 in-band 도구 오류. `prompts`
+  capability로 `incident-triage`·`compare-snapshots` 프롬프트를
+  노출한다(`prompts/list`/`prompts/get`).
 
 | 툴 | 용도 |
 |---|---|
 | `lens_disk_scan`, `lens_disk_duplicates` | 스토리지 분석/중복 탐지 |
 | `lens_abi_inspect`, `lens_abi_diff` | ELF/심볼/버전/DWARF 검사·비교 |
-| `lens_log_filter` | 로그 필터(tail/regex/페이지) |
+| `lens_log_filter`, `lens_log_stats` | 로그 필터(tail/regex/페이지)/레벨·히스토그램 집계 |
 | `lens_trace_analyze` | strace 분석 |
 | `lens_sys_cycles`, `lens_sys_diff` | systemd 사이클/스냅샷 비교 |
 | `lens_test_diff` | JUnit 회귀 diff |

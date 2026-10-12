@@ -169,11 +169,37 @@ lens abi diff <baseline> <candidate> [--format text|json]
 ### 3. log — 로그 인덱싱·필터
 
 ```bash
-lens log inspect <path> [--format text|json]
-lens log filter <path> [--query TEXT | --regex PATTERN] [--min-level LEVEL]
+lens log inspect <path>... [--format text|json]
+lens log filter <path>... [--query TEXT | --regex PATTERN] [--min-level LEVEL]
                 [--include-unknown] [--since TS] [--until TS] [--year Y]
-                [--limit N] [--context N] [--format text|json|jsonl]
+                [--limit N] [--context N] [-f|--follow]
+                [--format text|json|jsonl]
+lens log stats <path>... [--bucket 1m|5m|15m|1h|1d]
+                [--query TEXT | --regex PATTERN] [--min-level LEVEL]
+                [--include-unknown] [--since TS] [--until TS] [--year Y]
 ```
+
+- `log inspect`/`filter`/`stats`의 `path`는 여러 개 지정할 수 있고
+  각 항목은 `-`(stdin), 파일, `.gz`, `*`/`?` 파일명 glob(부모
+  디렉터리에서 확장, 정렬)이다. glob이 아무것도 못 찾으면 사용 오류,
+  `-`는 한 번만 허용된다.
+- 다중 입력 시 `--limit`은 전체 합산이고 컨텍스트는 파일 경계를
+  넘지 않는다. text 출력은 `[<file>:<line>]` 접두사, jsonl 오브젝트는
+  `"file"` 필드를 가진다. `--format json`은
+  `{"inputs": [파일별 오브젝트…], "matched", "total"}`이다(단일
+  입력은 기존 형태 그대로). `log inspect`는 파일별 요약 블록을
+  출력하고 json은 배열이 된다.
+- `-f`/`--follow`: 초기 필터 패스 뒤 250 ms 간격으로 파일을 폴링해
+  추가된 줄에 같은 필터를 적용한다(`tail -f`와 같음 — 줄 번호는
+  인덱스 총계에서 이어진다). 정확히 하나의 정규 파일만 허용
+  (stdin·`.gz` 불가), `--context 0`, `--format text` 또는 `jsonl`
+  필요. 파일이 잘리거나(truncate) 교체되면(rotate) 처음부터 다시
+  읽고 stderr에 안내를 출력한다.
+- `log stats`는 필터가 통과시킨 줄의 레벨 분포와 시간 히스토그램을
+  출력한다(`lens.log-stats/v1`). `--bucket` 미지정 시 첫·끝
+  타임스탬프 구간이 60 버킷 이하가 되는 최소 폭을 자동 선택
+  (타임스탬프 없으면 1h). text 출력의 버킷 뒤 `!N`은 그 버킷의
+  warn+ 줄 수다.
 
 - mmap 라인 인덱서(memchr 기반)로 GB급 로그를 즉시 열람.
 - `path`로 `-`를 주면 stdin을 읽는다. `.gz` 파일은 해제하며 읽고,
@@ -422,7 +448,7 @@ AI 어시스턴트 연동용 stdio JSON-RPC 서버. 도구: `lens_disk_scan`,
 `lens_log_filter`, `lens_trace_analyze`, `lens_sys_cycles`,
 `lens_sys_diff`, `lens_test_diff`, `lens_net_diff`, `lens_build_impact`,
 `lens_env_check`, `lens_net_inspect`, `lens_bundle_verify`,
-`lens_bundle_diff`, `lens_doctor`.
+`lens_bundle_diff`, `lens_log_stats`, `lens_doctor`.
 
 ```bash
 cargo build --release -p lens-mcp
@@ -447,6 +473,18 @@ cargo build --release -p lens-mcp
   불완전 증거가 있으면 두 번째 아이템으로
   `{"findings": [...], "complete": bool}` JSON이 추가된다.
 - 도구 실패는 `result.isError=true` + 텍스트로 반환된다(잘못된 경로 포함).
+- `lens-mcp --allow-root DIR`(반복 가능)으로 파일시스템 접근을
+  샌드박스한다: 모든 도구 경로 인자(`path`·`baseline`·`proc_dir`·
+  `root_path`·`systemd_dir` 등)가 허용 루트 아래로 canonicalize되지
+  않으면 in-band 도구 오류 `path <p> is outside the allowed roots`로
+  거부된다. 존재하지 않는 경로는 가장 가까운 존재 조상을 기준으로
+  판정한다. 미지정 시 기존 동작(제한 없음).
+- `prompts` capability: `prompts/list`/`prompts/get`로 두 프롬프트를
+  제공한다 — `incident-triage`(선택 인자 `log_path`: doctor →
+  net inspect → log filter `min_level:"warn"`, `tail:2000` 순서 지시)와
+  `compare-snapshots`(필수 인자 `baseline`/`candidate`:
+  `lens_bundle_diff` 호출 후 회귀부터 설명). 알 수 없는 프롬프트 또는
+  필수 인자 누락은 -32602다.
 - `initialize`는 지원하는 `protocolVersion`(`2025-06-18`, `2025-03-26`,
   `2024-11-05`) 중 요청된 것을 에코하고, 미지원/누락이면 `2025-06-18`로
   응답한다. `id` 없는 요청(JSON-RPC 노티피케이션)에는 응답하지 않는다.

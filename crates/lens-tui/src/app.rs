@@ -316,28 +316,35 @@ impl TuiApp {
                 })
         });
 
-        let loaded = path.and_then(|p| {
-            LogIndexer::open(&p).ok().map(|indexer| {
+        let loaded = path.map(|p| match LogIndexer::open(&p) {
+            Ok(indexer) => {
                 let start = indexer.len().saturating_sub(2000);
+                // Lossy: lines with invalid UTF-8 are shown with U+FFFD
+                // instead of being silently dropped from the tail.
                 let lines: Vec<String> = (start..indexer.len())
-                    .filter_map(|i| indexer.get_line(i).map(|s| s.to_string()))
+                    .filter_map(|i| indexer.get_line_lossy(i).map(|s| s.into_owned()))
                     .collect();
-                (p, lines)
-            })
+                Ok((p, lines))
+            }
+            Err(e) => Err((p, e)),
         });
         match loaded {
-            Some((p, lines)) => {
+            Some(Ok((p, lines))) => {
                 self.log_lines = lines;
                 self.log_path = Some(p);
                 self.log_scroll = self.log_lines.len();
             }
-            None => {
+            res => {
                 // No readable log — drop previously shown lines so the tab
                 // doesn't display stale output under a new directory.
                 self.log_lines.clear();
                 self.log_path = None;
                 self.log_scroll = 0;
-                if let Some(p) = &self.log_override {
+                if let Some(Err((p, e))) = res {
+                    // An explicit --log path (or a discovered file) that
+                    // failed to open tells the user why the tab is empty.
+                    self.status_message = format!("Cannot read log file {:?}: {}", p, e);
+                } else if let Some(p) = &self.log_override {
                     self.status_message = format!("Cannot read log file {:?}", p);
                 }
             }

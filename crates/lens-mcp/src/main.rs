@@ -1,9 +1,53 @@
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
+use lens_mcp::handler::set_allowed_roots;
+use lens_mcp::protocol::{get_prompt, list_prompts};
 use lens_mcp::{execute_tool, list_tools, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 
+const USAGE: &str = "\
+lens-mcp — MCP (JSON-RPC 2.0 over stdio) server exposing the lens toolkit.
+
+Usage: lens-mcp [--allow-root DIR]...
+
+Options:
+  --allow-root DIR   Restrict all tool path arguments to DIR (repeatable).
+                     Paths are canonicalized; a path resolving outside every
+                     allowed root is rejected with a tool error.
+  -h, --help         Show this help.
+";
+
+/// Parse `--allow-root DIR` (repeatable) and `--help` without pulling in
+/// clap — the binary's interface is otherwise pure stdio JSON-RPC.
+fn parse_args() -> Result<Vec<std::path::PathBuf>, String> {
+    let mut roots = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--allow-root" => {
+                let dir = args
+                    .next()
+                    .ok_or_else(|| "--allow-root requires a directory argument".to_string())?;
+                roots.push(std::path::PathBuf::from(dir));
+            }
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(roots)
+}
+
 fn main() -> io::Result<()> {
+    match parse_args().and_then(set_allowed_roots) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -73,7 +117,8 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                 result: Some(serde_json::json!({
                     "protocolVersion": protocol_version,
                     "capabilities": {
-                        "tools": {}
+                        "tools": {},
+                        "prompts": {}
                     },
                     "serverInfo": {
                         "name": "lens-mcp",
@@ -101,6 +146,35 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                 })),
                 error: None,
             })
+        }
+        "prompts/list" => Some(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id.clone(),
+            result: Some(list_prompts()),
+            error: None,
+        }),
+        "prompts/get" => {
+            let params = req.params.as_ref().unwrap_or(&Value::Null);
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params.get("arguments").unwrap_or(&Value::Null);
+            match get_prompt(name, args) {
+                Ok(prompt) => Some(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: req.id.clone(),
+                    result: Some(prompt),
+                    error: None,
+                }),
+                Err(e) => Some(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: req.id.clone(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: e,
+                        data: None,
+                    }),
+                }),
+            }
         }
         "tools/call" => {
             let params = req.params.as_ref().unwrap_or(&Value::Null);

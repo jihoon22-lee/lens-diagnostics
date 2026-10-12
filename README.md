@@ -112,6 +112,8 @@ $ lens abi diff lib_v1.so lib_v2.so
 
 # 3. 수 GB 로그 파일 무할당 제로카피 고속 필터링
 $ lens log filter /var/log/syslog --query "error" --min-level warn
+$ lens log filter /var/log/syslog -f --min-level warn   # tail -f처럼 실시간 팔로우
+$ lens log stats /var/log/syslog                       # 레벨 분포 + 시간 히스토그램
 
 # 4. 스트리밍 테스트 리포트 파싱 및 회귀(Regression) 자동 탐지
 $ lens test parse target/junit.xml --project backend
