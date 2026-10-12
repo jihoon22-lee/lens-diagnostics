@@ -2,7 +2,9 @@
 
 Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.Z` 형식이다.
 
-## Unreleased
+## 0.7.0
+
+코드리뷰 후속 하드닝·사용성 개선 릴리스: 공유 오퍼레이션 레이어(`lens-ops`)와 findings 기반 종료 코드, 자동 판별 `lens inspect`/`lens diff`, `lens snapshot`과 번들 간 diff, 로그 follow/stats, MCP 샌드박스·prompts. 종료 코드 등 Breaking changes는 아래 섹션 참고.
 
 ### 추가
 

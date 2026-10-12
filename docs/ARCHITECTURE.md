@@ -162,7 +162,7 @@ lens-tui ──> (도메인 크레이트 직접 소비) ──> lens-core
 {
   "schema": "lens.bundle/v2",
   "tool": "lens",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "created_at": "<RFC3339>",
   "sources": [{"path": "reports/x.json", "size": N, "sha256": "..."}],
   "diagnostics": ["..."]
