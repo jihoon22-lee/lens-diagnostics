@@ -49,19 +49,24 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// Protocol versions this server speaks. Echoed back when the client
+/// asks for one of them; anything else (or a missing version) gets the
+/// newest supported one.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
 fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    // A JSON-RPC notification (no `id`) never gets a response — for any
+    // method, including tools/call and unknown methods.
+    req.id.as_ref()?;
     match req.method.as_str() {
         "initialize" => {
-            // Protocol negotiation: echo the client's requested version
-            // (we implement the tools/call surface identically for all
-            // 2024-11-05+ clients); fall back to our baseline when the
-            // request omits it.
             let protocol_version = req
                 .params
                 .as_ref()
                 .and_then(|p| p.get("protocolVersion"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("2024-11-05");
+                .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+                .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0]);
             Some(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id: req.id.clone(),
@@ -118,19 +123,27 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                 })
             } else {
                 match execute_tool(name, args) {
-                    Ok(text) => Some(JsonRpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: req.id.clone(),
-                        result: Some(serde_json::json!({
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": text
-                                }
-                            ]
-                        })),
-                        error: None,
-                    }),
+                    Ok(output) => {
+                        // First content item is the data JSON; when the
+                        // operation produced findings or incomplete
+                        // evidence a second item carries them.
+                        let mut content = vec![serde_json::json!({
+                            "type": "text",
+                            "text": output.data
+                        })];
+                        if let Some(f) = output.findings {
+                            content.push(serde_json::json!({
+                                "type": "text",
+                                "text": f
+                            }));
+                        }
+                        Some(JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: req.id.clone(),
+                            result: Some(serde_json::json!({ "content": content })),
+                            error: None,
+                        })
+                    }
                     Err(err) => Some(JsonRpcResponse {
                         jsonrpc: "2.0".to_string(),
                         id: req.id.clone(),

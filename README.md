@@ -8,7 +8,7 @@
 
 ## 1. 아키텍처 및 워크스페이스 구조 (`crates/`)
 
-플랫폼은 13개의 고성능 모듈식 Rust 크레이트로 구성되어 있습니다.
+플랫폼은 14개의 고성능 모듈식 Rust 크레이트로 구성되어 있습니다.
 
 ```text
 toy-projects/
@@ -24,6 +24,7 @@ toy-projects/
 │   ├── lens-build/     compile_commands.json 파서, 플래그 정규화, 헤더 영향도 역방향 DAG
 │   ├── lens-env/       Zero-Code Python venv 분석기, 미충족 패키지 검사, import 섀도잉 탐지
 │   ├── lens-net/       네트워크 소켓 포렌식, IPv4/IPv6 /proc/net 무실행 파싱, 프로세스 FD 상관관계, 포트 Diff
+│   ├── lens-ops/       공유 오퍼레이션 레이어 — 수집+판정 `Report<T>`/findings, doctor 구현, 번들 수집
 │   ├── lens-cli/       단일 통합 CLI (`lens`), 시스템 종합 진단 (`doctor`), 셸 자동완성, 포렌식 번들
 │   ├── lens-tui/       대화형 터미널 UI 대시보드 (Storage, Services, Logs, Network 실데이터)
 │   └── lens-mcp/       AI 어시스턴트(Claude, Antigravity) 연동용 Model Context Protocol 서버
@@ -51,7 +52,7 @@ toy-projects/
 
 ## 3. 빌드 및 테스트
 
-### 전체 테스트 실행 (13개 크레이트 동시 검증)
+### 전체 테스트 실행 (14개 크레이트 동시 검증)
 ```bash
 cargo test --workspace --jobs 2
 ```

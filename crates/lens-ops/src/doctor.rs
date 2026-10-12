@@ -2,7 +2,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use lens_core::{LensError, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::{Report, Severity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -476,6 +479,53 @@ pub fn run_doctor(
         checks,
         summary,
     }
+}
+
+/// Validate the explicit override paths, run all checks, and wrap the
+/// report in a [`Report`] whose findings mirror each Warn/Fail check
+/// (code `doctor.<category lowercase>`) — shared by the CLI, where
+/// `--fail-on` picks the actionable threshold, and the MCP tool.
+pub fn run(
+    root: Option<&Path>,
+    procfs: Option<&Path>,
+    systemd_dir: Option<&Path>,
+) -> Result<Report<DoctorReport>> {
+    // An explicitly passed path that does not exist is a usage error,
+    // not a healthy-looking "non-systemd environment" report.
+    for (flag, dir) in [
+        ("--root", &root),
+        ("--procfs", &procfs),
+        ("--systemd-dir", &systemd_dir),
+    ] {
+        if let Some(p) = dir {
+            if !p.exists() {
+                return Err(LensError::Usage {
+                    message: format!("{flag} path {:?} does not exist", p),
+                });
+            }
+        }
+    }
+
+    let data = run_doctor(root, procfs, systemd_dir);
+    let findings = data
+        .checks
+        .iter()
+        .filter_map(|c| {
+            let severity = match c.status {
+                HealthStatus::Warn => Severity::Warn,
+                HealthStatus::Fail => Severity::Fail,
+                _ => return None,
+            };
+            Some(crate::Finding {
+                severity,
+                code: format!("doctor.{}", c.category.to_lowercase()),
+                message: format!("{}: {}", c.name, c.message),
+            })
+        })
+        .collect();
+    let mut report = Report::new(data);
+    report.findings = findings;
+    Ok(report)
 }
 
 #[cfg(test)]

@@ -4,6 +4,25 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
 
 ## Unreleased
 
+### 추가
+
+- 새 크레이트 `lens-ops`: 수집+판정 로직을 `Report<T>`(`findings`,
+  `complete`, `diagnostics`)로 반환하는 공유 오퍼레이션 레이어.
+  `lens-cli`와 `lens-mcp`가 더 이상 도메인 로직을 복제하지 않고 같은
+  구현을 소비한다. `doctor` 구현도 이 크레이트로 이동했다.
+- text 모드 출력에 `Findings:` 블록 — 도메인 출력 뒤에
+  `Findings: N fail, M warn`과 `[FAIL]`/`[WARN]` 항목(안정적 `code` +
+  메시지)을 출력한다. JSON 출력은 변경되지 않는다.
+- MCP 도구 결과에 findings 두 번째 content 아이템 — findings 또는
+  불완전 증거가 있으면 `{"findings": [...], "complete": bool}` JSON이
+  데이터 아이템 뒤에 추가된다.
+- MCP `page_path` 페이지네이션 인자 — `offset`을 적용할 배열을 점
+  경로로 지정한다(배열 원소 내부는 `units[].diagnostics`처럼 `[]`).
+- diff 입력 스키마 검증 — `env diff`/`sys diff`/`net diff`가 스냅샷
+  JSON의 `schema`/`schema_version`을 생산자 값과 비교하고, 다른
+  스키마의 파일을 넣으면 `expected schema` 오류(exit 2)로 거부한다.
+- MCP `lens_test_diff`가 글롭 입력도 받는다(CLI와 같은 입력 확장).
+
 ### 수정
 
 - `lens` stdout이 이제 64 KiB 버퍼로 출력된다 — 라인마다 write+flush
@@ -31,6 +50,13 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
 - `bundle extract`가 단일 패스로 스테이징·검증한다. 목적지의
   심볼링크는 절대 따라가지 않고(`--force`여도 심볼링크·디렉터리
   덮어쓰기 거부), 검증 실패 시 스테이징된 파일은 남지 않는다.
+- MCP `initialize`의 프로토콜 협상이 지원 버전(`2025-06-18`,
+  `2025-03-26`, `2024-11-05`)만 에코하고, 미지원·누락 버전에는
+  `2025-06-18`로 응답한다(이전에는 임의 버전을 그대로 에코하고
+  누락 시 `2024-11-05`였다).
+- `id` 없는 JSON-RPC 요청(노티피케이션)에는 어떤 메서드에도 응답하지
+  않는다(이전에는 `initialize`/`tools/call` 등에도 응답했다). 파싱
+  오류는 계속 `id: null` 에러를 반환한다.
 
 ### Breaking changes
 
@@ -38,6 +64,16 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
   비systemd 환경의 services 검사는 PASS 대신 SKIP으로 보고한다.
 - 라이브러리 `lens_core::create_bundle_archive` 시그니처에 `overwrite`
   매개변수가 추가됐다.
+- 새 exit-1 조건(findings): `disk duplicates` 불완전 스캔/해시 오류,
+  `test parse` 불완전 JUnit, `trace diff` 신규 에러,
+  `sys inspect`/`sys cycles` 사이클, `sys diff` 신규 사이클,
+  `env inspect`/`env check` 누락·충돌, `net diff` 신규 리스너,
+  `bundle create` 수집 경고(번들은 계속 생성되나 exit 1).
+- MCP 페이지네이션 의미론 변경: `offset`은 이제 `page_path`가
+  가리키는 배열에만 적용되고, 배열 안의 `_truncated` 마커는 최상위
+  `_pagination` 메타데이터로 대체됐다.
+- 스키마가 다른 JSON을 diff 입력으로 주면 exit 2다(이전에는 잘못된
+  스키마로 역직렬화되거나 모호한 오류가 났다).
 
 ## 0.6.1
 

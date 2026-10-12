@@ -160,12 +160,30 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   `uninspectable_processes`를 기록.
 - 스키마: `lens.net/v1`(additive 필드만 추가).
 
+## lens-ops — 공유 오퍼레이션 레이어
+
+- `lens-cli`와 `lens-mcp`가 공유하는 수집+판정 로직. 각 오퍼레이션은
+  `Result<Report<T>>`를 반환: `data`(도메인 결과) + `findings`
+  (`Severity` Info/Warn/Fail + 안정적 `code`) + `complete`(증거 불완전
+  여부) + `diagnostics`.
+- `Report::is_actionable(threshold)`이 "종료 코드 1" 판정의 단일 근거 —
+  불완전 증거는 항상 actionable.
+- 모듈: `disk`, `abi`, `log`(`open`/`build_filter`), `test`(파일/디렉터리/
+  글롭 입력), `trace`(fail-closed 입력 검증), `sys`, `build`, `env`,
+  `net`, `bundle`(수집기+검증/해제 래퍼), `doctor`, `json`(스키마 검증
+  포함 JSON 로더).
+- clap·출력 없음 — 프레젠테이션은 소비자 책임.
+
 ## lens-cli — `lens` 통합 CLI
 
-- `src/cli.rs`: clap 커맨드 트리. `src/ops.rs`: 전 서브커맨드 디스패치
-  (라이브러리로 공개 — lens-mcp가 재사용). `main.rs`는 얇은 래퍼.
+- `src/cli.rs`: clap 커맨드 트리. `src/ops.rs`: 렌더러 — `lens-ops`
+  결과를 text/JSON으로 출력하고 `is_actionable`을 종료 코드로 변환.
+  `main.rs`는 얇은 래퍼.
 - `doctor`: 스토리지/네트워크/서비스/환경 종합 헬스체크(`--json`,
-  `--fail-on` 지원).
+  `--fail-on` 지원; 구현은 `lens-ops`에 있고 `lens_cli::doctor`로
+  re-export된다).
+- text 모드에서는 도메인 출력 뒤에 `Findings:` 블록([FAIL]/[WARN])
+  이 출력된다. JSON 출력에는 findings가 섞이지 않는다.
 - `bundle create/inspect/verify/show/extract`: `lens.bundle/v2` 아카이브.
 - `tui`: `lens_tui::run`으로 진입. `completion`: 셸 자동완성 생성.
 
@@ -181,12 +199,22 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
 
 ## lens-mcp — MCP 서버
 
-- JSON-RPC 2.0 over stdio로 진단 툴을 노출. `initialize`는 요청된
-  `protocolVersion`을 에코하고, 도구 실패는 `result.isError`로 반환한다.
-- 모든 도구에 `limit`/`offset` 페이지네이션(배열 끝 `_truncated` 마커,
-  응답 상한 64KiB). 상대 경로는 서버 cwd 기준.
+- JSON-RPC 2.0 over stdio로 진단 툴을 노출. `initialize`는 지원 버전
+  (`2025-06-18`, `2025-03-26`, `2024-11-05`) 중 요청된 것을 에코하고,
+  미지원/누락이면 `2025-06-18`로 응답한다. `id` 없는 요청(노티피케이션)
+  에는 응답하지 않는다. 도구 실패는 `result.isError`로 반환한다.
+- 도구 결과의 첫 content 아이템은 데이터 JSON, findings/불완전 증거가
+  있으면 두 번째 아이템으로 `{"findings":[...], "complete":bool}`을
+  추가한다.
+- 모든 도구에 `limit`(배열당 최대, 기본 200)/`page_path`/`offset`
+  페이지네이션: `offset`은 `page_path`가 가리키는 배열에만 적용되고,
+  잘린 배열은 최상위 `_pagination`(`path → {total, returned, offset}`)
+  로 보고된다 — 배열 안에 마커 객체를 넣지 않는다. `[]` 경로는 모든
+  발생의 합계를 낸다. 응답 상한 64KiB 초과 시 limit 25로 재시도하고
+  `_response_clamped: true`. 상대 경로는 서버 cwd 기준.
 - `lens_log_filter`는 `tail`(끝 N라인), `regex`, `min_level`,
-  `include_unknown`, `limit`/`offset`을 지원한다.
+  `include_unknown`을 지원하고 `matches`를 자체 페이징한다
+  (`limit`/`offset`).
 
 | 툴 | 용도 |
 |---|---|

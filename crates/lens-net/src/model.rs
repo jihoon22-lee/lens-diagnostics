@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// Schema identifier written into every `NetReport` (`schema_version`)
+/// and validated by snapshot consumers such as `net diff`.
+pub const REPORT_SCHEMA_V1: &str = "lens.net/v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SocketKind {

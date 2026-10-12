@@ -26,7 +26,8 @@ mod tests {
     fn test_execute_lens_doctor() {
         let res = execute_tool("lens_doctor", &serde_json::json!({ "root_path": "/" }));
         assert!(res.is_ok());
-        let val: serde_json::Value = serde_json::from_str(&res.unwrap()).unwrap();
+        let out = res.unwrap();
+        let val: serde_json::Value = serde_json::from_str(&out.data).unwrap();
         assert_eq!(val["schema_version"], "lens.doctor/v1");
         assert!(val["checks"].is_array());
     }

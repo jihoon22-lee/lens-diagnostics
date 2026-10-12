@@ -45,12 +45,17 @@ fn desc(text: &str) -> String {
 }
 
 /// Shared pagination arguments — every tool accepts `limit` (max items
-/// per array, default 200) and `offset`; arrays that were cut carry a
-/// `{ "_truncated": true, "total_before_truncation", "omitted" }` marker.
+/// per array, default 200), `page_path` (dot path of the one array that
+/// `offset` applies to, e.g. `abi.imports`; array elements are addressed
+/// as `[]`, e.g. `units[].diagnostics`), and `offset` (skip the first N
+/// items of the `page_path` array). Cut arrays are reported in the
+/// top-level `_pagination` object as `path -> {total, returned, offset}`;
+/// no marker objects are inserted into the data itself.
 fn pagination_props() -> serde_json::Map<String, Value> {
     serde_json::json!({
         "limit": { "type": "integer", "description": "Max items per array in the response (default 200)" },
-        "offset": { "type": "integer", "description": "Skip the first N items of each array" }
+        "page_path": { "type": "string", "description": "Dot path of the array `offset` applies to (e.g. 'abi.imports'; 'units[].diagnostics' addresses arrays inside array elements)" },
+        "offset": { "type": "integer", "description": "Skip the first N items of the array named by 'page_path'" }
     })
     .as_object()
     .cloned()

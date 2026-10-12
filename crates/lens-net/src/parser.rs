@@ -332,7 +332,7 @@ pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
     summary.uninspectable_processes = proc_scan.uninspectable_count;
 
     Ok(NetReport {
-        schema_version: "lens.net/v1".to_string(),
+        schema_version: crate::model::REPORT_SCHEMA_V1.to_string(),
         summary,
         sockets,
         listening,

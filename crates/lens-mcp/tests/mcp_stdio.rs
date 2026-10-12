@@ -153,9 +153,31 @@ fn initialize_echoes_client_protocol_version() {
     ]);
     assert_eq!(responses[0]["result"]["protocolVersion"], "2025-03-26");
 
-    // No version in the request → server baseline.
+    // No version in the request → newest supported version.
     let responses = roundtrip(&[r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#]);
-    assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+}
+
+#[test]
+fn initialize_unsupported_protocol_version_gets_latest_supported() {
+    let responses = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999"}}"#,
+    ]);
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+}
+
+#[test]
+fn request_without_id_gets_no_response() {
+    // A JSON-RPC notification (no id) produces no output line for any
+    // method — including tools/call, initialize, and unknown methods.
+    let responses = roundtrip(&[
+        r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"lens_doctor","arguments":{"root_path":"/"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        r#"{"jsonrpc":"2.0","method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","method":"bogus/method"}"#,
+        r#"{"jsonrpc":"2.0","method":"tools/list"}"#,
+    ]);
+    assert!(responses.is_empty(), "notifications must not respond");
 }
 
 #[test]
@@ -253,8 +275,9 @@ fn log_filter_since_until_time_window() {
 
 #[test]
 fn tool_results_paginate_arrays() {
-    // lens_doctor's checks array is capped by `limit` and carries a
-    // structured truncation marker.
+    // lens_doctor's checks array is capped by `limit`; the cut is
+    // reported in top-level `_pagination` metadata — no marker objects
+    // are injected into the data itself.
     let text = tool_call(
         12,
         "lens_doctor",
@@ -262,11 +285,12 @@ fn tool_results_paginate_arrays() {
     );
     let v: Value = serde_json::from_str(&text).unwrap();
     let checks = v["checks"].as_array().unwrap();
-    let marker = checks
-        .iter()
-        .find(|c| c["_truncated"] == true)
-        .unwrap_or_else(|| panic!("no truncation marker: {text}"));
-    assert!(marker["omitted"].as_u64().unwrap() > 0);
+    assert_eq!(checks.len(), 1);
+    assert!(checks.iter().all(|c| c.get("_truncated").is_none()));
+    let page = &v["_pagination"]["checks"];
+    assert!(page["total"].as_u64().unwrap() > 0, "{text}");
+    assert_eq!(page["returned"], 1);
+    assert_eq!(page["offset"], 0);
 }
 
 #[test]
@@ -280,7 +304,7 @@ fn doctor_bad_override_path_is_iserror() {
     assert!(result["content"][0]["text"]
         .as_str()
         .unwrap()
-        .contains("systemd_dir"));
+        .contains("does not exist"));
 }
 
 #[test]
@@ -305,6 +329,40 @@ fn sys_diff_between_unit_dirs() {
     );
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["modified_units"][0]["unit"], "a.service", "{text}");
+}
+
+#[test]
+fn sys_cycles_appends_findings_content_item() {
+    // A cyclic result carries the data JSON plus a second content item
+    // with the report's findings.
+    let dir = tmpdir("cycles");
+    std::fs::write(
+        dir.join("a.service"),
+        "[Unit]\nAfter=b.service\n[Service]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("b.service"),
+        "[Unit]\nAfter=a.service\n[Service]\n",
+    )
+    .unwrap();
+
+    let result = tool_result(
+        16,
+        "lens_sys_cycles",
+        serde_json::json!({ "dir": dir.to_string_lossy() }),
+    );
+    let content = result["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{result}");
+    let data: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert!(!data["cycles"].as_array().unwrap().is_empty());
+    let findings: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    let list = findings["findings"].as_array().unwrap();
+    assert!(
+        list.iter()
+            .any(|f| f["code"] == "sys.cycle" && f["severity"] == "fail"),
+        "{findings}"
+    );
 }
 
 #[test]

@@ -5,14 +5,16 @@
 
 ## 1. 워크스페이스와 의존 방향
 
-13개 크레이트. 의존 방향은 프레젠테이션 → 도메인 → 코어 단방향입니다.
+14개 크레이트. 의존 방향은 프레젠테이션 → 오퍼레이션 → 도메인 → 코어
+단방향입니다.
 
 ```
-lens-cli ─┬─> lens-disk  lens-abi  lens-log  lens-test  lens-trace
-          ├─> lens-sys   lens-env  lens-net  lens-build
-          └─> lens-tui ──┐
-lens-mcp ──┴─────────────┤
-                         └─> (각 도메인 크레이트) ──> lens-core
+lens-cli ─┐
+          ├─> lens-ops ──> lens-disk  lens-abi  lens-log  lens-test
+lens-mcp ─┘                  lens-trace lens-sys lens-env lens-net
+                             lens-build ──> lens-core
+
+lens-tui ──> (도메인 크레이트 직접 소비) ──> lens-core
 ```
 
 - **lens-core**: 공유 기반. `LensError`/`Result`, `SafeInput`(TOCTOU 방어),
@@ -23,11 +25,16 @@ lens-mcp ──┴─────────────┤
 - **도메인 크레이트** (`lens-disk`, `lens-abi`, `lens-log`, `lens-test`,
   `lens-trace`, `lens-sys`, `lens-build`, `lens-env`, `lens-net`):
   각각 수집·파싱·스냅샷·diff를 담당. 서로 의존하지 않아 독립 테스트 가능.
-- **lens-cli**: clap 정의(`cli.rs`), 도메인 디스패치(`ops.rs`),
-  종합 점검(`doctor.rs`). 프레젠테이션만 담당.
-- **lens-tui** / **lens-mcp**: 같은 도메인 API를 다른 진입점으로 소비.
-  비즈니스 로직 복제 금지 — systemd 로딩은 `lens_sys::load_units`처럼
-  도메인 크레이트가 단일 구현을 제공.
+- **lens-ops**: 공유 오퍼레이션 레이어. 수집 + 판정을 `Report<T>`
+  (`findings`, `complete`, `diagnostics`)로 반환하고, 프레젠테이션은
+  일절 하지 않는다(clap 없음, 출력 없음). 종합 점검(`doctor`)도 여기에
+  있다. 종료 코드 판정의 단일 근거는 `Report::is_actionable(threshold)`.
+- **lens-cli**: clap 정의(`cli.rs`)와 렌더러(`ops.rs`). `lens-ops`의
+  `Report`를 text/JSON으로 출력하고 `is_actionable` 결과를 종료 코드로
+  변환할 뿐 수집·판정 로직을 갖지 않는다.
+- **lens-tui** / **lens-mcp**: 같은 오퍼레이션/도메인 API를 다른
+  진입점으로 소비. 비즈니스 로직 복제 금지 — systemd 로딩·JUnit 입력
+  확장·빌드 영향도 해석 등은 `lens-ops`의 단일 구현을 공유.
 
 ## 2. 설계 불변조건
 
@@ -177,7 +184,8 @@ lens-mcp ──┴─────────────┤
 - **`SafeInput`**: open 후 `fstat`으로 타깃 메타데이터 재검증(TOCTOU).
   심볼링크 경로는 링크가 아닌 타깃과 비교.
 - **리소스 상한**: 번들 항목/바이트, DWARF 타입 10k, MCP 응답 64KiB +
-  배열 `limit`(기본 200)·`offset` 페이지네이션(`_truncated` 마커),
+  배열 `limit`(기본 200)·`page_path`/`offset` 페이지네이션(최상위
+  `_pagination` 메타데이터 — 배열 안에 마커 객체를 넣지 않는다),
   MCP 로그 `tail` 윈도우, 빌드 스캔 파일 수 — 전부 상한 도달을 출력에 표시.
 - **에러 분류**: `LensError::{Io{path,source}, LimitExceeded, InvalidInput,
   InputChanged, Json, Unsupported, Usage}` — 경로와 원인을 유지한 채 전파.
@@ -202,7 +210,8 @@ cli.rs (인자) → ops.rs dispatch
 
 ## 7. 리팩터링 규칙
 
-- 도메인 로직은 `lens-*` 도메인 크레이트에, 입출력·포맷은 `lens-cli`/`lens-tui`/`lens-mcp`에.
+- 도메인 로직은 `lens-*` 도메인 크레이트에, 수집+판정 오케스트레이션은
+  `lens-ops`에, 입출력·포맷은 `lens-cli`/`lens-tui`/`lens-mcp`에.
 - 새 스키마/필드는 명시적으로 추가하고 문서·가이드 동기화.
 - 회귀 테스트는 버그의 실패 모드를 재현하는 최소 케이스로 추가.
 - 커밋은 작업 단위별 conventional commit.

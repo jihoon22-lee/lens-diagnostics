@@ -13,15 +13,8 @@ path = "src/main.rs"
 [dependencies]
 lens-core = { path = "../lens-core" }
 lens-disk = { path = "../lens-disk" }
-lens-abi = { path = "../lens-abi" }
 lens-log = { path = "../lens-log" }
-lens-test = { path = "../lens-test" }
-lens-trace = { path = "../lens-trace" }
-lens-sys = { path = "../lens-sys" }
-lens-build = { path = "../lens-build" }
-lens-env = { path = "../lens-env" }
-lens-net = { path = "../lens-net" }
-lens-cli = { path = "../lens-cli" }
+lens-ops = { path = "../lens-ops" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -390,11 +390,9 @@ fn bundle_create_isolates_source_failures() {
         "--trace",
         "/nonexistent-trace",
     ]);
-    assert!(
-        out.status.success(),
-        "bundle should be created despite the failing trace source: {}",
-        stderr_of(&out)
-    );
+    // The bundle is still written, but a collection diagnostic is
+    // incomplete evidence — a finding (exit 1).
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
     assert!(output.exists());
 
     // The trace failure is preserved as a manifest diagnostic.
@@ -620,9 +618,11 @@ fn sys_cycles_report_directive_path_and_origin() {
     assert!(stdout.contains("--Before(a.service:2)-->"), "{stdout}");
     assert!(stdout.contains("--Before(b.service:2)-->"), "{stdout}");
     assert!(stdout.contains("--After(a.service:3)-->"), "{stdout}");
-    // Not the old alphabetical SCC join.
+    // Not the old alphabetical SCC join — in the domain output (the
+    // trailing Findings block lists the member names, which is fine).
+    let domain_output = stdout.split("Findings:").next().unwrap_or("");
     assert!(
-        !stdout.contains("a.service -> b.service -> c.service"),
+        !domain_output.contains("a.service -> b.service -> c.service"),
         "{stdout}"
     );
 }
@@ -1673,7 +1673,8 @@ fn gzip_file(src: &PathBuf, dst: &PathBuf) -> bool {
 fn bundle_log_gz_embeds_decompressed_tail() {
     let dir = tmp_dir("bundle-gzbig");
     let plain = dir.join("big.log");
-    // >8 MiB decompressed but highly compressible so the fixture stays fast.
+    // >8 MiB decompressed so the embedded tail is truncated (a
+    // collection diagnostic -> exit 1 under the shared rules).
     let mut content = String::new();
     for i in 0..400_000 {
         content.push_str(&format!("[INFO] line {i} padding padding padding\n"));
@@ -1695,7 +1696,7 @@ fn bundle_log_gz_embeds_decompressed_tail() {
         "--log",
         gz.to_str().unwrap(),
     ]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
 
     // The manifest records the truncation diagnostic.
     let inspect = lens(&[
@@ -1824,9 +1825,10 @@ fn bundle_trace_rejects_non_strace_via_diagnostics() {
         "--log",
         log.to_str().unwrap(),
     ]);
-    // Bundle still succeeds (the log source worked), but the trace
-    // failure is a manifest diagnostic and no snapshot is embedded.
-    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    // The bundle is still created (the log source worked), the trace
+    // failure is a manifest diagnostic, and no snapshot is embedded —
+    // but the diagnostic makes the run a finding (exit 1).
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
 
     let inspect = lens(&[
         "bundle",
@@ -1931,4 +1933,247 @@ fn log_filter_buffered_output_still_correct() {
         count += 1;
     }
     assert_eq!(count, n);
+}
+
+// --- Shared ops layer: centralized finding -> exit-code mapping ---
+
+/// A minimal valid lens.net/v1 report with the given listeners
+/// (`(local_port, process_name)`), constructed directly so the test
+/// does not depend on the host's /proc.
+fn net_report_json(listeners: &[(u32, &str)]) -> String {
+    let listening: Vec<String> = listeners
+        .iter()
+        .enumerate()
+        .map(|(i, (port, _proc))| {
+            format!(
+                r#"{{"kind":"tcp","local_address":"0.0.0.0","local_port":{port},"remote_address":"","remote_port":0,"state":"LISTEN","inode":{},"uid":0,"tx_queue":0,"rx_queue":0,"process":null}}"#,
+                1000 + i
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"schema_version":"lens.net/v1","summary":{{"total_sockets":{n},"listening_ports":{n},"established_connections":0,"time_wait_sockets":0,"orphan_sockets":0,"unix_domain_sockets":0}},"sockets":[],"listening":[{listening}]}}"#,
+        n = listeners.len(),
+        listening = listening.join(",")
+    )
+}
+
+#[test]
+fn net_diff_new_listener_exits_1_and_prints_findings() {
+    let dir = tmp_dir("netdiff");
+    let base = dir.join("base.json");
+    let cand = dir.join("cand.json");
+    std::fs::write(&base, net_report_json(&[(80, "nginx")])).unwrap();
+    std::fs::write(
+        &cand,
+        net_report_json(&[(80, "nginx"), (4444, "cryptominer")]),
+    )
+    .unwrap();
+
+    let out = lens(&[
+        "net",
+        "diff",
+        base.to_str().unwrap(),
+        cand.to_str().unwrap(),
+        "--format",
+        "text",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    // Text mode renders a Findings block after the domain output.
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("Findings:"), "{stdout}");
+    assert!(stdout.contains("[FAIL] net.new_listener"), "{stdout}");
+    assert!(stdout.contains("4444"), "{stdout}");
+}
+
+#[test]
+fn net_diff_json_output_has_no_findings_key() {
+    let dir = tmp_dir("netjson");
+    let base = dir.join("base.json");
+    let cand = dir.join("cand.json");
+    std::fs::write(&base, net_report_json(&[(80, "nginx")])).unwrap();
+    std::fs::write(
+        &cand,
+        net_report_json(&[(80, "nginx"), (4444, "cryptominer")]),
+    )
+    .unwrap();
+
+    let out = lens(&[
+        "net",
+        "diff",
+        base.to_str().unwrap(),
+        cand.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    assert!(
+        json.get("findings").is_none(),
+        "JSON output must stay the plain domain shape"
+    );
+    assert_eq!(json["new_listeners"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn sys_diff_new_cycle_exits_1() {
+    let dir = tmp_dir("syscycle");
+    let base_dir = dir.join("base");
+    let cand_dir = dir.join("cand");
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&cand_dir).unwrap();
+    std::fs::write(base_dir.join("a.service"), "[Unit]\n[Service]\n").unwrap();
+    std::fs::write(
+        cand_dir.join("a.service"),
+        "[Unit]\nAfter=b.service\n[Service]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cand_dir.join("b.service"),
+        "[Unit]\nAfter=a.service\n[Service]\n",
+    )
+    .unwrap();
+
+    let out = lens(&[
+        "sys",
+        "diff",
+        base_dir.to_str().unwrap(),
+        cand_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("new_cycles"));
+}
+
+#[test]
+fn trace_diff_new_error_exits_1() {
+    let dir = tmp_dir("tracediff");
+    let base = dir.join("base.strace");
+    let cand = dir.join("cand.strace");
+    let shared = "1 openat(AT_FDCWD, \"/etc/passwd\", O_RDONLY) = 3\n1 close(3) = 0\n";
+    std::fs::write(&base, shared).unwrap();
+    std::fs::write(
+        &cand,
+        format!("{shared}1 read(3, 0x7fff, 4096) = -1 EIO (Input/output error)\n"),
+    )
+    .unwrap();
+
+    let out = lens(&[
+        "trace",
+        "diff",
+        base.to_str().unwrap(),
+        cand.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("new_errors"));
+}
+
+#[test]
+fn test_parse_incomplete_junit_exits_1() {
+    let dir = tmp_dir("junittrunc");
+    let f = dir.join("truncated.xml");
+    // Boundary-truncated after a complete testcase element.
+    std::fs::write(
+        &f,
+        r#"<testsuite tests="2" failures="0"><testcase classname="a" name="ok" time="0.1"/>"#,
+    )
+    .unwrap();
+    let out = lens(&["test", "parse", f.to_str().unwrap(), "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    assert_eq!(json["complete"], false);
+}
+
+#[test]
+fn bundle_create_with_collection_warnings_exits_1_but_writes_bundle() {
+    let dir = tmp_dir("bundlewarn");
+    let log = tmp_file("bundlewarn", "ok.log", "[INFO] fine\n");
+    let output = dir.join("warn.lens");
+    let out = lens(&[
+        "bundle",
+        "create",
+        output.to_str().unwrap(),
+        "--log",
+        log.to_str().unwrap(),
+        "--env",
+        "/nonexistent-venv",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(output.exists(), "bundle written despite the warning");
+
+    let show = lens(&["bundle", "show", output.to_str().unwrap(), "logs/ok.log"]);
+    assert_eq!(stdout_of(&show).trim_end(), "[INFO] fine");
+}
+
+#[test]
+fn findings_block_caps_detail_lines_at_20() {
+    // 25 regressions → 25 Fail findings; the text block must cap the
+    // detail list at 20 and point at JSON for the rest.
+    let dir = tmp_dir("findingscap");
+    let cases = |suffix: &str| {
+        (0..25)
+            .map(
+                |i| format!(r#"<testcase classname="C" name="t{i}" time="0">{suffix}</testcase>"#,),
+            )
+            .collect::<String>()
+    };
+    let base = dir.join("base.xml");
+    let cand = dir.join("cand.xml");
+    std::fs::write(
+        &base,
+        format!("<testsuite tests=\"25\">{}</testsuite>", cases("")),
+    )
+    .unwrap();
+    std::fs::write(
+        &cand,
+        format!(
+            "<testsuite tests=\"25\">{}</testsuite>",
+            cases("<failure>oops</failure>")
+        ),
+    )
+    .unwrap();
+
+    let out = lens(&[
+        "test",
+        "diff",
+        base.to_str().unwrap(),
+        cand.to_str().unwrap(),
+        "--format",
+        "text",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("Findings: 25 fail"), "{stdout}");
+    let detail = stdout
+        .lines()
+        .filter(|l| l.contains("[FAIL]") || l.contains("[WARN]"))
+        .count();
+    assert_eq!(detail, 20, "{stdout}");
+    assert!(
+        stdout.contains("… and 5 more (use --format json for the full report)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn env_diff_rejects_wrong_schema_input() {
+    let dir = tmp_dir("envschema");
+    let base = dir.join("base.json");
+    let cand = dir.join("cand.json");
+    // Feed env diff a *net* report: schema validation must reject it
+    // before diffing (usage/schema failure -> exit 2).
+    std::fs::write(&base, net_report_json(&[])).unwrap();
+    std::fs::write(&cand, net_report_json(&[])).unwrap();
+
+    let out = lens(&[
+        "env",
+        "diff",
+        base.to_str().unwrap(),
+        cand.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("expected schema"),
+        "{}",
+        stderr_of(&out)
+    );
 }

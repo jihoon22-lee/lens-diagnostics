@@ -22,10 +22,24 @@ source <(lens completion bash)   # zsh, fish도 지원
 | 코드 | 의미 | 예시 |
 |------|------|------|
 | 0 | clean — findings 없음 | 정상 스캔, 회귀 없는 `test diff` |
-| 1 | findings 있음 | `test diff` 회귀/신규 실패, `abi diff` incompatible·uncertain(수동 검토 필요), `sys cycles` 사이클, `env check` 누락/충돌 의존성, `doctor`의 `--fail-on` 기준 이상, `disk scan` incomplete(권한 오류·절단), `trace analyze` fd 누수, `bundle verify` 무결성 불일치 |
-| 2 | 사용·입력·런타임 오류 | 존재하지 않는 경로, 잘못된 플래그 값, 파싱 불가 입력, `abi inspect`/`abi diff`의 비ELF 입력 |
+| 1 | findings 있음 | `test diff` 회귀/신규 실패, `test parse` 불완전 JUnit, `abi diff` incompatible·uncertain(수동 검토 필요), `sys inspect`/`sys cycles` 사이클, `sys diff` 신규 사이클, `env inspect`/`env check` 누락·충돌 의존성, `net diff` 신규 리스너, `trace analyze` fd 누수, `trace diff` 신규 에러, `disk scan`/`disk duplicates` incomplete(권한 오류·절단·해시 실패), `bundle create` 수집 경고, `bundle verify` 무결성 불일치, `doctor`의 `--fail-on` 기준 이상 |
+| 2 | 사용·입력·런타임 오류 | 존재하지 않는 경로, 잘못된 플래그 값, 파싱 불가 입력, `abi inspect`/`abi diff`의 비ELF 입력, diff 입력의 스키마 불일치(`expected schema`) |
 
-`doctor`는 `--fail-on warn|fail`(기본 `fail`)로 findings 기준을 조절한다.
+판정은 공유 레이어(`lens-ops`)의 `Report<T>`에서 나온다: 각 오퍼레이션이
+`findings`(Info/Warn/Fail)과 `complete`를 채우고, CLI는
+`is_actionable(threshold)`만으로 exit 1을 결정한다. 불완전 증거
+(`complete=false`)는 findings가 없어도 항상 exit 1이다. 기본 임계값은
+Fail이며 `doctor`만 `--fail-on warn|fail`(기본 `fail`)로 조절한다.
+
+text 모드에서는 도메인 출력 뒤에 findings 요약 블록이 붙는다:
+
+```text
+Findings: 1 fail, 0 warn
+  [FAIL] net.new_listener: new listener 0.0.0.0:4444
+```
+
+JSON 출력은 도메인 스키마를 그대로 유지하며 `findings` 키가 섞이지
+않는다(`doctor`는 자체 checks 렌더링이 findings를 대신한다).
 
 ### 출력 형식
 
@@ -314,14 +328,25 @@ cargo build --release -p lens-mcp
 
 - 모든 도구의 상대 경로는 lens-mcp 프로세스의 cwd 기준으로 해석된다
   (`lens_build_impact`의 `header`는 컴파일 DB 디렉터리/entry `directory` 기준).
-- 응답 크기 제어: 모든 도구가 `limit`(배열당 최대, 기본 200)·`offset`을 받고,
-  잘린 배열 끝에 `{"_truncated": true, "total_before_truncation", "omitted"}`
-  마커가 붙는다. 64KiB를 넘는 응답은 추가로 클램프되어
-  `_response_clamped: true`가 표시된다.
+- 응답 크기 제어: 모든 도구가 `limit`(배열당 최대, 기본 200),
+  `page_path`(오프셋을 적용할 배열의 점 경로 — 예: `abi.imports`,
+  배열 원소 내부는 `units[].diagnostics`처럼 `[]`로 지정), `offset`을
+  받는다. `offset`은 `page_path`가 가리키는 배열에만 적용된다. 잘린
+  배열은 데이터에 마커를 넣지 않고 최상위 `_pagination` 객체로 보고된다:
+  `{"_pagination": {"<path>": {"total": N, "returned": k, "offset": o}}}`.
+  `[]` 경로는 모든 발생의 합계를 낸다. 64KiB를 넘는 응답은 limit 25로
+  재시도되고 `_response_clamped: true`가 표시된다.
 - `lens_log_filter`는 `tail`로 파일 끝 N라인만 스캔할 수 있다(최근 라인 조사).
-  `limit`/`offset`으로 매치를 페이징하며 `truncated`로 표시된다.
+  `limit`/`offset`으로 매치를 페이징하며 `truncated`로 표시된다
+  (이 결과의 `matches`는 자체 페이징되므로 `page_path` 오프셋이
+  중복 적용되지 않는다).
+- 도구 결과의 첫 content 아이템은 데이터 JSON이다. findings 또는
+  불완전 증거가 있으면 두 번째 아이템으로
+  `{"findings": [...], "complete": bool}` JSON이 추가된다.
 - 도구 실패는 `result.isError=true` + 텍스트로 반환된다(잘못된 경로 포함).
-- `initialize`는 클라이언트 요청 `protocolVersion`을 그대로 에코한다.
+- `initialize`는 지원하는 `protocolVersion`(`2025-06-18`, `2025-03-26`,
+  `2024-11-05`) 중 요청된 것을 에코하고, 미지원/누락이면 `2025-06-18`로
+  응답한다. `id` 없는 요청(JSON-RPC 노티피케이션)에는 응답하지 않는다.
 
 ## 출력 계약 (공통)
 
