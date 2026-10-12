@@ -43,7 +43,7 @@ Before fixes, both new P1 regressions failed on that source:
 ## Verification
 
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `cargo test --workspace`: 313 tests passed, including actual MCP subprocess
+- `cargo test --workspace`: 318 tests passed, including actual MCP subprocess
   tests for systemd/JUnit/doctor escapes, drop-ins, XML globs, secondary readers,
   multiple allowed roots, diagnostics and an oversized JUnit failure response.
 - `cargo build --release --workspace`: passed.
@@ -90,3 +90,29 @@ build, documentation checks and six release-flow tests passed. Actual release
 CLI/MCP runs also confirmed identical denials for existing/dangling external
 aliases, blocked disk target metadata, bounded large validation errors, and
 successful comparisons for the three previously omitted suffixes.
+
+## Second review: boundary prechecks and allocation limits
+
+Three new regressions failed on `19e8b36` and passed after correction:
+external drop-in directory links bypassed the boundary when dangling; an
+external symlink chain ending at `/dev/null` bypassed the mask exception; and
+large manifest diagnostics were cloned before response truncation.
+
+Drop-in metadata is now policy-checked before the directory-type gate, and
+only an immediate `/dev/null` target receives mask treatment. Existing and
+dangling external targets return identical denials.
+
+Bundle manifests now have a 1 MiB metadata cap enforced at the tar header,
+before entry buffering/parsing, across verify/inspect/show/extract. Creation
+uses a capped serializer before deterministic serialization. Bundle diff
+imports at most 128 collection diagnostic messages with a shared 64 KiB
+budget and at most 4 KiB per message; explicit truncation notices preserve
+the incomplete-evidence status. MCP metadata serialization borrows its
+inputs and writes through a capped writer rather than cloning oversized
+JSON values; size estimates no longer materialize the lists.
+
+Final local verification: 318 workspace tests, strict clippy, fmt, release
+build, documentation checks and all six release-flow tests passed. Direct
+release execution rejected an 8,573-byte compressed bundle containing an
+8 MiB diagnostic before parsing; `/usr/bin/time` measured peak RSS 4,552 KiB
+for that MCP process. All earlier release CLI/MCP smoke checks still passed.

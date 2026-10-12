@@ -1110,3 +1110,34 @@ fn followup_oversized_validation_error_is_bounded() {
     assert_eq!(response[0]["result"]["isError"], true);
     assert!(response[0].to_string().len() <= 64 * 1024);
 }
+#[cfg(unix)]
+#[test]
+fn review2_dropin_directory_target_is_always_checked() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("dropins");
+    std::fs::write(root.path().join("x.service"), "[Unit]\n").unwrap();
+    std::os::unix::fs::symlink(&target, root.path().join("x.service.d")).unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_sys_cycles","arguments":{"dir":root.path()}}}).to_string();
+    let missing = roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+    std::fs::create_dir(&target).unwrap();
+    let exists = roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+    assert_eq!(missing[0]["result"]["isError"], true);
+    assert_eq!(missing, exists);
+}
+
+#[cfg(unix)]
+#[test]
+fn review2_mask_exception_does_not_follow_external_hops() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("mask");
+    std::os::unix::fs::symlink("/dev/null", &target).unwrap();
+    std::os::unix::fs::symlink(&target, root.path().join("x.service")).unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_sys_cycles","arguments":{"dir":root.path()}}}).to_string();
+    let exists = roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+    std::fs::remove_file(&target).unwrap();
+    let missing = roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+    assert_eq!(exists[0]["result"]["isError"], true);
+    assert_eq!(exists, missing);
+}

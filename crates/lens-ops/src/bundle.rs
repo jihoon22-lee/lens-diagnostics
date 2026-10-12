@@ -373,6 +373,39 @@ fn read_entry_json<T: serde::de::DeserializeOwned>(bundle: &PathBuf, entry: &str
     serde_json::from_value(value).map_err(LensError::Json)
 }
 
+fn append_collection_diagnostics(output: &mut Vec<String>, side: &str, input: &[String]) {
+    // Bound before cloning attacker-controlled strings. Reserve room for a
+    // truncation notice on both sides, and never split UTF-8 code points.
+    let mut remaining =
+        (64 * 1024usize).saturating_sub(output.iter().map(String::len).sum::<usize>() + 128);
+    let mut truncated = false;
+    for diagnostic in input {
+        if output.len() >= 128 || remaining < 128 {
+            truncated = true;
+            break;
+        }
+        let cap = remaining.min(4096) - side.len() - 32;
+        let mut end = diagnostic.len().min(cap);
+        while !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        let suffix = if end < diagnostic.len() {
+            " [truncated]"
+        } else {
+            ""
+        };
+        let message = format!("{side}: {}{suffix}", &diagnostic[..end]);
+        remaining -= message.len();
+        output.push(message);
+    }
+    if truncated {
+        output.push(format!(
+            "{side}: collection diagnostics truncated ({} total)",
+            input.len()
+        ));
+    }
+}
+
 /// Diff two forensic bundles section by section. Both bundles are
 /// verified first — a failed verification is an input error, never a
 /// diff. Sections present on both sides are compared with the same
@@ -433,9 +466,9 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
 
     for (side, inspection) in [("baseline", &ins_a), ("candidate", &ins_b)] {
         if let Some(manifest) = &inspection.manifest {
-            for diagnostic in &manifest.diagnostics {
+            if !manifest.diagnostics.is_empty() {
                 report.complete = false;
-                report.diagnostics.push(format!("{side}: {diagnostic}"));
+                append_collection_diagnostics(&mut report.diagnostics, side, &manifest.diagnostics);
             }
         }
     }
@@ -644,6 +677,32 @@ pub fn extract(bundle: &PathBuf, dest: &PathBuf, force: bool) -> Result<Report<V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review2_manifest_diagnostics_are_bounded_before_cloning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics.lens");
+        create_bundle_archive(
+            &path,
+            "test",
+            &[json_artifact(
+                "reports/log_summary.json",
+                serde_json::json!({"total_lines":0}),
+            )],
+            vec!["x".repeat(256 * 1024)],
+            false,
+        )
+        .unwrap();
+        let report = diff(&path, &path).unwrap();
+        assert!(!report.complete);
+        assert!(report.diagnostics.iter().map(String::len).sum::<usize>() <= 64 * 1024);
+        assert!(report.diagnostics.iter().any(|d| d.contains("truncated")));
+        let mut messages = Vec::new();
+        let input = vec!["한글".repeat(1024); 300];
+        append_collection_diagnostics(&mut messages, "baseline", &input);
+        append_collection_diagnostics(&mut messages, "candidate", &input);
+        assert!(messages.iter().map(String::len).sum::<usize>() <= 64 * 1024);
+        assert!(messages.len() <= 130);
+    }
     #[test]
     fn bundle_records_recoverable_junit_and_disk_truncation() {
         let dir = tempfile::tempdir().unwrap();

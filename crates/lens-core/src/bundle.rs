@@ -25,6 +25,9 @@ pub const MANIFEST_ENTRY: &str = "manifest.json";
 /// Defensive caps against hostile archives (decompression bombs).
 const MAX_BUNDLE_ENTRIES: usize = 4096;
 const MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
+/// Manifests are metadata, not payloads. Reject compressed diagnostic bombs
+/// before reading or parsing the entry (including inspect/show/extract).
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// The integrity inventory of a `.lens` bundle. It is unsigned: verification
 /// detects corruption, not an attacker who can rewrite the whole archive.
@@ -147,7 +150,14 @@ pub fn create_bundle_archive<P: AsRef<Path>>(
         sources,
         diagnostics,
     };
+    // Gate before deterministic serialization clones strings into a Value.
+    let _bounded = crate::json::to_bounded_vec(&manifest, MAX_MANIFEST_BYTES as usize)?;
     let manifest_json = crate::json::to_deterministic_pretty(&manifest)?.into_bytes();
+    if manifest_json.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(LensError::LimitExceeded {
+            message: "manifest exceeds maximum metadata size".into(),
+        });
+    }
 
     let estimated = estimated_archive_bytes(
         artifacts
@@ -323,6 +333,11 @@ where
             .map_err(|e| io_err(path_ref, e))?
             .to_string_lossy()
             .to_string();
+        if normalize_entry_name(&name) == MANIFEST_ENTRY && size > MAX_MANIFEST_BYTES {
+            return Err(LensError::LimitExceeded {
+                message: "manifest exceeds maximum metadata size".into(),
+            });
+        }
         on_entry(&name, &mut entry, size)?;
     }
     Ok(())
@@ -753,6 +768,46 @@ fn normalize_path_str(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oversized_manifest_is_rejected_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomb.lens");
+        create_bundle_archive(&path, "test", &sample_artifacts(), vec![], false).unwrap();
+        rebuild_with(&path, |entries| {
+            let manifest = entries
+                .iter_mut()
+                .find(|(name, _)| name == MANIFEST_ENTRY)
+                .unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&manifest.1).unwrap();
+            value["diagnostics"] = serde_json::json!(["x".repeat(8 * 1024 * 1024)]);
+            manifest.1 = serde_json::to_vec(&value).unwrap();
+        });
+        assert!(std::fs::metadata(&path).unwrap().len() < 64 * 1024);
+        assert!(matches!(
+            verify_bundle_archive(&path),
+            Err(LensError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            inspect_bundle(&path),
+            Err(LensError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            read_bundle_entry(&path, MANIFEST_ENTRY),
+            Err(LensError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            extract_bundle(&path, &dir.path().join("extract"), false),
+            Err(LensError::LimitExceeded { .. })
+        ));
+        assert!(create_bundle_archive(
+            dir.path().join("create.lens"),
+            "test",
+            &sample_artifacts(),
+            vec!["x".repeat(2 * 1024 * 1024)],
+            false
+        )
+        .is_err());
+    }
     use super::*;
     use tempfile::NamedTempFile;
 

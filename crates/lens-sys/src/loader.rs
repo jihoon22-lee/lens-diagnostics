@@ -25,7 +25,7 @@ const UNIT_SUFFIXES: [&str; 10] = [
 
 fn unit_symlink_target(path: &Path) -> std::io::Result<PathBuf> {
     // A /dev/null mask is a fixed sentinel: classify it without opening it.
-    if std::fs::canonicalize(path).is_ok_and(|target| target == Path::new("/dev/null")) {
+    if std::fs::read_link(path).is_ok_and(|target| target == Path::new("/dev/null")) {
         return Ok(PathBuf::from("/dev/null"));
     }
     lens_core::read_policy::canonicalize(path)
@@ -47,7 +47,7 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
     // systemd precedence: for an instance `foo@bar.service`, template-level
     // `foo@.service.d/*.conf` merges first, then `foo@bar.service.d/*.conf`.
     for drop_dir in drop_in_dirs(path, &name) {
-        if !drop_dir.is_dir() {
+        if !lens_core::read_policy::metadata(&drop_dir).is_ok_and(|m| m.is_dir()) {
             continue;
         }
         let mut confs: Vec<PathBuf> = match lens_core::read_policy::read_dir(&drop_dir) {
@@ -345,7 +345,7 @@ fn drop_in_confs(dir: &Path, unit_name: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let unit_path = dir.join(unit_name);
     for drop_dir in drop_in_dirs(&unit_path, unit_name) {
-        if !drop_dir.is_dir() {
+        if !lens_core::read_policy::metadata(&drop_dir).is_ok_and(|m| m.is_dir()) {
             continue;
         }
         let mut confs: Vec<PathBuf> = match lens_core::read_policy::read_dir(&drop_dir) {

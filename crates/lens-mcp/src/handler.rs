@@ -15,6 +15,12 @@ fn text_fits(text: &str) -> bool {
     serde_json::to_string(text).is_ok_and(|encoded| encoded.len() <= TEXT_BUDGET)
 }
 
+fn bounded_json_text<T: serde::Serialize>(value: &T) -> Option<String> {
+    let bytes = lens_core::json::to_bounded_vec(value, TEXT_BUDGET).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    text_fits(&text).then_some(text)
+}
+
 /// Keep in-band tool errors bounded too, including JSON escaping overhead.
 pub fn bounded_error(mut error: String) -> String {
     if text_fits(&error) {
@@ -149,8 +155,7 @@ fn serialize_result(v: Value, args: &Value) -> Result<String, String> {
                 m.insert("_response_clamped".to_string(), serde_json::json!(true));
             }
         }
-        let text = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
-        if text_fits(&text) {
+        if let Some(text) = bounded_json_text(&out) {
             return Ok(text);
         }
     }
@@ -589,6 +594,16 @@ pub struct ToolOutput {
 /// keep the full count honest, and an oversized serialization falls
 /// back to the clamped array limit.
 fn serialize_findings(outcome: &ToolOutcome, args: &Value) -> Option<String> {
+    #[derive(serde::Serialize)]
+    struct Metadata<'a> {
+        findings: &'a [Finding],
+        findings_total: usize,
+        findings_truncated: bool,
+        complete: bool,
+        diagnostics: &'a [String],
+        diagnostics_total: usize,
+        diagnostics_truncated: bool,
+    }
     if outcome.findings.is_empty() && outcome.diagnostics.is_empty() && outcome.complete {
         return None;
     }
@@ -598,27 +613,28 @@ fn serialize_findings(outcome: &ToolOutcome, args: &Value) -> Option<String> {
     let mut diagnostics_shown =
         diagnostics_total.min(arg_usize(args, "limit", DEFAULT_ARRAY_LIMIT));
     loop {
-        let text = serde_json::json!({
-            "findings": &outcome.findings[..shown],
-            "findings_total": total,
-            "findings_truncated": total > shown,
-            "complete": outcome.complete,
-            "diagnostics": &outcome.diagnostics[..diagnostics_shown],
-            "diagnostics_total": diagnostics_total,
-            "diagnostics_truncated": diagnostics_shown < diagnostics_total,
-        })
-        .to_string();
-        if text_fits(&text) {
+        let metadata = Metadata {
+            findings: &outcome.findings[..shown],
+            findings_total: total,
+            findings_truncated: total > shown,
+            complete: outcome.complete,
+            diagnostics: &outcome.diagnostics[..diagnostics_shown],
+            diagnostics_total,
+            diagnostics_truncated: diagnostics_shown < diagnostics_total,
+        };
+        if let Some(text) = bounded_json_text(&metadata) {
             return Some(text);
         }
         // Halve the more expensive list, preserving the other list when
         // one finding or diagnostic alone is larger than the budget.
-        let finding_bytes = serde_json::to_vec(&outcome.findings[..shown])
-            .unwrap()
-            .len();
-        let diagnostic_bytes = serde_json::to_vec(&outcome.diagnostics[..diagnostics_shown])
-            .unwrap()
-            .len();
+        let finding_bytes = outcome.findings[..shown]
+            .iter()
+            .map(|f| f.code.len() + f.message.len() + 64)
+            .sum::<usize>();
+        let diagnostic_bytes = outcome.diagnostics[..diagnostics_shown]
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
         if shown > 0 && finding_bytes >= diagnostic_bytes {
             shown /= 2;
         } else {
