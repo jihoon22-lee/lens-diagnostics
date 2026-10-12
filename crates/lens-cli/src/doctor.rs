@@ -10,6 +10,9 @@ pub enum HealthStatus {
     Pass,
     Warn,
     Fail,
+    /// The check does not apply to the inspected root (e.g. host-only
+    /// evidence under `--root`) — never counted as a finding.
+    Skip,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +30,8 @@ pub struct DoctorSummary {
     pub passed: usize,
     pub warnings: usize,
     pub failures: usize,
+    #[serde(default)]
+    pub skipped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,52 +227,65 @@ pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
 
 use lens_sys::OrderingGraph;
 
-/// Load systemd units with `<unit>.d/*.conf` drop-ins applied. An explicit
-/// `path` loads that file/dir; `None` merges the full systemd search path
-/// (/etc > /run > /usr/lib > /lib). Unreadable units are preserved as
-/// diagnostic stubs so a doctor run never silently drops them.
-pub fn load_systemd_units(
-    path: Option<&Path>,
-) -> std::collections::BTreeMap<String, lens_sys::SystemdUnit> {
-    match path {
-        Some(p) => lens_sys::load_units(p).unwrap_or_default(),
-        None => {
-            let dirs: Vec<std::path::PathBuf> = lens_sys::SYSTEMD_SEARCH_DIRS
-                .iter()
-                .map(std::path::PathBuf::from)
-                .collect();
-            lens_sys::load_units_merged(&dirs)
-        }
+/// Effective systemd unit directories for the services check: an explicit
+/// `systemd_dir` wins; under `--root` the standard search dirs are
+/// re-rooted (`<root>/etc/systemd/system`, …); otherwise the host search
+/// path. The bool marks an explicit dir whose load errors must surface.
+fn services_dirs(root: Option<&Path>, systemd_dir: Option<&Path>) -> (Vec<PathBuf>, bool) {
+    if let Some(d) = systemd_dir {
+        return (vec![d.to_path_buf()], true);
     }
+    let dirs: Vec<PathBuf> = lens_sys::SYSTEMD_SEARCH_DIRS
+        .iter()
+        .map(|d| match root {
+            Some(r) => r.join(d.trim_start_matches('/')),
+            None => PathBuf::from(d),
+        })
+        .collect();
+    (dirs, false)
 }
 
-pub fn check_services(systemd_dir: Option<&Path>) -> DoctorCheck {
-    if let Some(base) = systemd_dir {
-        if !base.exists() {
-            return DoctorCheck {
-                category: "Services".to_string(),
-                name: "Systemd Dependency Cycles".to_string(),
-                status: HealthStatus::Pass,
-                message: "No local systemd unit directory to inspect (non-systemd environment)"
-                    .to_string(),
-                recommendation: None,
-            };
-        }
-    } else if !lens_sys::SYSTEMD_SEARCH_DIRS
-        .iter()
-        .any(|d| Path::new(d).exists())
-    {
+/// Load systemd units with `<unit>.d/*.conf` drop-ins applied. An
+/// explicit directory goes through `load_units` and propagates its
+/// error; merged search dirs tolerate missing entries. Unreadable units
+/// are preserved as diagnostic stubs so a doctor run never silently
+/// drops them.
+pub fn load_systemd_units(
+    dirs: &[PathBuf],
+    explicit: bool,
+) -> std::result::Result<std::collections::BTreeMap<String, lens_sys::SystemdUnit>, String> {
+    if explicit {
+        return lens_sys::load_units(&dirs[0]).map_err(|e| e.to_string());
+    }
+    Ok(lens_sys::load_units_merged(dirs))
+}
+
+pub fn check_services(root: Option<&Path>, systemd_dir: Option<&Path>) -> DoctorCheck {
+    let (dirs, explicit) = services_dirs(root, systemd_dir);
+    if !dirs.iter().any(|d| d.exists()) {
         return DoctorCheck {
             category: "Services".to_string(),
             name: "Systemd Dependency Cycles".to_string(),
-            status: HealthStatus::Pass,
-            message: "No local systemd unit directory to inspect (non-systemd environment)"
-                .to_string(),
+            status: HealthStatus::Skip,
+            message: "No systemd unit directory to inspect; services check skipped".to_string(),
             recommendation: None,
         };
     }
 
-    let units = load_systemd_units(systemd_dir);
+    let units = match load_systemd_units(&dirs, explicit) {
+        Ok(u) => u,
+        Err(e) => {
+            return DoctorCheck {
+                category: "Services".to_string(),
+                name: "Systemd Dependency Cycles".to_string(),
+                status: HealthStatus::Warn,
+                message: format!("Failed to load systemd units: {}", e),
+                recommendation: Some(
+                    "Check the unit directory for unreadable or malformed files.".to_string(),
+                ),
+            };
+        }
+    };
     let graph = OrderingGraph::build(&units);
     let cycles = graph.find_cycles();
 
@@ -339,7 +357,18 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
         });
     }
 
-    if let Ok(path_var) = env::var("PATH") {
+    if root.is_some() {
+        // PATH reflects the invoking process, not the inspected root —
+        // reporting it under --root would attribute host state to the
+        // image.
+        checks.push(DoctorCheck {
+            category: "Environment".to_string(),
+            name: "PATH Sanity".to_string(),
+            status: HealthStatus::Skip,
+            message: "PATH check reflects the invoking process; skipped under --root".to_string(),
+            recommendation: None,
+        });
+    } else if let Ok(path_var) = env::var("PATH") {
         let parts: Vec<&str> = path_var.split(':').collect();
         let mut suspicious = Vec::new();
         for p in &parts {
@@ -386,19 +415,42 @@ pub fn run_doctor(
     let mut checks = Vec::new();
 
     checks.push(check_storage(root.unwrap_or_else(|| Path::new("/"))));
-    checks.extend(check_network(procfs));
-    checks.push(check_services(sys_dir));
+
+    // An explicit --procfs always wins; under --root the procfs is
+    // <root>/proc, and its absence is a Skip — never a read of the host
+    // /proc that would attribute host sockets to the image.
+    match (root, procfs) {
+        (Some(r), None) => {
+            let proc_dir = r.join("proc");
+            if proc_dir.exists() {
+                checks.extend(check_network(Some(&proc_dir)));
+            } else {
+                checks.push(DoctorCheck {
+                    category: "Network".to_string(),
+                    name: "Network".to_string(),
+                    status: HealthStatus::Skip,
+                    message: format!("{} not present; network checks skipped", proc_dir.display()),
+                    recommendation: None,
+                });
+            }
+        }
+        (_, p) => checks.extend(check_network(p)),
+    }
+
+    checks.push(check_services(root, sys_dir));
     checks.extend(check_environment(root));
 
     let mut passed = 0;
     let mut warnings = 0;
     let mut failures = 0;
+    let mut skipped = 0;
 
     for c in &checks {
         match c.status {
             HealthStatus::Pass => passed += 1,
             HealthStatus::Warn => warnings += 1,
             HealthStatus::Fail => failures += 1,
+            HealthStatus::Skip => skipped += 1,
         }
     }
 
@@ -415,6 +467,7 @@ pub fn run_doctor(
         passed,
         warnings,
         failures,
+        skipped,
     };
 
     DoctorReport {
@@ -484,7 +537,52 @@ mod tests {
         assert!(report.summary.total >= 4);
         assert_eq!(
             report.summary.total,
-            report.summary.passed + report.summary.warnings + report.summary.failures
+            report.summary.passed
+                + report.summary.warnings
+                + report.summary.failures
+                + report.summary.skipped
+        );
+    }
+
+    #[test]
+    fn test_run_doctor_empty_root_never_reads_host() {
+        // An empty --root must not leak host evidence: network, services,
+        // and PATH checks all skip; only the root-scoped preload check
+        // still runs.
+        let root = tempfile::Builder::new()
+            .prefix("lens-doctor-fakeroot-")
+            .tempdir()
+            .unwrap();
+        let report = run_doctor(Some(root.path()), None, None);
+
+        let status_of = |name: &str| {
+            report
+                .checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing check {name}"))
+                .status
+        };
+        assert_eq!(status_of("Network"), HealthStatus::Skip);
+        assert_eq!(status_of("Systemd Dependency Cycles"), HealthStatus::Skip);
+        assert_eq!(status_of("PATH Sanity"), HealthStatus::Skip);
+        assert_eq!(status_of("ld.so.preload Verification"), HealthStatus::Pass);
+        assert_eq!(report.summary.skipped, 3);
+        // Skips are not findings — every non-Storage check is Pass or
+        // Skip. (Storage itself statvfs's the tempdir's filesystem and
+        // may legitimately Warn/Fail on a low-disk host.)
+        assert!(report
+            .checks
+            .iter()
+            .filter(|c| c.category != "Storage")
+            .all(|c| matches!(c.status, HealthStatus::Pass | HealthStatus::Skip)));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|c| !c.message.contains("Total sockets")),
+            "host socket data must not appear: {:?}",
+            report.checks
         );
     }
 }

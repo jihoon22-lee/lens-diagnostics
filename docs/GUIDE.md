@@ -277,6 +277,14 @@ lens doctor [--root PATH] [--procfs PATH] [--systemd-dir PATH]
 심각도는 exit 0을 유지한다 — 권한 부족으로 검사 불가한 소켓은 orphan
 WARN이 아니라 PASS + "sudo로 재실행" 권고로 보고한다.
 
+`--root PATH`는 검사를 루트 이미지로 스코프한다: 네트워크는 `<root>/proc`,
+서비스는 `<root>` 아래로 재배치된 systemd 검색 디렉터리(`/etc/systemd/system`
+등), ld.so.preload는 `<root>/etc/ld.so.preload`를 읽는다. 루트에서 확인할
+수 없는 검사(네트워크, 서비스, 호스트 프로세스의 PATH)는 호스트 데이터로
+채우지 않고 `SKIP`으로 보고한다. `SKIP`은 findings에 포함되지 않아
+exit code에도 영향이 없다. `--procfs`/`--systemd-dir`을 명시하면 그
+경로가 우선한다.
+
 ## TUI 대시보드
 
 ```bash

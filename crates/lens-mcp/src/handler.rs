@@ -9,7 +9,6 @@ use lens_disk::{DiskScanner, DuplicateFinder, ScanOptions, SnapshotV2};
 use lens_env::inspect_venv;
 use lens_log::{parse_line, LogFilter, LogIndexer, LogLevel};
 use lens_sys::{OrderingGraph, SystemdSnapshot, SystemdUnit};
-use lens_trace::TraceAnalyzer;
 
 /// Cap on a serialized tool result — a single `tools/call` result must
 /// stay well inside an LLM context window. When pagination cannot shrink
@@ -293,10 +292,17 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<Value, String> {
             let mut truncated = false;
             let mut scanned = 0usize;
             let mut seen = 0usize;
+            let mut lossy_lines = 0usize;
             for idx in start..total {
                 scanned += 1;
-                if let Some(line) = indexer.get_line(idx) {
-                    let record = parse_line(line, idx + 1);
+                // Lossy view: invalid-UTF-8 lines are still matched (shown
+                // with U+FFFD) and counted, not silently skipped. An Owned
+                // Cow means from_utf8_lossy had to repair invalid bytes.
+                if let Some(line) = indexer.get_line_lossy(idx) {
+                    if matches!(line, std::borrow::Cow::Owned(_)) {
+                        lossy_lines += 1;
+                    }
+                    let record = parse_line(&line, idx + 1);
                     if filter.matches(&record) {
                         seen += 1;
                         if seen > offset + limit {
@@ -318,6 +324,7 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<Value, String> {
                 "matches": matches,
                 "scanned_lines": scanned,
                 "total_lines": total,
+                "lossy_lines": lossy_lines,
                 "tail": tail,
                 "truncated": truncated,
             }))
@@ -325,8 +332,10 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<Value, String> {
         "lens_trace_analyze" => {
             let p = tool_path(args, "trace_file")?;
             let content = fs::read_to_string(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
-            let analyzer = TraceAnalyzer::new();
-            let snap = analyzer.analyze_lines(content.lines());
+            // Same fail-closed gate as the CLI: non-strace input is an
+            // in-band tool error, not a meaningless snapshot.
+            let snap = lens_trace::analyze_strace_text(&content)
+                .map_err(|e| format!("{}: {}", p.display(), e))?;
             serde_json::to_value(&snap).map_err(|e| e.to_string())
         }
         "lens_sys_cycles" => {

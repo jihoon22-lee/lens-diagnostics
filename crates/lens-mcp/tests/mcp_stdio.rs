@@ -366,6 +366,59 @@ fn net_diff_between_snapshots() {
 }
 
 #[test]
+fn log_filter_counts_lossy_utf8_lines() {
+    // A matching line with invalid UTF-8 is still a match (shown lossy),
+    // and the scanned lossy lines are counted — not silently dropped.
+    let dir = tmpdir("loglossy");
+    let log = dir.join("app.log");
+    let mut bytes = b"ERROR ok\n".to_vec();
+    bytes.extend_from_slice(b"ERROR bad \xff\n");
+    bytes.extend_from_slice(b"ERROR ok2\n");
+    std::fs::write(&log, bytes).unwrap();
+
+    let text = tool_call(
+        18,
+        "lens_log_filter",
+        serde_json::json!({
+            "path": log.to_string_lossy(),
+            "query": "error"
+        }),
+    );
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["matches"].as_array().unwrap().len(), 3, "{text}");
+    assert_eq!(v["scanned_lines"], 3, "{text}");
+    assert_eq!(v["lossy_lines"], 1, "{text}");
+    assert!(v["matches"][1]["raw"]
+        .as_str()
+        .unwrap()
+        .contains('\u{fffd}'));
+}
+
+#[test]
+fn trace_analyze_rejects_non_strace_input() {
+    // The CLI's fail-closed gate applies in MCP too: markdown is an
+    // in-band tool error, not a garbage snapshot.
+    let dir = tmpdir("tracemd");
+    let md = dir.join("notes.md");
+    std::fs::write(
+        &md,
+        "# Notes\n\n- some *markdown* text\n- more lines\n- and more\n- and more\n",
+    )
+    .unwrap();
+
+    let result = tool_result(
+        19,
+        "lens_trace_analyze",
+        serde_json::json!({ "trace_file": md.to_string_lossy() }),
+    );
+    assert_eq!(result["isError"], Value::Bool(true), "{result}");
+    assert!(result["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("does not look like strace output"));
+}
+
+#[test]
 fn abi_diff_identical_binary_is_compatible() {
     // The lens-mcp binary itself is an ELF — diffing it against itself is
     // trivially compatible.

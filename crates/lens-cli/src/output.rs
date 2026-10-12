@@ -1,39 +1,48 @@
-use std::io::Write;
+use std::io::{BufWriter, Stdout, Write};
+use std::sync::{Mutex, OnceLock};
 
-/// Write one formatted line to stdout. A downstream reader that closed the
-/// pipe early (`| head`, `| grep -m1`, quitting `less`) is a clean exit, not
-/// a panic on `BrokenPipe` like `println!`.
+/// Process-global buffered stdout (64 KiB): every `outln!`/`bytes` call
+/// shares one writer, so a line-per-record hot path costs one write
+/// syscall per flush instead of one per line.
+static STDOUT: OnceLock<Mutex<BufWriter<Stdout>>> = OnceLock::new();
+
+fn stdout_writer() -> &'static Mutex<BufWriter<Stdout>> {
+    STDOUT.get_or_init(|| Mutex::new(BufWriter::with_capacity(64 * 1024, std::io::stdout())))
+}
+
+/// A downstream reader that closed the pipe early (`| head`, `| grep -m1`,
+/// quitting `less`) is a clean exit, not an error. Any other write
+/// failure exits 2 — the "findings" code 1 is reserved for results.
+fn exit_on_write_error(e: std::io::Error) -> ! {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("error: failed to write to stdout: {e}");
+    std::process::exit(2);
+}
+
+/// Write one formatted line to stdout (buffered; see [`flush`]).
 pub fn line(args: std::fmt::Arguments<'_>) {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let result = out
-        .write_fmt(args)
-        .and_then(|()| out.write_all(b"\n"))
-        .and_then(|()| out.flush());
-    match result {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
-        Err(e) => {
-            drop(out);
-            eprintln!("error: failed to write to stdout: {e}");
-            std::process::exit(1);
-        }
+    let mut out = stdout_writer().lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(e) = out.write_fmt(args).and_then(|()| out.write_all(b"\n")) {
+        exit_on_write_error(e);
     }
 }
 
-/// Write a whole buffer to stdout with the same semantics as [`line`]:
-/// a reader that closed the pipe early is a clean exit, not a panic.
+/// Write a whole buffer to stdout with the same semantics as [`line`].
 pub fn bytes(buf: &[u8]) {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    match out.write_all(buf).and_then(|()| out.flush()) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
-        Err(e) => {
-            drop(out);
-            eprintln!("error: failed to write to stdout: {e}");
-            std::process::exit(1);
-        }
+    let mut out = stdout_writer().lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(e) = out.write_all(buf) {
+        exit_on_write_error(e);
+    }
+}
+
+/// Flush the buffered stdout. Call before process exit, and before
+/// writing a final error line to stderr so stdout output is not lost.
+pub fn flush() {
+    let mut out = stdout_writer().lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(e) = out.flush() {
+        exit_on_write_error(e);
     }
 }
 

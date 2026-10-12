@@ -15,6 +15,4 @@ memmap2 = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 jiff = { workspace = true }
-
-[dev-dependencies]
 tempfile = "3.17"

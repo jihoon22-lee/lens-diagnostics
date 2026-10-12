@@ -2,6 +2,43 @@
 
 Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.Z` 형식이다.
 
+## Unreleased
+
+### 수정
+
+- `lens` stdout이 이제 64 KiB 버퍼로 출력된다 — 라인마다 write+flush
+  하던 것을 없애 `log filter` 등 대량 출력이 빨라졌다. stdout 쓰기
+  실패 시 종료 코드가 1에서 2로 변경됐다(1은 findings 전용).
+- `bundle create --test`가 디렉터리·glob 입력을 받는다. 이전에는
+  디렉터리를 주면 `Is a directory` I/O 오류로 수집이 실패했다.
+- `bundle create --log`가 `.gz`와 stdin(`-`)을 올바르게 임베드한다.
+  내용은 해제된 바이트로 저장되며 엔트리 이름은 `.gz` 접미사를 뗀다
+  (`app.log.gz` → `logs/app.log`, stdin은 `logs/stdin.log`). 이전에는
+  압축 바이트의 꼬리를 그대로 넣어 손상된 gzip이 임베드됐고, `-`는
+  파일을 못 찾아 내용이 빠졌다.
+- `trace diff`와 `bundle create --trace`가 `trace analyze`와 같은
+  fail-closed 입력 검증을 적용한다. 비-strace 입력은 diff/analyze에서
+  exit 2이고, 번들에는 진단으로 기록된다.
+- `doctor --root`가 네트워크·서비스 검사를 루트로 스코프한다. 호스트
+  `/proc`와 호스트 systemd 유닛을 더 이상 읽지 않으며, 루트에 없는
+  검사는 새 `SKIP` 상태로 보고한다. 명시한 `--systemd-dir` 로드 실패는
+  PASS 대신 WARN으로 보고한다.
+- MCP `lens_log_filter`가 무효 UTF-8 라인을 lossy로 매칭하고 스캔
+  범위의 `lossy_lines`를 보고한다(이전에는 조용히 건너뛰었다). MCP
+  `lens_trace_analyze`도 같은 fail-closed 게이트를 적용한다.
+- `bundle create`가 verify와 같은 엔트리 수·크기 상한을 사전에
+  강제하고, `--force` 없이는 기존 번들을 덮어쓰지 않는다.
+- `bundle extract`가 단일 패스로 스테이징·검증한다. 목적지의
+  심볼링크는 절대 따라가지 않고(`--force`여도 심볼링크·디렉터리
+  덮어쓰기 거부), 검증 실패 시 스테이징된 파일은 남지 않는다.
+
+### Breaking changes
+
+- `doctor` JSON에 `SKIP` 상태와 `summary.skipped` 필드가 추가됐다.
+  비systemd 환경의 services 검사는 PASS 대신 SKIP으로 보고한다.
+- 라이브러리 `lens_core::create_bundle_archive` 시그니처에 `overwrite`
+  매개변수가 추가됐다.
+
 ## 0.6.1
 
 의존성 보안·릴리스 자동화·문서 정합성 후속 정리 릴리스. 상세 내역은 아래 섹션 참고.

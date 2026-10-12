@@ -13,7 +13,7 @@ use lens_log::{parse_line, LogFilter, LogIndexer, LogLevel};
 use lens_net::{diff_net_reports, inspect_network, NetReport};
 use lens_sys::{diff_systemd, OrderingGraph, SystemdSnapshot};
 use lens_test::{diff_test_runs, parse_junit_xml};
-use lens_trace::{diff_snapshots, TraceAnalyzer};
+use lens_trace::diff_snapshots;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,8 +28,6 @@ fn wants_json(format: Option<OutputFormat>, json_flag: bool, default_json: bool)
     }
 }
 
-/// Open a `log` input: `-` reads stdin through a bounded buffer; `.gz`
-/// files decompress through a bounded reader; the rest are memory-mapped.
 /// Non-ELF input is a usage error on the CLI (exit 2): printing a
 /// `status: non-elf` report would look like a successful inspection of
 /// something we never inspected. The library report stays honest for
@@ -43,6 +41,8 @@ fn reject_non_elf(path: &Path, report: &lens_abi::ElfReport) -> Result<()> {
     Ok(())
 }
 
+/// Open a `log` input: `-` reads stdin through a bounded buffer; `.gz`
+/// files decompress through a bounded reader; the rest are memory-mapped.
 fn open_log_indexer(path: &Path) -> Result<LogIndexer> {
     if path.as_os_str() == "-" {
         let stdin = std::io::stdin();
@@ -50,6 +50,19 @@ fn open_log_indexer(path: &Path) -> Result<LogIndexer> {
         return LogIndexer::from_reader(lock, "-");
     }
     LogIndexer::open(path)
+}
+
+/// Read a trace input and fail closed when it is not strace output —
+/// shared by `trace analyze`, both sides of `trace diff`, and the
+/// `bundle create --trace` collector so they apply identical rules.
+fn analyze_trace_file(path: &Path) -> Result<lens_trace::TraceSnapshot> {
+    let content = fs::read_to_string(path).map_err(|e| lens_core::LensError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    lens_trace::analyze_strace_text(&content).map_err(|e| lens_core::LensError::InvalidInput {
+        message: format!("{:?} {}", path, e),
+    })
 }
 
 /// Flatten per-unit parser/loader diagnostics for the snapshot-level
@@ -134,47 +147,33 @@ fn human_bytes(n: u64) -> String {
 /// is kept: incident investigations care about the most recent lines.
 const BUNDLE_LOG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Read up to `cap` bytes of a log for bundling: the whole file when it
-/// fits, otherwise the tail starting on a line boundary. Returns the bytes
-/// and whether they were truncated.
-fn read_log_tail(path: &Path, cap: u64) -> Result<(Vec<u8>, bool)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).map_err(|e| lens_core::LensError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let len = file
-        .metadata()
-        .map_err(|e| lens_core::LensError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?
-        .len();
-    if len <= cap {
-        let mut buf = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut buf)
-            .map_err(|e| lens_core::LensError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-        return Ok((buf, false));
+/// Select up to `cap` bytes of log content for bundling: the whole input
+/// when it fits, otherwise the tail starting on a line boundary. Returns
+/// the slice and whether it was truncated.
+fn tail_on_line_boundary(data: &[u8], cap: usize) -> (&[u8], bool) {
+    if data.len() <= cap {
+        return (data, false);
     }
-    file.seek(SeekFrom::End(-(cap as i64)))
-        .map_err(|e| lens_core::LensError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-    let mut buf = Vec::with_capacity(cap as usize);
-    file.read_to_end(&mut buf)
-        .map_err(|e| lens_core::LensError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+    let tail = &data[data.len() - cap..];
     // Skip the partial first line so the excerpt starts cleanly.
-    if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-        buf.drain(..nl + 1);
+    match tail.iter().position(|&b| b == b'\n') {
+        Some(nl) => (&tail[nl + 1..], true),
+        None => (tail, true),
     }
-    Ok((buf, true))
+}
+
+/// Tar entry name for bundled log content: stdin is `stdin.log`, and a
+/// `.gz` suffix is dropped since the embedded bytes are decompressed.
+fn log_entry_name(path: &Path) -> String {
+    if path.as_os_str() == "-" {
+        return "stdin.log".to_string();
+    }
+    let name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "stdin.log".to_string());
+    let name = name.strip_suffix(".gz").unwrap_or(&name);
+    name.replace(['/', '\\'], "_")
 }
 
 /// `test diff`/`test parse` accept a file, a directory (all `*.xml`
@@ -725,10 +724,10 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                     }
                     // Lossy view: invalid-UTF-8 lines are still matched and
                     // shown (with U+FFFD) rather than silently skipped.
-                    let line = indexer
-                        .get_line_lossy(idx)
-                        .map(|c| c.into_owned())
-                        .unwrap_or_default();
+                    // Kept as a Cow: the borrowed fast path avoids one
+                    // String allocation per scanned line; only context
+                    // lines buffered in `pending_before` are owned.
+                    let line = indexer.get_line_lossy(idx).unwrap_or_default();
                     let is_match = !limited && {
                         if filter.min_level.is_some() || filter.time_filter_active() {
                             // Level/timestamp filtering needs the parsed
@@ -786,7 +785,7 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                             &mut after_left,
                         );
                     } else if context > 0 {
-                        pending_before.push_back((idx, line));
+                        pending_before.push_back((idx, line.into_owned()));
                         while pending_before.len() > context {
                             pending_before.pop_front();
                         }
@@ -899,29 +898,7 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
         },
         Commands::Trace { action } => match action {
             TraceCommands::Analyze { trace_file, format } => {
-                let content =
-                    fs::read_to_string(&trace_file).map_err(|e| lens_core::LensError::Io {
-                        path: trace_file.clone(),
-                        source: e,
-                    })?;
-                let analyzer = TraceAnalyzer::new();
-                let snapshot = analyzer.analyze_lines(content.lines());
-                // Fail closed on input that is not strace output: when most
-                // candidate lines fail to parse, the report is meaningless.
-                let unparsed = snapshot.total_events.saturating_sub(snapshot.total_calls);
-                if snapshot.total_events == 0 {
-                    return Err(lens_core::LensError::InvalidInput {
-                        message: format!("{:?} contains no recognizable strace lines", trace_file),
-                    });
-                }
-                if unparsed > snapshot.total_calls {
-                    return Err(lens_core::LensError::InvalidInput {
-                        message: format!(
-                            "{:?} does not look like strace output: {} of {} lines failed to parse",
-                            trace_file, unparsed, snapshot.total_events
-                        ),
-                    });
-                }
+                let snapshot = analyze_trace_file(&trace_file)?;
                 if wants_json(format, false, true) {
                     outln!("{}", to_deterministic_pretty(&snapshot)?);
                 } else {
@@ -952,17 +929,8 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                 candidate,
                 format,
             } => {
-                let c1 = fs::read_to_string(&baseline).map_err(|e| lens_core::LensError::Io {
-                    path: baseline.clone(),
-                    source: e,
-                })?;
-                let c2 = fs::read_to_string(&candidate).map_err(|e| lens_core::LensError::Io {
-                    path: candidate.clone(),
-                    source: e,
-                })?;
-                let analyzer = TraceAnalyzer::new();
-                let s1 = analyzer.analyze_lines(c1.lines());
-                let s2 = analyzer.analyze_lines(c2.lines());
+                let s1 = analyze_trace_file(&baseline)?;
+                let s2 = analyze_trace_file(&candidate)?;
                 let diff = diff_snapshots(&s1, &s2);
                 if wants_json(format, false, true) {
                     outln!("{}", to_deterministic_pretty(&diff)?);
@@ -1435,23 +1403,28 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                 }
 
                 if let Some(ref l) = log {
-                    collect!("log", "reports/log_summary.json", {
-                        let indexer = open_log_indexer(l)?;
-                        Ok(serde_json::json!({
-                            "path": l.to_string_lossy(),
-                            "total_lines": indexer.len(),
-                            "lossy_lines": indexer.lossy_lines(),
-                        }))
-                    });
-                    // Embed the original log content (tail-bounded) so the
-                    // bundle is evidence, not just a line count.
-                    let log_name = l
-                        .file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "stdin.log".to_string());
-                    let log_name = log_name.replace(['/', '\\'], "_");
-                    match read_log_tail(l, BUNDLE_LOG_TAIL_BYTES) {
-                        Ok((bytes, truncated)) => {
+                    // The log is opened once: the summary JSON and the
+                    // embedded content (tail-bounded, so the bundle stays
+                    // evidence rather than just a line count) share the
+                    // indexer's decoded bytes — `.gz` and stdin (`-`)
+                    // inputs therefore embed correctly too.
+                    match open_log_indexer(l) {
+                        Ok(indexer) => {
+                            match BundleArtifact::json(
+                                "reports/log_summary.json",
+                                &serde_json::json!({
+                                    "path": l.to_string_lossy(),
+                                    "total_lines": indexer.len(),
+                                    "lossy_lines": indexer.lossy_lines(),
+                                }),
+                            ) {
+                                Ok(artifact) => artifacts.push(artifact),
+                                Err(e) => diagnostics.push(format!("log: {}", e)),
+                            }
+                            let (tail, truncated) = tail_on_line_boundary(
+                                indexer.as_bytes(),
+                                BUNDLE_LOG_TAIL_BYTES as usize,
+                            );
                             if truncated {
                                 diagnostics.push(format!(
                                     "log: content truncated to the last {} bytes",
@@ -1459,33 +1432,22 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                                 ));
                             }
                             artifacts.push(BundleArtifact {
-                                name: format!("logs/{}", log_name),
-                                data: bytes,
+                                name: format!("logs/{}", log_entry_name(l)),
+                                data: tail.to_vec(),
                             });
                         }
-                        Err(e) => diagnostics.push(format!("log content: {}", e)),
+                        Err(e) => diagnostics.push(format!("log: {}", e)),
                     }
                 }
 
                 if let Some(ref t) = trace {
                     collect!("trace", "reports/trace_snapshot.json", {
-                        let content =
-                            fs::read_to_string(t).map_err(|e| lens_core::LensError::Io {
-                                path: t.clone(),
-                                source: e,
-                            })?;
-                        Ok(TraceAnalyzer::new().analyze_lines(content.lines()))
+                        analyze_trace_file(t)
                     });
                 }
 
                 if let Some(ref t) = test {
-                    collect!("test", "reports/test_run.json", {
-                        let bytes = fs::read(t).map_err(|e| lens_core::LensError::Io {
-                            path: t.clone(),
-                            source: e,
-                        })?;
-                        parse_junit_xml(&bytes, "bundle")
-                    });
+                    collect!("test", "reports/test_run.json", load_test_run(t, "bundle"));
                 }
 
                 if let Some(ref s) = sys {
@@ -1538,6 +1500,7 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                     env!("CARGO_PKG_VERSION"),
                     &artifacts,
                     diagnostics.clone(),
+                    force,
                 )?;
 
                 if wants_json(format, false, false) {
@@ -1841,6 +1804,7 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         HealthStatus::Pass => "[PASS]",
                         HealthStatus::Warn => "[WARN]",
                         HealthStatus::Fail => "[FAIL]",
+                        HealthStatus::Skip => "[SKIP]",
                     };
                     outln!(
                         "{:<12} {:<30} {:<8} {}",

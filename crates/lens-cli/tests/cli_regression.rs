@@ -1613,3 +1613,322 @@ fn env_check_flags_top_level_shadowing_only() {
         .collect();
     assert_eq!(names, vec!["logging", "secrets"], "{names:?}");
 }
+
+// --- Phase 3: review-hardening regressions ---
+
+#[test]
+fn bundle_test_accepts_junit_directory() {
+    // --test documented as "file/directory": a directory must parse every
+    // *.xml inside instead of failing with "Is a directory".
+    let dir = tmp_dir("bundle-testdir");
+    let junit = dir.join("cases");
+    std::fs::create_dir(&junit).unwrap();
+    std::fs::write(
+        junit.join("a.xml"),
+        r#"<testsuite tests="1"><testcase name="a" classname="C" time="0"/></testsuite>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        junit.join("b.xml"),
+        r#"<testsuite tests="1"><testcase name="b" classname="C" time="0"/></testsuite>"#,
+    )
+    .unwrap();
+    let output = dir.join("evidence.lens");
+
+    let out = lens(&[
+        "bundle",
+        "create",
+        output.to_str().unwrap(),
+        "--test",
+        junit.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    let out = lens(&[
+        "bundle",
+        "show",
+        output.to_str().unwrap(),
+        "reports/test_run.json",
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let run: serde_json::Value =
+        serde_json::from_str(&stdout_of(&out)).expect("test_run.json parses");
+    assert_eq!(run["summary"]["total"], 2, "{run}");
+}
+
+fn gzip_file(src: &PathBuf, dst: &PathBuf) -> bool {
+    let out = Command::new("gzip")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("spawn gzip");
+    if !out.status.success() {
+        return false;
+    }
+    std::fs::write(dst, &out.stdout).unwrap();
+    true
+}
+
+#[test]
+fn bundle_log_gz_embeds_decompressed_tail() {
+    let dir = tmp_dir("bundle-gzbig");
+    let plain = dir.join("big.log");
+    // >8 MiB decompressed but highly compressible so the fixture stays fast.
+    let mut content = String::new();
+    for i in 0..400_000 {
+        content.push_str(&format!("[INFO] line {i} padding padding padding\n"));
+    }
+    let last = "[ERROR] final line of the log\n";
+    content.push_str(last);
+    assert!(content.len() > 8 * 1024 * 1024);
+    std::fs::write(&plain, &content).unwrap();
+    let gz = dir.join("big.log.gz");
+    if !gzip_file(&plain, &gz) {
+        return; // no gzip binary on this host
+    }
+
+    let output = dir.join("big.lens");
+    let out = lens(&[
+        "bundle",
+        "create",
+        output.to_str().unwrap(),
+        "--log",
+        gz.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    // The manifest records the truncation diagnostic.
+    let inspect = lens(&[
+        "bundle",
+        "inspect",
+        output.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout_of(&inspect)).expect("inspect JSON");
+    let diags = v["manifest"]["diagnostics"].to_string();
+    assert!(diags.contains("truncated"), "{diags}");
+
+    // Extracted entry is logs/big.log (suffix dropped) — valid plain
+    // text, not a corrupt gzip tail.
+    let dest = dir.join("out");
+    let out = lens(&[
+        "bundle",
+        "extract",
+        output.to_str().unwrap(),
+        dest.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let embedded = std::fs::read(dest.join("logs/big.log")).unwrap();
+    assert_ne!(&embedded[..2], &[0x1f, 0x8b], "must not be gzip data");
+    assert!(embedded.ends_with(last.as_bytes()));
+}
+
+#[test]
+fn bundle_log_gz_small_embeds_full_content() {
+    let dir = tmp_dir("bundle-gzsmall");
+    let plain = dir.join("app.log");
+    let content = "[INFO] alpha\n[ERROR] beta\n";
+    std::fs::write(&plain, content).unwrap();
+    let gz = dir.join("app.log.gz");
+    if !gzip_file(&plain, &gz) {
+        return; // no gzip binary on this host
+    }
+
+    let output = dir.join("small.lens");
+    let out = lens(&[
+        "bundle",
+        "create",
+        output.to_str().unwrap(),
+        "--log",
+        gz.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    let out = lens(&["bundle", "show", output.to_str().unwrap(), "logs/app.log"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out).trim_end(), content.trim_end());
+}
+
+#[test]
+fn bundle_log_stdin_dash_embeds_stdin() {
+    use std::io::Write;
+    let dir = tmp_dir("bundle-stdin");
+    let output = dir.join("stdin.lens");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lens"))
+        .args(["bundle", "create", output.to_str().unwrap(), "--log", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lens");
+    child.stdin.take().unwrap().write_all(b"a\nb\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    let out = lens(&["bundle", "show", output.to_str().unwrap(), "logs/stdin.log"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out).trim_end(), "a\nb");
+
+    // No content-collection diagnostic: stdin was read, not a literal
+    // file named "-".
+    let inspect = lens(&[
+        "bundle",
+        "inspect",
+        output.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout_of(&inspect)).expect("inspect JSON");
+    let diags = v["manifest"]["diagnostics"].to_string();
+    assert!(!diags.contains("log content"), "{diags}");
+}
+
+#[test]
+fn trace_diff_rejects_non_strace() {
+    // The same fail-closed gate `trace analyze` uses applies to both
+    // inputs of `trace diff`.
+    let md = tmp_file(
+        "trace-md",
+        "notes.md",
+        "# Notes\n\n- some *markdown* text\n- more lines\n- and more\n- and more\n- and more\n",
+    );
+    let out = lens(&["trace", "diff", md.to_str().unwrap(), md.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("does not look like strace output"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn bundle_trace_rejects_non_strace_via_diagnostics() {
+    let dir = tmp_dir("bundle-trace-md");
+    let md = dir.join("notes.md");
+    std::fs::write(
+        &md,
+        "# Notes\n\n- some *markdown* text\n- more lines\n- and more\n- and more\n",
+    )
+    .unwrap();
+    let log = dir.join("ok.log");
+    std::fs::write(&log, "[INFO] fine\n").unwrap();
+    let output = dir.join("evidence.lens");
+
+    let out = lens(&[
+        "bundle",
+        "create",
+        output.to_str().unwrap(),
+        "--trace",
+        md.to_str().unwrap(),
+        "--log",
+        log.to_str().unwrap(),
+    ]);
+    // Bundle still succeeds (the log source worked), but the trace
+    // failure is a manifest diagnostic and no snapshot is embedded.
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    let inspect = lens(&[
+        "bundle",
+        "inspect",
+        output.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout_of(&inspect)).expect("inspect JSON");
+    let diags = v["manifest"]["diagnostics"].to_string();
+    assert!(
+        diags.contains("does not look like strace output"),
+        "{diags}"
+    );
+    let names: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"reports/trace_snapshot.json"), "{names:?}");
+}
+
+#[test]
+fn doctor_root_empty_dir_skips_host_checks() {
+    // --root on an empty image must not report host evidence: network,
+    // services and PATH checks all SKIP.
+    let root = tmp_dir("doctor-fakeroot");
+    let out = lens(&[
+        "doctor",
+        "--root",
+        root.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert!(out.status.code().is_some(), "spawn failed");
+    let v: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("doctor JSON");
+    let checks = v["checks"].as_array().unwrap();
+    let status_of = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("missing check {name}"))["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(status_of("Network"), "SKIP", "{v}");
+    assert_eq!(status_of("Systemd Dependency Cycles"), "SKIP", "{v}");
+    assert_eq!(status_of("PATH Sanity"), "SKIP", "{v}");
+    assert_eq!(status_of("ld.so.preload Verification"), "PASS", "{v}");
+    assert_eq!(v["summary"]["skipped"], 3, "{v}");
+    for c in checks {
+        assert!(
+            !c["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Total sockets"),
+            "host socket data leaked into --root report: {c}"
+        );
+    }
+}
+
+#[test]
+fn log_filter_buffered_output_still_correct() {
+    // Buffered stdout must not reorder, drop, or corrupt lines — 50k
+    // matches exercise multiple flush cycles.
+    let dir = tmp_dir("filter-buffered");
+    let log = dir.join("big.log");
+    let n = 50_000;
+    let mut content = String::new();
+    for i in 0..n {
+        content.push_str(&format!("[INFO] msg {i}\n"));
+    }
+    std::fs::write(&log, &content).unwrap();
+
+    let out = lens(&["log", "filter", log.to_str().unwrap(), "--query", "msg"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert_eq!(
+        stdout.lines().count(),
+        n,
+        "{stderr}",
+        stderr = stderr_of(&out)
+    );
+
+    let out = lens(&[
+        "log",
+        "filter",
+        log.to_str().unwrap(),
+        "--query",
+        "msg",
+        "--format",
+        "jsonl",
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    let mut count = 0usize;
+    for l in stdout.lines() {
+        let v: serde_json::Value = serde_json::from_str(l).expect("jsonl line parses");
+        assert!(v["text"].is_string(), "{l}");
+        count += 1;
+    }
+    assert_eq!(count, n);
+}
