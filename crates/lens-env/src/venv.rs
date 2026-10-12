@@ -2,7 +2,6 @@ use crate::markers::{eval_requirement, version_satisfies, MarkerEnv, ReqVerdict}
 use crate::metadata::{normalize_package_name, parse_metadata};
 use crate::model::{PyPackage, PyVenv};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 /// `extras` activates `extra == "name"` environment markers (PEP 508),
@@ -15,7 +14,7 @@ pub fn inspect_venv(venv_path: &Path, extras: &[String]) -> std::io::Result<PyVe
 
     let cfg_path = venv_path.join("pyvenv.cfg");
     if cfg_path.exists() {
-        if let Ok(content) = fs::read_to_string(&cfg_path) {
+        if let Ok(content) = lens_core::read_policy::read_to_string(&cfg_path) {
             for line in content.lines() {
                 if let Some(rest) = line.strip_prefix("home =") {
                     home = rest.trim().to_string();
@@ -37,7 +36,7 @@ pub fn inspect_venv(venv_path: &Path, extras: &[String]) -> std::io::Result<PyVe
     // Look in lib/python*/site-packages
     let lib_dir = venv_path.join("lib");
     if lib_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&lib_dir) {
+        if let Ok(entries) = lens_core::read_policy::read_dir(&lib_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
@@ -129,7 +128,7 @@ fn validate_venv(venv_path: &Path) -> std::io::Result<()> {
     }
     let lib = venv_path.join("lib");
     let has_site_packages = lib.join("site-packages").is_dir()
-        || fs::read_dir(&lib)
+        || lens_core::read_policy::read_dir(&lib)
             .map(|entries| {
                 entries
                     .flatten()
@@ -149,7 +148,7 @@ fn validate_venv(venv_path: &Path) -> std::io::Result<()> {
 }
 
 fn scan_site_packages(site_packages: &Path, packages: &mut BTreeMap<String, PyPackage>) {
-    if let Ok(entries) = fs::read_dir(site_packages) {
+    if let Ok(entries) = lens_core::read_policy::read_dir(site_packages) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -157,7 +156,8 @@ fn scan_site_packages(site_packages: &Path, packages: &mut BTreeMap<String, PyPa
                     if dir_name.ends_with(".dist-info") {
                         let meta_path = path.join("METADATA");
                         if meta_path.exists() {
-                            if let Ok(content) = fs::read_to_string(&meta_path) {
+                            if let Ok(content) = lens_core::read_policy::read_to_string(&meta_path)
+                            {
                                 if let Some(mut pkg) = parse_metadata(&content, Some(dir_name)) {
                                     pkg.top_level_modules =
                                         read_top_level_modules(&path, &pkg.name);
@@ -180,7 +180,7 @@ fn scan_site_packages(site_packages: &Path, packages: &mut BTreeMap<String, PyPa
 /// `typing-extensions` → `typing_extensions`), which is how pip maps the
 /// common cases.
 fn read_top_level_modules(dist_info: &Path, dist_name: &str) -> Vec<String> {
-    if let Ok(content) = fs::read_to_string(dist_info.join("top_level.txt")) {
+    if let Ok(content) = lens_core::read_policy::read_to_string(dist_info.join("top_level.txt")) {
         let mut mods: Vec<String> = content
             .lines()
             .map(str::trim)
@@ -193,7 +193,7 @@ fn read_top_level_modules(dist_info: &Path, dist_name: &str) -> Vec<String> {
             return mods;
         }
     }
-    if let Ok(content) = fs::read_to_string(dist_info.join("RECORD")) {
+    if let Ok(content) = lens_core::read_policy::read_to_string(dist_info.join("RECORD")) {
         let mut mods = std::collections::BTreeSet::new();
         for line in content.lines() {
             let path_field = line.split(',').next().unwrap_or("");
@@ -222,6 +222,7 @@ fn read_top_level_modules(dist_info: &Path, dist_name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
     /// Build a minimal venv fixture: pyvenv.cfg + one dist-info per

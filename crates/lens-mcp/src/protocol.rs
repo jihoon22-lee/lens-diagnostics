@@ -108,6 +108,7 @@ pub fn list_tools() -> Vec<McpTool> {
                 "type": "object",
                 "properties": with_pag(serde_json::json!({
                     "path": { "type": "string", "description": "Path to log file" },
+                    "include_unknown": { "type": "boolean", "description": "Include records with unknown level or timestamp when filtering" },
                     "bucket": { "type": "string", "description": "Histogram bucket width: 1m|5m|15m|1h|1d (default: auto-picked, ~60 buckets)" },
                     "query": { "type": "string", "description": "Case-insensitive substring query" },
                     "regex": { "type": "string", "description": "Regex pattern (alternative to query)" },

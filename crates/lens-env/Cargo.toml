@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+lens-core = { path = "../lens-core" }
 serde = { workspace = true }
 
 [dev-dependencies]

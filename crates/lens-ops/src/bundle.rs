@@ -174,16 +174,7 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
 
     if let Some(ref d) = req.disk {
         collect!("disk", "reports/disk_snapshot.json", {
-            let res = DiskScanner::new(ScanOptions::default()).scan(d)?;
-            // Per-entry scan failures are evidence gaps — record them in
-            // the manifest diagnostics.
-            diagnostics.extend(res.errors.iter().map(|e| format!("disk scan: {e}")));
-            Ok(SnapshotV2::from_tree(
-                &res.tree,
-                res.root_id,
-                res.complete,
-                res.truncated,
-            ))
+            collect_disk(d, ScanOptions::default(), &mut diagnostics)
         });
     }
 
@@ -229,7 +220,13 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
     }
 
     if let Some(ref t) = req.test {
-        collect!("test", "reports/test_run.json", test::load_run(t, "bundle"));
+        collect!("test", "reports/test_run.json", {
+            let run = test::load_run(t, "bundle")?;
+            if !run.complete {
+                diagnostics.push("test: incomplete JUnit evidence".to_string());
+            }
+            Ok(run)
+        });
     }
 
     if req.host {
@@ -306,6 +303,27 @@ pub fn inspect(bundle: &PathBuf) -> Result<Report<BundleInspection>> {
     Ok(Report::new(inspect_bundle(bundle)?))
 }
 
+fn collect_disk(
+    path: &std::path::Path,
+    options: ScanOptions,
+    diagnostics: &mut Vec<String>,
+) -> Result<SnapshotV2> {
+    let res = DiskScanner::new(options).scan(path)?;
+    diagnostics.extend(res.errors.iter().map(|e| format!("disk scan: {e}")));
+    if !res.complete || res.truncated {
+        diagnostics.push(format!(
+            "disk scan: incomplete evidence (truncated={})",
+            res.truncated
+        ));
+    }
+    Ok(SnapshotV2::from_tree(
+        &res.tree,
+        res.root_id,
+        res.complete,
+        res.truncated,
+    ))
+}
+
 /// `lens.bundle-diff/v1`: section diffs of two verified bundles. Each
 /// `sections` value is that domain's normal diff JSON (e.g. the
 /// `sys` section is a `SystemdDiff`); `only_in_*` lists entries present
@@ -334,7 +352,25 @@ const SECTION_ENTRIES: &[(&str, &str)] = &[
 
 fn read_entry_json<T: serde::de::DeserializeOwned>(bundle: &PathBuf, entry: &str) -> Result<T> {
     let bytes = read_bundle_entry(bundle, entry)?;
-    serde_json::from_slice(&bytes).map_err(LensError::Json)
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let expected = match entry {
+        "reports/sys_snapshot.json" => Some(("schema", lens_sys::SNAPSHOT_SCHEMA_V1)),
+        "reports/env_snapshot.json" => Some(("schema", lens_env::SNAPSHOT_SCHEMA_V1)),
+        "reports/net_report.json" => Some(("schema_version", lens_net::REPORT_SCHEMA_V1)),
+        "reports/test_run.json" => Some(("schema", "testlens.run/v1")),
+        "reports/trace_snapshot.json" => Some(("schema", lens_trace::SNAPSHOT_SCHEMA_V1)),
+        "reports/doctor_report.json" => Some(("schema_version", "lens.doctor/v1")),
+        "reports/disk_snapshot.json" => Some(("schema_version", lens_disk::SCHEMA_V2)),
+        _ => None,
+    };
+    if let Some((key, schema)) = expected {
+        if value.get(key).and_then(|v| v.as_str()) != Some(schema) {
+            return Err(LensError::InvalidInput {
+                message: format!("{}:{entry}: expected schema {schema}", bundle.display()),
+            });
+        }
+    }
+    serde_json::from_value(value).map_err(LensError::Json)
 }
 
 /// Diff two forensic bundles section by section. Both bundles are
@@ -394,6 +430,15 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
         only_in_baseline: only_in_baseline.clone(),
         only_in_candidate: only_in_candidate.clone(),
     });
+
+    for (side, inspection) in [("baseline", &ins_a), ("candidate", &ins_b)] {
+        if let Some(manifest) = &inspection.manifest {
+            for diagnostic in &manifest.diagnostics {
+                report.complete = false;
+                report.diagnostics.push(format!("{side}: {diagnostic}"));
+            }
+        }
+    }
 
     for n in &only_in_baseline {
         report.push(
@@ -495,6 +540,11 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
                         "node_count_delta": b.node_count as i64 - a.node_count as i64,
                     });
                     let mut r = Report::new(value);
+                    r.complete = a.complete && b.complete && !a.truncated && !b.truncated;
+                    if !r.complete {
+                        r.diagnostics
+                            .push("disk: incomplete snapshot evidence".to_string());
+                    }
                     let any = r.data["root_size_delta"] != 0
                         || r.data["root_allocated_delta"] != 0
                         || r.data["node_count_delta"] != 0;
@@ -594,6 +644,87 @@ pub fn extract(bundle: &PathBuf, dest: &PathBuf, force: bool) -> Result<Report<V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundle_records_recoverable_junit_and_disk_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("truncated.xml");
+        std::fs::write(&xml, "<testsuite><testcase name=\"ok\"/>").unwrap();
+        let report = create(&BundleRequest {
+            output: dir.path().join("test.lens"),
+            test: Some(xml),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!report.complete);
+        assert!(report.data.diagnostics.iter().any(|d| d.contains("JUnit")));
+        let mut diagnostics = Vec::new();
+        let snapshot = collect_disk(
+            dir.path(),
+            ScanOptions {
+                max_entries: 1,
+                ..Default::default()
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(snapshot.truncated);
+        assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn bundle_sections_reject_foreign_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        for (entry, _) in SECTION_ENTRIES.iter().filter(|(_, key)| *key != "log") {
+            let path = dir.path().join("schema.lens");
+            create_bundle_archive(
+                &path,
+                "test",
+                &[json_artifact(
+                    entry,
+                    serde_json::json!({"schema": "foreign/v99", "schema_version": "foreign/v99"}),
+                )],
+                vec![],
+                true,
+            )
+            .unwrap();
+            let report = diff(&path, &path).unwrap();
+            assert!(!report.complete, "{entry}");
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.contains("expected schema")),
+                "{:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_diff_preserves_collection_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.lens");
+        let b = dir.path().join("b.lens");
+        for path in [&a, &b] {
+            create_bundle_archive(
+                path,
+                "test",
+                &[json_artifact(
+                    "reports/log_summary.json",
+                    serde_json::json!({"total_lines": 0}),
+                )],
+                vec!["sys: collection failed".into()],
+                false,
+            )
+            .unwrap();
+        }
+        let report = diff(&a, &b).unwrap();
+        assert!(
+            !report.complete,
+            "failed collections must never appear complete"
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+    }
     use super::*;
 
     fn bundle_with(dir: &std::path::Path, name: &str, artifacts: Vec<BundleArtifact>) -> PathBuf {

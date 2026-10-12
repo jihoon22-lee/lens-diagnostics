@@ -30,7 +30,7 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
         .and_then(|n| n.to_str())
         .unwrap_or("unit")
         .to_string();
-    let content = std::fs::read_to_string(path).map_err(|e| LensError::Io {
+    let content = lens_core::read_policy::read_to_string(path).map_err(|e| LensError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -42,7 +42,7 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
         if !drop_dir.is_dir() {
             continue;
         }
-        let mut confs: Vec<PathBuf> = match std::fs::read_dir(&drop_dir) {
+        let mut confs: Vec<PathBuf> = match lens_core::read_policy::read_dir(&drop_dir) {
             Ok(rd) => rd
                 .flatten()
                 .map(|e| e.path())
@@ -61,7 +61,7 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
         };
         confs.sort();
         for conf in confs {
-            match std::fs::read_to_string(&conf) {
+            match lens_core::read_policy::read_to_string(&conf) {
                 Ok(c) => apply_drop_in(&mut unit, &c, &conf.to_string_lossy()),
                 Err(e) => unit.diagnostics.push(Diagnostic {
                     code: "DROPIN_UNREADABLE".to_string(),
@@ -92,7 +92,7 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
         let unit = load_unit(path)?;
         units.insert(unit.name.clone(), unit);
     } else if path.is_dir() {
-        let entries = std::fs::read_dir(path).map_err(|e| LensError::Io {
+        let entries = lens_core::read_policy::read_dir(path).map_err(|e| LensError::Io {
             path: path.to_path_buf(),
             source: e,
         })?;
@@ -340,7 +340,7 @@ fn drop_in_confs(dir: &Path, unit_name: &str) -> Vec<PathBuf> {
         if !drop_dir.is_dir() {
             continue;
         }
-        let mut confs: Vec<PathBuf> = match std::fs::read_dir(&drop_dir) {
+        let mut confs: Vec<PathBuf> = match lens_core::read_policy::read_dir(&drop_dir) {
             Ok(rd) => rd
                 .flatten()
                 .map(|e| e.path())
@@ -366,7 +366,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
     let dir_names: Vec<std::collections::BTreeSet<String>> = dirs
         .iter()
         .map(|d| {
-            std::fs::read_dir(d.as_ref())
+            lens_core::read_policy::read_dir(d.as_ref())
                 .map(|rd| {
                     rd.flatten()
                         .filter(|e| {
@@ -484,7 +484,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
             }
         }
 
-        let mut unit = match std::fs::read_to_string(&p) {
+        let mut unit = match lens_core::read_policy::read_to_string(&p) {
             Ok(content) => parse_unit_content(&content, &name, Some(&p.to_string_lossy())),
             Err(e) => {
                 let mut unit = SystemdUnit {
@@ -525,7 +525,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
 fn apply_merged_drop_ins(unit: &mut SystemdUnit, dirs: &[impl AsRef<Path>], unit_name: &str) {
     for dir in dirs.iter().rev() {
         for conf in drop_in_confs(dir.as_ref(), unit_name) {
-            match std::fs::read_to_string(&conf) {
+            match lens_core::read_policy::read_to_string(&conf) {
                 Ok(c) => apply_drop_in(unit, &c, &conf.to_string_lossy()),
                 Err(e) => unit.diagnostics.push(Diagnostic {
                     code: "DROPIN_UNREADABLE".to_string(),

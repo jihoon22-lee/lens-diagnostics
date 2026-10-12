@@ -242,7 +242,7 @@ pub fn check_storage(root: Option<&Path>, procfs: Option<&Path>) -> Vec<DoctorCh
         .unwrap_or_else(|| Path::new("/proc"))
         .join("self/mounts");
     let mut checks = vec![root_check];
-    let Ok(content) = fs::read_to_string(&mounts_path) else {
+    let Ok(content) = lens_core::read_policy::read_to_string(&mounts_path) else {
         // Unreadable mounts table → just the root check, as before.
         return checks;
     };
@@ -549,7 +549,7 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
         .unwrap_or_else(|| PathBuf::from("/etc/ld.so.preload"));
     let preload_label = preload.display().to_string();
     if preload.exists() {
-        let content = fs::read_to_string(&preload).unwrap_or_default();
+        let content = lens_core::read_policy::read_to_string(&preload).unwrap_or_default();
         let trimmed = content.trim();
         if !trimmed.is_empty() {
             checks.push(DoctorCheck {

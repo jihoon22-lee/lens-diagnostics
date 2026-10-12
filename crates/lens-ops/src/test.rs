@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use lens_core::{glob::glob_match, LensError, Result};
@@ -11,7 +10,7 @@ use crate::{Report, Severity};
 /// CI pipelines commonly produce one JUnit file per module.
 pub fn expand_test_inputs(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_dir() {
-        let mut files: Vec<PathBuf> = fs::read_dir(path)
+        let mut files: Vec<PathBuf> = lens_core::read_policy::read_dir(path)
             .map_err(|e| LensError::Io {
                 path: path.to_path_buf(),
                 source: e,
@@ -28,7 +27,7 @@ pub fn expand_test_inputs(path: &Path) -> Result<Vec<PathBuf>> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let pat = path.file_name().map(|f| f.to_string_lossy().into_owned());
         if let Some(pat) = pat {
-            let mut files: Vec<PathBuf> = fs::read_dir(parent)
+            let mut files: Vec<PathBuf> = lens_core::read_policy::read_dir(parent)
                 .map_err(|e| LensError::Io {
                     path: parent.to_path_buf(),
                     source: e,
@@ -58,7 +57,7 @@ pub fn load_run(path: &Path, project: &str) -> Result<TestRun> {
     }
     let mut runs = Vec::new();
     for f in &files {
-        let bytes = fs::read(f).map_err(|e| LensError::Io {
+        let bytes = lens_core::read_policy::read(f).map_err(|e| LensError::Io {
             path: f.clone(),
             source: e,
         })?;

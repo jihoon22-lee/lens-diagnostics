@@ -877,6 +877,7 @@ dependencies = [
 name = "lens-build"
 version = "0.7.0"
 dependencies = [
+ "lens-core",
  "serde",
  "tempfile",
 ]
@@ -937,6 +938,7 @@ dependencies = [
 name = "lens-env"
 version = "0.7.0"
 dependencies = [
+ "lens-core",
  "serde",
  "tempfile",
 ]

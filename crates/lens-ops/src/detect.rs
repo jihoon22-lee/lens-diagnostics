@@ -80,7 +80,7 @@ fn looks_like_junit(head: &[u8]) -> bool {
     s.starts_with(b"<testsuite")
 }
 
-fn has_unit_extension(path: &Path) -> bool {
+pub(crate) fn has_unit_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| UNIT_EXTENSIONS.contains(&e))

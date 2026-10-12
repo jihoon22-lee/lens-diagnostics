@@ -161,7 +161,7 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
     };
     let inode_map = &mut scan.inode_map;
 
-    let entries = match fs::read_dir(proc_dir) {
+    let entries = match lens_core::read_policy::read_dir(proc_dir) {
         Ok(e) => e,
         Err(_) => return scan,
     };
@@ -178,17 +178,17 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
         let fd_dir = pid_path.join("fd");
 
         // Read proc name and cmdline
-        let comm = fs::read_to_string(pid_path.join("comm"))
+        let comm = lens_core::read_policy::read_to_string(pid_path.join("comm"))
             .unwrap_or_default()
             .trim()
             .to_string();
-        let cmdline = fs::read_to_string(pid_path.join("cmdline"))
+        let cmdline = lens_core::read_policy::read_to_string(pid_path.join("cmdline"))
             .unwrap_or_default()
             .replace('\0', " ")
             .trim()
             .to_string();
 
-        let fd_entries = match fs::read_dir(fd_dir) {
+        let fd_entries = match lens_core::read_policy::read_dir(fd_dir) {
             Ok(e) => e,
             Err(_) => {
                 // EACCES on /proc/<pid>/fd — the process exists but its
@@ -251,21 +251,22 @@ pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
 
     // net/tcp is mandatory: a procfs that cannot provide it (bad --proc-dir,
     // /proc not mounted) must fail closed instead of reporting 0 sockets.
-    let tcp_content = fs::read_to_string(&tcp_path).map_err(|e| LensError::Io {
-        path: tcp_path.clone(),
-        source: e,
-    })?;
+    let tcp_content =
+        lens_core::read_policy::read_to_string(&tcp_path).map_err(|e| LensError::Io {
+            path: tcp_path.clone(),
+            source: e,
+        })?;
     sockets.extend(parse_proc_net_tcp(&tcp_content, SocketKind::Tcp));
-    if let Ok(content) = fs::read_to_string(&udp_path) {
+    if let Ok(content) = lens_core::read_policy::read_to_string(&udp_path) {
         sockets.extend(parse_proc_net_tcp(&content, SocketKind::Udp));
     }
-    if let Ok(content) = fs::read_to_string(&tcp6_path) {
+    if let Ok(content) = lens_core::read_policy::read_to_string(&tcp6_path) {
         sockets.extend(parse_proc_net_tcp(&content, SocketKind::Tcp6));
     }
-    if let Ok(content) = fs::read_to_string(&udp6_path) {
+    if let Ok(content) = lens_core::read_policy::read_to_string(&udp6_path) {
         sockets.extend(parse_proc_net_tcp(&content, SocketKind::Udp6));
     }
-    if let Ok(content) = fs::read_to_string(&unix_path) {
+    if let Ok(content) = lens_core::read_policy::read_to_string(&unix_path) {
         sockets.extend(parse_proc_net_unix(&content));
     }
 

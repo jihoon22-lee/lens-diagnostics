@@ -835,3 +835,209 @@ fn lens_log_stats_returns_schema() {
     assert_eq!(data["schema"], "lens.log-stats/v1", "{data}");
     assert_eq!(data["by_level"]["error"], 1, "{data}");
 }
+
+#[test]
+fn stats_include_unknown_is_advertised_and_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("log");
+    std::fs::write(&path, "1970-01-01T00:00:00Z ERROR known\nunknown\n").unwrap();
+    for (include, expected) in [(false, 1), (true, 2)] {
+        let call = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"lens_log_stats", "arguments":{"path":path, "min_level":"warn", "since":"1970-01-01", "include_unknown":include}}}).to_string();
+        let responses = roundtrip(&[&call]);
+        let data: serde_json::Value = serde_json::from_str(
+            responses[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data["matched_lines"], expected);
+    }
+    let list = roundtrip(&[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#]);
+    let tool = list[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "lens_log_stats")
+        .unwrap();
+    assert_eq!(
+        tool["inputSchema"]["properties"]["include_unknown"]["type"],
+        "boolean"
+    );
+}
+
+#[test]
+fn bundle_diagnostics_survive_mcp_conversion() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("bad.lens");
+    lens_core::create_bundle_archive(
+        &bundle,
+        "test",
+        &[lens_core::BundleArtifact {
+            name: "reports/sys_snapshot.json".into(),
+            data: b"not json".to_vec(),
+        }],
+        vec!["collector failed".into()],
+        false,
+    )
+    .unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_bundle_diff","arguments":{"baseline":bundle,"candidate":bundle}}}).to_string();
+    let response = roundtrip(&[&call]);
+    let metadata: serde_json::Value = serde_json::from_str(
+        response[0]["result"]["content"][1]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["complete"], false);
+    let diagnostics = metadata["diagnostics"].as_array().unwrap();
+    assert!(diagnostics
+        .iter()
+        .any(|d| d.as_str().unwrap().contains("baseline: collector failed")));
+    assert!(diagnostics
+        .iter()
+        .any(|d| d.as_str().unwrap().contains("sys")));
+}
+
+#[test]
+fn huge_junit_failure_fits_wire_response_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("a.xml");
+    let cand = dir.path().join("b.xml");
+    std::fs::write(&base, "<testsuite><testcase name=\"a\"/></testsuite>").unwrap();
+    std::fs::write(
+        &cand,
+        format!(
+            "<testsuite><testcase name=\"a\"><failure message=\"{}\"/></testcase></testsuite>",
+            "huge".repeat(100_000)
+        ),
+    )
+    .unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_test_diff","arguments":{"baseline":base,"candidate":cand}}}).to_string();
+    let response = roundtrip(&[&call]);
+    assert!(response[0].to_string().len() <= 64 * 1024);
+    let metadata: serde_json::Value = serde_json::from_str(
+        response[0]["result"]["content"][1]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["findings_total"], 1);
+    assert_eq!(metadata["findings_truncated"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn allow_root_checks_dropins_globs_and_secondary_readers() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let external = outside.path().join("evidence");
+    std::fs::write(&external, "[Unit]\nAfter=x.service\n").unwrap();
+    std::fs::write(root.path().join("x.service"), "[Unit]\n").unwrap();
+    std::fs::create_dir(root.path().join("x.service.d")).unwrap();
+    symlink(&external, root.path().join("x.service.d/override.conf")).unwrap();
+    symlink(&external, root.path().join("x.xml")).unwrap();
+    std::fs::create_dir_all(root.path().join("etc")).unwrap();
+    symlink(&external, root.path().join("etc/ld.so.preload")).unwrap();
+    std::fs::create_dir_all(root.path().join("net")).unwrap();
+    symlink(&external, root.path().join("net/tcp")).unwrap();
+    std::fs::create_dir_all(root.path().join("lib/python3.12/site-packages")).unwrap();
+    symlink(&external, root.path().join("pyvenv.cfg")).unwrap();
+    let requests = [
+        (
+            "lens_sys_cycles",
+            serde_json::json!({"dir": root.path().join("x.service")}),
+        ),
+        (
+            "lens_test_diff",
+            serde_json::json!({"baseline":root.path().join("*.xml"),"candidate":root.path().join("*.xml")}),
+        ),
+        ("lens_doctor", serde_json::json!({"root_path": root.path()})),
+        (
+            "lens_net_inspect",
+            serde_json::json!({"proc_dir": root.path()}),
+        ),
+        (
+            "lens_env_check",
+            serde_json::json!({"venv_path": root.path()}),
+        ),
+    ];
+    for (name, arguments) in requests {
+        let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}}).to_string();
+        let response =
+            roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+        assert_eq!(
+            response[0]["result"]["isError"], true,
+            "{name}: {:?}",
+            response[0]
+        );
+        assert!(response[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("outside the allowed roots"));
+    }
+    // Both roots explicitly allowed: normal in-root aliases and drop-ins still work.
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_sys_cycles","arguments":{"dir":root.path()}}}).to_string();
+    let response = roundtrip_with_args(
+        &[&call],
+        &[
+            "--allow-root",
+            root.path().to_str().unwrap(),
+            "--allow-root",
+            outside.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        response[0]["result"].get("isError").is_none(),
+        "{:?}",
+        response[0]
+    );
+}
+#[cfg(unix)]
+#[test]
+fn allow_root_rejects_descendant_symlink_reads() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    std::fs::write(
+        external.path().join("secret.service"),
+        "[Unit]\nAfter=secret.service\n",
+    )
+    .unwrap();
+    std::fs::write(
+        external.path().join("secret.xml"),
+        "<testsuite><testcase name=\"secret\"/></testsuite>",
+    )
+    .unwrap();
+    symlink(
+        external.path().join("secret.service"),
+        root.path().join("secret.service"),
+    )
+    .unwrap();
+    symlink(
+        external.path().join("secret.xml"),
+        root.path().join("secret.xml"),
+    )
+    .unwrap();
+    let calls = [
+        ("lens_sys_cycles", serde_json::json!({"dir": root.path()})),
+        (
+            "lens_test_diff",
+            serde_json::json!({"baseline": root.path(), "candidate": root.path()}),
+        ),
+        (
+            "lens_doctor",
+            serde_json::json!({"root_path": root.path(), "systemd_dir": root.path()}),
+        ),
+    ];
+    for (name, arguments) in calls {
+        let call = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name": name, "arguments": arguments}}).to_string();
+        let responses =
+            roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+        assert_eq!(
+            responses[0]["result"]["isError"], true,
+            "{name}: {:?}",
+            responses[0]
+        );
+    }
+}
