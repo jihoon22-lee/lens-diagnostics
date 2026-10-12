@@ -329,7 +329,7 @@ where
 }
 
 /// Normalizes an archive entry name for comparison: strips a leading `./`.
-fn normalize_entry_name(name: &str) -> &str {
+pub fn normalize_entry_name(name: &str) -> &str {
     name.strip_prefix("./").unwrap_or(name)
 }
 

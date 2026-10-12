@@ -983,6 +983,7 @@ dependencies = [
 name = "lens-ops"
 version = "0.6.1"
 dependencies = [
+ "flate2",
  "lens-abi",
  "lens-build",
  "lens-core",
@@ -996,6 +997,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
 ]
 

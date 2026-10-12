@@ -644,6 +644,137 @@ fn allow_root_rejects_outside_and_accepts_inside() {
 }
 
 #[test]
+fn allow_root_requires_default_path_args() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_arg = dir.path().to_str().unwrap().to_string();
+    // With roots active, omitted proc_dir/root_path must not silently
+    // fall back to the host's /proc and /.
+    let responses = roundtrip_with_args(
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_net_inspect","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"lens_doctor","arguments":{}}}"#,
+        ],
+        &["--allow-root", &root_arg],
+    );
+    assert_eq!(responses.len(), 2);
+    let net = &responses[0]["result"];
+    assert_eq!(net["isError"], true, "{net}");
+    assert!(
+        net["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("proc_dir is required when --allow-root is set"),
+        "{net}"
+    );
+    let doctor = &responses[1]["result"];
+    assert_eq!(doctor["isError"], true, "{doctor}");
+    assert!(
+        doctor["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("root_path is required when --allow-root is set"),
+        "{doctor}"
+    );
+
+    // ...while a root covering the defaults keeps them usable.
+    let responses = roundtrip_with_args(
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lens_net_inspect","arguments":{}}}"#,
+        ],
+        &["--allow-root", "/"],
+    );
+    let r = &responses[0]["result"];
+    assert!(r.get("isError").is_none(), "{r}");
+    let data: serde_json::Value =
+        serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(data["schema_version"], "lens.net/v1", "{data}");
+}
+
+#[test]
+fn allow_root_doctor_accepts_root_contained_invocation() {
+    let dir = tempfile::tempdir().unwrap();
+    // A minimal root: doctor re-roots /proc, the systemd search dirs
+    // and /etc/ld.so.preload under it and skips host PATH inspection.
+    std::fs::create_dir_all(dir.path().join("proc")).unwrap();
+    std::fs::create_dir_all(dir.path().join("etc/systemd/system")).unwrap();
+    let root_arg = dir.path().to_str().unwrap().to_string();
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"lens_doctor","arguments":{{"root_path":{:?}}}}}}}"#,
+        dir.path().to_string_lossy()
+    );
+    let responses = roundtrip_with_args(&[&call], &["--allow-root", &root_arg]);
+    let r = &responses[0]["result"];
+    assert!(r.get("isError").is_none(), "{r}");
+    let data: serde_json::Value =
+        serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(data["schema_version"], "lens.doctor/v1", "{data}");
+}
+
+#[test]
+fn allow_root_build_impact_validates_compile_db_paths() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("main.c"), "int main(void){return 0;}\n").unwrap();
+    let inside_inc = root.path().join("inc");
+    std::fs::create_dir_all(&inside_inc).unwrap();
+    // Compile db inside the root whose entry pulls in a host include
+    // dir — the first offending path must be named in the error.
+    let bad_db = root.path().join("bad_commands.json");
+    std::fs::write(
+        &bad_db,
+        serde_json::json!([{
+            "directory": root.path().to_string_lossy(),
+            "file": "main.c",
+            "arguments": ["cc", "-I/usr/include", "main.c"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let ok_db = root.path().join("compile_commands.json");
+    std::fs::write(
+        &ok_db,
+        serde_json::json!([{
+            "directory": root.path().to_string_lossy(),
+            "file": "main.c",
+            "arguments": ["cc", format!("-I{}", inside_inc.display()), "main.c"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let root_arg = root.path().to_str().unwrap().to_string();
+    let call_bad = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"lens_build_impact","arguments":{{"compile_commands":{:?},"header":"main.c"}}}}}}"#,
+        bad_db.to_string_lossy()
+    );
+    let call_ok = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"lens_build_impact","arguments":{{"compile_commands":{:?},"header":"main.c"}}}}}}"#,
+        ok_db.to_string_lossy()
+    );
+    let responses = roundtrip_with_args(&[&call_bad, &call_ok], &["--allow-root", &root_arg]);
+    let bad = &responses[0]["result"];
+    assert_eq!(bad["isError"], true, "{bad}");
+    let text = bad["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("outside the allowed roots"), "{text}");
+    assert!(text.contains("/usr/include"), "{text}");
+    let ok = &responses[1]["result"];
+    assert!(ok.get("isError").is_none(), "{ok}");
+}
+
+#[test]
+fn null_id_gets_response_missing_id_does_not() {
+    // "id": null is a request — it must get a response with id: null.
+    // An absent `id` member is a notification and gets no response.
+    let responses = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#,
+    ]);
+    assert_eq!(responses.len(), 2, "{responses:?}");
+    assert!(responses[0]["id"].is_null(), "{:?}", responses[0]);
+    assert_eq!(responses[0]["result"], serde_json::json!({}));
+    assert_eq!(responses[1]["id"], 7);
+}
+
+#[test]
 fn prompts_list_and_get() {
     let list = roundtrip(&[r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list"}"#]);
     let prompts = list[0]["result"]["prompts"].as_array().unwrap();

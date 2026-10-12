@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lens_build::{
     diff_compilations, parse_command_entry, resolve_header_target, BuildDiff, BuildSnapshot,
@@ -19,6 +19,49 @@ fn load_graph(file: &Path) -> Result<(Vec<CompileCommandEntry>, Vec<ParsedUnit>,
         graph.add_translation_unit(unit);
     }
     Ok((entries, units, graph))
+}
+
+/// Every filesystem path the compile database makes a consumer read:
+/// each entry's `directory`, its `file`, and every include dir /
+/// forced include parsed from its command. Relative paths resolve
+/// against the entry's `directory`; a relative `directory` resolves
+/// against the database's parent. Callers that confine filesystem
+/// access (e.g. `lens-mcp --allow-root`) check this list before
+/// building the impact graph.
+pub fn referenced_paths(file: &Path) -> Result<Vec<PathBuf>> {
+    let entries: Vec<CompileCommandEntry> = json::read_json(file)?;
+    let db_dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut out = Vec::new();
+    for e in &entries {
+        let unit = parse_command_entry(e);
+        let dir = Path::new(&unit.directory);
+        let dir = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            db_dir.join(dir)
+        };
+        out.push(dir.clone());
+        let mut push_rel = |rel: &str| {
+            let p = Path::new(rel);
+            if p.is_absolute() {
+                out.push(p.to_path_buf());
+            } else {
+                out.push(dir.join(p));
+            }
+        };
+        push_rel(&unit.file);
+        for inc in &unit.includes {
+            push_rel(inc);
+        }
+        for fi in &unit.forced_includes {
+            push_rel(fi);
+        }
+    }
+    Ok(out)
 }
 
 /// Emit the full `buildscope.snapshot/v4` snapshot, including the

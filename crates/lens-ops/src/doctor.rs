@@ -247,28 +247,51 @@ pub fn check_storage(root: Option<&Path>, procfs: Option<&Path>) -> Vec<DoctorCh
         return checks;
     };
     let mut seen_fsid: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for (point, _fstype) in parse_mounts(&content) {
-        let path = Path::new(&point);
+    // Seed with /'s filesystem id: a bind mount or subvolume of the
+    // root filesystem exposed at another mountpoint must not get a
+    // second capacity check.
+    if let Some(fsid) = statvfs_fsid("/") {
+        seen_fsid.insert(fsid);
+    }
+    let pairs: Vec<(String, Option<u64>)> = parse_mounts(&content)
+        .into_iter()
+        .map(|(point, _fstype)| (point.clone(), statvfs_fsid(&point)))
+        .collect();
+    for point in dedupe_mounts(&pairs, &mut seen_fsid) {
+        checks.push(capacity_check(
+            Path::new(&point),
+            &format!("Disk Capacity {point}"),
+        ));
+    }
+    checks
+}
+
+/// statvfs `f_fsid` of a mount point, `None` when the call fails.
+fn statvfs_fsid(point: &str) -> Option<u64> {
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let c = std::ffi::CString::new(point.as_bytes()).ok()?;
+    (unsafe { libc::statvfs(c.as_ptr(), &mut stat) } == 0).then_some(stat.f_fsid)
+}
+
+/// Keep the mount points whose filesystem id is new to `seen_fsid`
+/// (skipping `/`, already covered by the root check). A `None` fsid
+/// (statvfs failed) dedupes by an artificial per-miss id so one bad
+/// mount cannot mask another's check. Extracted for testing.
+fn dedupe_mounts(
+    mounts: &[(String, Option<u64>)],
+    seen_fsid: &mut std::collections::HashSet<u64>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (point, fsid) in mounts {
         if point == "/" {
             continue; // already reported as Root Disk Capacity
         }
-        // Dedupe by filesystem id: several mount points can expose the
-        // same superblock (bind mounts, btrfs subvols) — one check each.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        let c = std::ffi::CString::new(point.as_bytes()).unwrap_or_default();
-        let fsid = if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } == 0 {
-            stat.f_fsid
-        } else {
-            // statvfs failed — dedupe by the mount path itself so one
-            // bad mount cannot mask another's check.
-            u64::MAX - seen_fsid.len() as u64
-        };
-        if !seen_fsid.insert(fsid) {
-            continue;
+        let id = fsid.unwrap_or(u64::MAX - seen_fsid.len() as u64);
+        if seen_fsid.insert(id) {
+            out.push(point.clone());
         }
-        checks.push(capacity_check(path, &format!("Disk Capacity {point}")));
     }
-    checks
+    out
 }
 
 pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
@@ -1077,6 +1100,38 @@ tmpfs /run tmpfs rw 0 0
         assert!(mounts.contains(&("/".to_string(), "overlay".to_string())));
         assert!(mounts.contains(&("/mnt/data disk".to_string(), "xfs".to_string())));
         assert_eq!(mounts.len(), 3, "{mounts:?}");
+    }
+
+    #[test]
+    fn dedupe_mounts_seeds_root_fsid() {
+        // A bind mount / btrfs subvolume of / shares the root fsid — it
+        // must not get a second capacity check of its own.
+        let mut seen: std::collections::HashSet<u64> = [42u64].into_iter().collect();
+        let pairs = vec![
+            ("/".to_string(), Some(42u64)),
+            ("/bind-of-root".to_string(), Some(42u64)),
+            ("/mnt/data".to_string(), Some(7u64)),
+            ("/unknown-fs".to_string(), None),
+        ];
+        let kept = dedupe_mounts(&pairs, &mut seen);
+        assert_eq!(
+            kept,
+            vec!["/mnt/data".to_string(), "/unknown-fs".to_string()]
+        );
+
+        // Without the root fsid seeded, / itself is skipped but its
+        // bind-mount twin would leak through — the seeding in
+        // check_storage is what prevents that second check.
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let kept = dedupe_mounts(&pairs, &mut seen);
+        assert_eq!(
+            kept,
+            vec![
+                "/bind-of-root".to_string(),
+                "/mnt/data".to_string(),
+                "/unknown-fs".to_string()
+            ]
+        );
     }
 
     #[test]

@@ -53,6 +53,56 @@ mod tests {
     }
 
     #[test]
+    fn hardlink_dedup_across_different_directories() {
+        // a/f and b/g are two names for one 5-byte inode; c/h is a
+        // separate 3-byte file. The root aggregate must count the
+        // shared inode once: 5 + 3 = 8, and the directory holding the
+        // later occurrence must aggregate 0 for it.
+        let dir = tempdir().unwrap();
+        for sub in ["a", "b", "c"] {
+            fs::create_dir(dir.path().join(sub)).unwrap();
+        }
+        fs::write(dir.path().join("a/f"), b"12345").unwrap();
+        if fs::hard_link(dir.path().join("a/f"), dir.path().join("b/g")).is_err() {
+            return; // filesystem without hardlink support
+        }
+        fs::write(dir.path().join("c/h"), b"xyz").unwrap();
+
+        let res = DiskScanner::new(ScanOptions::default())
+            .scan(dir.path())
+            .unwrap();
+        let root = &res.tree.nodes[res.root_id as usize];
+        assert_eq!(root.size, 8, "hardlink counted once + 3-byte file");
+
+        // Whichever subdir holds the *later* occurrence contributes 0;
+        // the other contributes 5. Find each subdir's aggregate.
+        let mut a_size = None;
+        let mut b_size = None;
+        let mut c_size = None;
+        for child in res.tree.children_ids(res.root_id) {
+            let node = &res.tree.nodes[child as usize];
+            match node.name.as_str() {
+                "a" => a_size = Some(node.size),
+                "b" => b_size = Some(node.size),
+                "c" => c_size = Some(node.size),
+                _ => {}
+            }
+        }
+        let (a_size, b_size, c_size) = (a_size.unwrap(), b_size.unwrap(), c_size.unwrap());
+        assert_eq!(a_size + b_size, 5, "shared inode counted once, not in both");
+        assert_eq!(c_size, 3);
+        // Both file nodes keep their own size.
+        let file_sizes: Vec<u64> = res
+            .tree
+            .children_ids(res.root_id)
+            .iter()
+            .flat_map(|d| res.tree.children_ids(*d))
+            .map(|f| res.tree.nodes[f as usize].size)
+            .collect();
+        assert_eq!(file_sizes, vec![5, 5, 3]);
+    }
+
+    #[test]
     fn test_duplicate_detection() {
         let dir = tempdir().unwrap();
         let f1 = dir.path().join("copy1.bin");

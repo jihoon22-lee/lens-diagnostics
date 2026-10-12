@@ -95,9 +95,50 @@ fn schema_of(value: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// Stream-parse just the first element of a `[`-starting file and check
+/// it for the compile_commands shape (`directory` + `file` keys).
+/// Deliberately not bounded by the 64 KiB sniff — a renamed compile db
+/// must still be recognized no matter where its first entry ends.
+fn first_array_element_has_compile_shape(path: &Path) -> bool {
+    use serde::de::{IgnoredAny, SeqAccess, Visitor};
+    use serde::Deserializer as _;
+    use std::fmt;
+
+    struct FirstElement;
+    impl<'de> Visitor<'de> for FirstElement {
+        type Value = Option<serde_json::Value>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON array")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let first = seq.next_element::<serde_json::Value>()?;
+            // Drain the rest cheaply so the deserializer sees the `]`.
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(first)
+        }
+    }
+
+    let Ok(f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(f));
+    let Ok(first) = de.deserialize_seq(FirstElement) else {
+        return false;
+    };
+    first
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .is_some_and(|o| o.contains_key("directory") && o.contains_key("file"))
+}
+
 /// Classify a path. First match wins; an unreadable/nonexistent path is
-/// an `Io` error (exit 2). A `Usage` error is returned for files that
-/// look structured but carry no recognized schema — a wrong guess would
+/// an `Io` error (exit 2). Files that merely look structured but carry
+/// no recognized schema classify as logs — guessing a domain would
 /// silently produce a meaningless report.
 pub fn detect(path: &Path) -> Result<InputKind> {
     let meta = fs::symlink_metadata(path).map_err(|e| LensError::Io {
@@ -156,48 +197,37 @@ pub fn detect(path: &Path) -> Result<InputKind> {
     let first_non_ws = head.iter().find(|b| !b.is_ascii_whitespace());
     match first_non_ws {
         Some(b'[') => {
-            // JSON array: compile_commands by name, or a parsed first
-            // element that carries `directory` + `file` keys.
+            // JSON array: compile_commands by name, or a first element
+            // carrying `directory` + `file` keys — stream-parsed so a
+            // renamed db larger than the 64 KiB sniff still detects.
             if path
                 .file_name()
                 .is_some_and(|n| n == "compile_commands.json")
+                || first_array_element_has_compile_shape(path)
             {
                 return Ok(InputKind::CompileDb);
-            }
-            if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&head) {
-                if arr
-                    .first()
-                    .and_then(|v| v.as_object())
-                    .is_some_and(|o| o.contains_key("directory") && o.contains_key("file"))
-                {
-                    return Ok(InputKind::CompileDb);
-                }
             }
             Ok(InputKind::Log)
         }
         Some(b'{') => {
             // A snapshot/report: parse the whole file and match the
-            // declared schema against the known producers.
-            let text = fs::read(path).map_err(|e| LensError::Io {
+            // declared schema against the known producers. Anything
+            // else that merely starts with `{` — JSONL streams,
+            // concatenated objects, foreign JSON — is just a log.
+            let f = fs::File::open(path).map_err(|e| LensError::Io {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-            let value: serde_json::Value =
-                serde_json::from_slice(&text).map_err(|_| LensError::Usage {
-                    message: format!(
-                        "{path:?}: unrecognized JSON input; pass --as to pick a domain"
-                    ),
-                })?;
+            let Ok(value) =
+                serde_json::from_reader::<_, serde_json::Value>(std::io::BufReader::new(f))
+            else {
+                return Ok(InputKind::Log);
+            };
             match schema_of(&value) {
                 Some(lens_env::SNAPSHOT_SCHEMA_V1) => Ok(InputKind::EnvSnapshot),
                 Some(lens_sys::SNAPSHOT_SCHEMA_V1) => Ok(InputKind::SysSnapshot),
                 Some(lens_net::REPORT_SCHEMA_V1) => Ok(InputKind::NetReport),
-                other => Err(LensError::Usage {
-                    message: format!(
-                        "{path:?}: unrecognized JSON input (schema {}); pass --as",
-                        other.unwrap_or("<missing>")
-                    ),
-                }),
+                _ => Ok(InputKind::Log),
             }
         }
         _ => {
@@ -327,12 +357,47 @@ mod tests {
     }
 
     #[test]
-    fn unknown_schema_json_is_a_usage_error() {
+    fn unknown_schema_json_is_a_log() {
         let dir = tempdir().unwrap();
         let p = write(dir.path(), "mystery.json", br#"{"schema":"other/v9"}"#);
-        let err = detect(&p).unwrap_err().to_string();
-        assert!(err.contains("unrecognized JSON input"), "{err}");
-        assert!(err.contains("pass --as"), "{err}");
+        assert_eq!(detect(&p).unwrap(), InputKind::Log);
+    }
+
+    #[test]
+    fn jsonl_and_malformed_objects_are_logs() {
+        let dir = tempdir().unwrap();
+        let jsonl = write(
+            dir.path(),
+            "events.jsonl",
+            br#"{"level":"info","msg":"one"}
+{"level":"warn","msg":"two"}
+"#,
+        );
+        assert_eq!(detect(&jsonl).unwrap(), InputKind::Log);
+        let broken = write(dir.path(), "truncated.log", br#"{"a": 1, "#);
+        assert_eq!(detect(&broken).unwrap(), InputKind::Log);
+    }
+
+    #[test]
+    fn renamed_compile_db_detects_past_the_sniff_window() {
+        let dir = tempdir().unwrap();
+        // First element's `file` key sits beyond the 64 KiB head read —
+        // detection must stream the first array element, not rely on
+        // the sniffed prefix.
+        let padding = "x".repeat(200 * 1024);
+        let db = format!(
+            r#"[{{"directory":"/tmp","command":"cc -c {0}","file":"{0}"}}]"#,
+            padding
+        );
+        let p = write(dir.path(), "renamed.json", db.as_bytes());
+        assert_eq!(detect(&p).unwrap(), InputKind::CompileDb);
+        // A renamed array without the compile shape is still a log.
+        let not_db = write(
+            dir.path(),
+            "also_renamed.json",
+            format!(r#"[{{"blob":"{padding}"}}]"#).as_bytes(),
+        );
+        assert_eq!(detect(&not_db).unwrap(), InputKind::Log);
     }
 
     #[test]

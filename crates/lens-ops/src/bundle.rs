@@ -361,10 +361,19 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
 
     let ins_a = inspect_bundle(base)?;
     let ins_b = inspect_bundle(cand)?;
-    let names_a: std::collections::BTreeSet<String> =
-        ins_a.entries.iter().map(|e| e.name.clone()).collect();
-    let names_b: std::collections::BTreeSet<String> =
-        ins_b.entries.iter().map(|e| e.name.clone()).collect();
+    // Compare under the same normalized names verification uses — a
+    // bundle packed with `./reports/…` must diff section-for-section
+    // against one packed with `reports/…`.
+    let names_a: std::collections::BTreeSet<String> = ins_a
+        .entries
+        .iter()
+        .map(|e| lens_core::normalize_entry_name(&e.name).to_string())
+        .collect();
+    let names_b: std::collections::BTreeSet<String> = ins_b
+        .entries
+        .iter()
+        .map(|e| lens_core::normalize_entry_name(&e.name).to_string())
+        .collect();
 
     let only_in_baseline: Vec<String> = names_a
         .difference(&names_b)
@@ -662,6 +671,71 @@ mod tests {
         assert!(codes.contains(&"test.regression"), "{codes:?}");
         assert!(codes.contains(&"bundle.only_in_baseline"), "{codes:?}");
         assert!(codes.contains(&"bundle.log_delta"), "{codes:?}");
+    }
+
+    /// Repack a bundle with a name mutation applied to each entry —
+    /// lets tests build `./`-prefixed archives `create_bundle_archive`
+    /// refuses to write.
+    fn repack_names(path: &std::path::Path, map: impl Fn(&str) -> String) {
+        use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let raw = std::fs::read(path).unwrap();
+        let mut archive = tar::Archive::new(GzDecoder::new(&raw[..]));
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for e in archive.entries().unwrap().flatten() {
+            let mut e = e;
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut e, &mut data).unwrap();
+            entries.push((e.path().unwrap().to_string_lossy().into_owned(), data));
+        }
+        let out = std::fs::File::create(path).unwrap();
+        let mut builder = tar::Builder::new(GzEncoder::new(out, Compression::default()));
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, map(&name), data.as_slice())
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn bundle_diff_normalizes_dot_slash_entry_names() {
+        let dir = tempfile::tempdir().unwrap();
+        // Baseline packed the "legacy" way: every entry ./-prefixed.
+        let a = bundle_with(
+            dir.path(),
+            "a.lens",
+            vec![json_artifact("reports/test_run.json", junit_run("passed"))],
+        );
+        repack_names(&a, |n| format!("./{n}"));
+        let b = bundle_with(
+            dir.path(),
+            "b.lens",
+            vec![json_artifact("reports/test_run.json", junit_run("failed"))],
+        );
+
+        let report = diff(&a, &b).unwrap();
+        // Sections must be matched under normalized names — no
+        // only_in_* noise purely from the `./` packing difference.
+        assert!(
+            report.data.sections.contains_key("test"),
+            "{:?}",
+            report.data.sections
+        );
+        assert!(
+            report.data.only_in_baseline.is_empty(),
+            "{:?}",
+            report.data.only_in_baseline
+        );
+        assert!(report.data.only_in_candidate.is_empty());
+        let codes: Vec<&str> = report.findings.iter().map(|f| f.code.as_str()).collect();
+        assert!(codes.contains(&"test.regression"), "{codes:?}");
     }
 
     #[test]

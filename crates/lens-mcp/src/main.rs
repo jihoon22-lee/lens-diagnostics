@@ -62,7 +62,30 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
+        let parsed: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                let err_resp = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: None,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32700,
+                        message: format!("Parse error: {}", e),
+                        data: None,
+                    }),
+                };
+                let out = serde_json::to_string(&err_resp)?;
+                writeln!(stdout, "{}", out)?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+        // `"id": null` and a missing `id` differ in JSON-RPC: the null
+        // is a present id (response carries `id: null`), absence makes
+        // the request a notification (no response at all).
+        let id_present = parsed.get("id").is_some();
+        let req: JsonRpcRequest = match serde_json::from_value(parsed) {
             Ok(r) => r,
             Err(e) => {
                 let err_resp = JsonRpcResponse {
@@ -82,7 +105,7 @@ fn main() -> io::Result<()> {
             }
         };
 
-        let resp = handle_request(&req);
+        let resp = handle_request(&req, id_present);
         if let Some(r) = resp {
             let out = serde_json::to_string(&r)?;
             writeln!(stdout, "{}", out)?;
@@ -98,10 +121,15 @@ fn main() -> io::Result<()> {
 /// newest supported one.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
-    // A JSON-RPC notification (no `id`) never gets a response — for any
-    // method, including tools/call and unknown methods.
-    req.id.as_ref()?;
+fn handle_request(req: &JsonRpcRequest, id_present: bool) -> Option<JsonRpcResponse> {
+    // A JSON-RPC notification (no `id` member) never gets a response —
+    // for any method, including tools/call and unknown methods. An
+    // `id` member that IS present (even null) expects a response whose
+    // `id` echoes it (`Some(Value::Null)` → `"id":null`).
+    if !id_present {
+        return None;
+    }
+    let rid = Some(req.id.clone().unwrap_or(Value::Null));
     match req.method.as_str() {
         "initialize" => {
             let protocol_version = req
@@ -113,7 +141,7 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                 .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0]);
             Some(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
-                id: req.id.clone(),
+                id: rid.clone(),
                 result: Some(serde_json::json!({
                     "protocolVersion": protocol_version,
                     "capabilities": {
@@ -132,7 +160,7 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
         // MCP ping: an empty result keeps the session liveness check cheap.
         "ping" => Some(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
-            id: req.id.clone(),
+            id: rid.clone(),
             result: Some(serde_json::json!({})),
             error: None,
         }),
@@ -140,7 +168,7 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
             let tools = list_tools();
             Some(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
-                id: req.id.clone(),
+                id: rid.clone(),
                 result: Some(serde_json::json!({
                     "tools": tools
                 })),
@@ -149,7 +177,7 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
         }
         "prompts/list" => Some(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
-            id: req.id.clone(),
+            id: rid.clone(),
             result: Some(list_prompts()),
             error: None,
         }),
@@ -160,13 +188,13 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
             match get_prompt(name, args) {
                 Ok(prompt) => Some(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
-                    id: req.id.clone(),
+                    id: rid.clone(),
                     result: Some(prompt),
                     error: None,
                 }),
                 Err(e) => Some(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
-                    id: req.id.clone(),
+                    id: rid.clone(),
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32602,
@@ -187,7 +215,7 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
             if !list_tools().iter().any(|t| t.name == name) {
                 Some(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
-                    id: req.id.clone(),
+                    id: rid.clone(),
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32602,
@@ -213,14 +241,14 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                         }
                         Some(JsonRpcResponse {
                             jsonrpc: "2.0".to_string(),
-                            id: req.id.clone(),
+                            id: rid.clone(),
                             result: Some(serde_json::json!({ "content": content })),
                             error: None,
                         })
                     }
                     Err(err) => Some(JsonRpcResponse {
                         jsonrpc: "2.0".to_string(),
-                        id: req.id.clone(),
+                        id: rid.clone(),
                         result: Some(serde_json::json!({
                             "content": [
                                 {
@@ -235,9 +263,9 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                 }
             }
         }
-        _ => req.id.as_ref().map(|id| JsonRpcResponse {
+        _ => Some(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
-            id: Some(id.clone()),
+            id: rid,
             result: None,
             error: Some(JsonRpcError {
                 code: -32601,

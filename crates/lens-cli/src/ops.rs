@@ -858,8 +858,18 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     total_lines += indexer.len();
                     total_lossy += indexer.lossy_lines();
                     let label = path.to_string_lossy();
+                    // In --follow mode an unterminated tail line is not
+                    // emitted by the initial pass — it is re-read once
+                    // completed by a later append.
+                    let scan_lines =
+                        if follow && !indexer.is_empty() && !indexer.as_bytes().ends_with(b"\n") {
+                            indexer.len() - 1
+                        } else {
+                            indexer.len()
+                        };
                     let res = filter_log_lines(
                         &indexer, &label, multi, &filter, context, budget, jsonl_mode, json_mode,
+                        scan_lines,
                     );
                     matched += res.matched;
                     excluded_unknown += res.excluded_unknown;
@@ -899,9 +909,20 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
 
                 if follow && !stopped {
                     let indexer = follow_indexer.unwrap();
-                    let mut follower =
-                        log::Follower::new(&paths[0], indexer.as_bytes().len() as u64)?;
-                    let mut line_no = indexer.len();
+                    // Resume exactly at the unterminated tail: the partial
+                    // line's bytes belong to the next appended line, so
+                    // the follower starts where it begins (not at EOF)
+                    // and its line number is the next one.
+                    let (follow_offset, mut line_no) =
+                        if !indexer.is_empty() && !indexer.as_bytes().ends_with(b"\n") {
+                            (
+                                indexer.line_offset(indexer.len() - 1).unwrap_or(0) as u64,
+                                indexer.len() - 1,
+                            )
+                        } else {
+                            (indexer.as_bytes().len() as u64, indexer.len())
+                        };
+                    let mut follower = log::Follower::new(&paths[0], follow_offset)?;
                     'follow: loop {
                         std::thread::sleep(std::time::Duration::from_millis(250));
                         let poll = follower.poll()?;
@@ -1870,6 +1891,7 @@ fn filter_log_lines(
     limit: Option<usize>,
     jsonl_mode: bool,
     json_mode: bool,
+    scan_lines: usize,
 ) -> LogFileFilterOut {
     let mut matched = 0usize;
     let mut excluded_unknown = 0usize;
@@ -1935,7 +1957,7 @@ fn filter_log_lines(
         }
     };
 
-    for idx in 0..indexer.len() {
+    for idx in 0..scan_lines {
         // After --limit, only the owed trailing context is emitted.
         if limited && after_left == 0 {
             break;

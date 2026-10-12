@@ -197,6 +197,22 @@ fn tool_path(args: &Value, key: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// True once `--allow-root` installed a non-empty root list.
+fn roots_active() -> bool {
+    ALLOWED_ROOTS.get().is_some_and(|r| !r.is_empty())
+}
+
+/// When roots are active, an *omitted* path argument must not silently
+/// fall back to a host path — unless that default location is itself
+/// inside an allowed root (e.g. the caller allowed `/`).
+fn require_allowed_default(default: &Path, arg: &str) -> Result<(), String> {
+    if roots_active() && check_allowed(default).is_err() {
+        Err(format!("{arg} is required when --allow-root is set"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Optional-path variant of [`tool_path`] for `proc_dir`, `root_path`,
 /// `systemd_dir` — absent key → `None`; present → resolved + checked.
 fn tool_opt_path(args: &Value, key: &str) -> Result<Option<PathBuf>, String> {
@@ -433,6 +449,14 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
         "lens_build_impact" => {
             let file = tool_path(args, "compile_commands")?;
             let header = arg_str(args, "header")?;
+            // The database itself is checked, but it *references* paths
+            // — source files, include dirs, forced includes — that the
+            // graph builder then reads. Confine those too.
+            if roots_active() {
+                for p in lens_ops::build::referenced_paths(&file).map_err(|e| e.to_string())? {
+                    check_allowed(&p)?;
+                }
+            }
             lens_ops::build::impact(&file, header)
                 .map(ToolOutcome::from)
                 .map_err(|e| e.to_string())
@@ -465,6 +489,11 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
         }
         "lens_net_inspect" => {
             let proc_dir = tool_opt_path(args, "proc_dir")?;
+            // Without proc_dir the tool reads the host /proc — require
+            // it explicitly when that default escapes the sandbox.
+            if proc_dir.is_none() {
+                require_allowed_default(Path::new("/proc"), "proc_dir")?;
+            }
             lens_ops::net::inspect(proc_dir.as_deref(), false)
                 .map(ToolOutcome::from)
                 .map_err(|e| e.to_string())
@@ -489,6 +518,12 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             let root_path = tool_opt_path(args, "root_path")?;
             let proc_dir = tool_opt_path(args, "proc_dir")?;
             let systemd_dir = tool_opt_path(args, "systemd_dir")?;
+            // With a root_path, every doctor input derives under it
+            // (<root>/proc, re-rooted systemd dirs, <root>/etc/…); a
+            // host-scoped run without one is unreachable in a sandbox.
+            if root_path.is_none() {
+                require_allowed_default(Path::new("/"), "root_path")?;
+            }
             lens_ops::doctor::run(
                 root_path.as_deref(),
                 proc_dir.as_deref(),
@@ -509,19 +544,35 @@ pub struct ToolOutput {
     pub findings: Option<String>,
 }
 
+/// The findings content item is bounded like the data item: the same
+/// `limit` argument caps the list, `findings_total`/`findings_truncated`
+/// keep the full count honest, and an oversized serialization falls
+/// back to the clamped array limit.
+fn serialize_findings(outcome: &ToolOutcome, args: &Value) -> Option<String> {
+    if outcome.findings.is_empty() && outcome.complete {
+        return None;
+    }
+    let total = outcome.findings.len();
+    let emit = |cap: usize| {
+        let shown = total.min(cap);
+        serde_json::json!({
+            "findings": &outcome.findings[..shown],
+            "findings_total": total,
+            "findings_truncated": total > shown,
+            "complete": outcome.complete,
+        })
+        .to_string()
+    };
+    let mut text = emit(arg_usize(args, "limit", DEFAULT_ARRAY_LIMIT));
+    if text.len() > MAX_RESPONSE_BYTES {
+        text = emit(CLAMPED_ARRAY_LIMIT);
+    }
+    Some(text)
+}
+
 pub fn execute_tool(name: &str, args: &Value) -> Result<ToolOutput, String> {
     let outcome = execute_tool_value(name, args)?;
-    let findings = if !outcome.findings.is_empty() || !outcome.complete {
-        Some(
-            serde_json::json!({
-                "findings": outcome.findings,
-                "complete": outcome.complete,
-            })
-            .to_string(),
-        )
-    } else {
-        None
-    };
+    let findings = serialize_findings(&outcome, args);
     Ok(ToolOutput {
         data: serialize_result(outcome.value, args)?,
         findings,
@@ -615,5 +666,54 @@ mod tests {
         // the first items again.
         assert_eq!(out["matches"], json!(["m1", "m2"]));
         assert!(out.get("_self_paginated").is_none());
+    }
+
+    #[test]
+    fn findings_item_is_capped_and_reports_total() {
+        let many: Vec<lens_ops::Finding> = (0..1000)
+            .map(|i| lens_ops::Finding {
+                severity: lens_ops::Severity::Warn,
+                code: "x.finding".to_string(),
+                message: format!("finding number {i}"),
+            })
+            .collect();
+        let outcome = ToolOutcome {
+            value: json!({}),
+            findings: many,
+            complete: true,
+        };
+        let text = serialize_findings(&outcome, &json!({})).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["findings_total"], 1000);
+        assert_eq!(v["findings_truncated"], true);
+        assert_eq!(v["findings"].as_array().unwrap().len(), DEFAULT_ARRAY_LIMIT);
+
+        // `limit` is honored; a pathological case still fits the byte
+        // budget after clamping.
+        let text = serialize_findings(&outcome, &json!({"limit": 3})).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["findings"].as_array().unwrap().len(), 3);
+        assert_eq!(v["findings_total"], 1000);
+
+        let huge: Vec<lens_ops::Finding> = (0..1000)
+            .map(|i| lens_ops::Finding {
+                severity: lens_ops::Severity::Fail,
+                code: "x.finding".to_string(),
+                message: format!("{}:{}", i, "y".repeat(2000)),
+            })
+            .collect();
+        let outcome = ToolOutcome {
+            value: json!({}),
+            findings: huge,
+            complete: true,
+        };
+        let text = serialize_findings(&outcome, &json!({})).unwrap();
+        assert!(
+            text.len() <= MAX_RESPONSE_BYTES,
+            "clamped findings item exceeded budget: {}",
+            text.len()
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["findings"].as_array().unwrap().len(), CLAMPED_ARRAY_LIMIT);
     }
 }

@@ -77,7 +77,9 @@ lens inspect <path> [--as abi|test|trace|build|sys|env|net|log|disk|bundle]
 lens diff <a> <b> [--as ...]
 ```
 
-판별 규칙(파일은 처음 64 KiB만 읽음):
+판별 규칙(파일은 처음 64 KiB만 읽는다. 단, `compile_commands.json`으로
+이름이 지정되지 않은 JSON 배열은 첫 원소를 스트리밍으로 파싱하므로
+64 KiB를 넘는 compile DB도 인식된다):
 
 | 입력 | 판별 | inspect 매핑 | diff 매핑 |
 |------|------|--------------|-----------|
@@ -89,12 +91,12 @@ lens diff <a> <b> [--as ...]
 | `.service`/`.socket`/`.target`/`.timer`/`.mount`/`.path`/`.slice` 단위 확장자 | SystemdDir(디렉터리)/SystemdUnit(파일) | `sys inspect` | `sys diff` (Dir/Unit/SysSnapshot 조합) |
 | `.lens` 또는 gzip 매직 + 유효한 번들 매니페스트 | Bundle | `bundle inspect` | 미지원(usage 오류) |
 | 스냅샷 JSON(`schema`/`schema_version` 매칭) | EnvSnapshot/SysSnapshot/NetReport | 오류 — "already a snapshot; use `lens diff`" | `env diff`/`sys diff`/`net diff` (같은 스키마끼리) |
-| 그 외 텍스트/`.gz` | Log | `log inspect` | — |
+| 그 외 텍스트/`.gz`, JSONL·연결된 객체·스키마 미상 JSON 등 구조화돼 보이지만 인식되지 않는 입력 | Log | `log inspect` | — |
 | 그 외 디렉터리 | Directory | `disk scan` | — |
 
 호환되지 않는 쌍은 usage 오류다(`cannot diff <a> with <b>; pass --as`,
-exit 2). 스키마를 인식하지 못한 JSON 입력도 usage 오류다
-(`unrecognized JSON input (schema …); pass --as`).
+exit 2). 스키마를 인식하지 못한 JSON 입력(한 줄 JSONL 포함)은 오류가
+아니라 Log로 판별된다.
 
 `lens diff`와 `lens env diff`는 venv 디렉터리와 env 스냅샷 JSON을
 자유롭게 섞어 비교할 수 있다(디렉터리는 그 자리에서 inspect된다).

@@ -23,7 +23,7 @@ pub mod json;
 pub mod time;
 
 pub use bundle::{
-    create_bundle_archive, extract_bundle, inspect_bundle, read_bundle_entry,
+    create_bundle_archive, extract_bundle, inspect_bundle, normalize_entry_name, read_bundle_entry,
     verify_bundle_archive, BundleArtifact, BundleInspection, BundleManifest,
     BundleVerificationReport, BUNDLE_SCHEMA_V2,
 };

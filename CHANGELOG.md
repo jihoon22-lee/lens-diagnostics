@@ -108,6 +108,28 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
 - `id` 없는 JSON-RPC 요청(노티피케이션)에는 어떤 메서드에도 응답하지
   않는다(이전에는 `initialize`/`tools/call` 등에도 응답했다). 파싱
   오류는 계속 `id: null` 에러를 반환한다.
+- `lens-mcp --allow-root`에서 생략된 경로 인자가 호스트 기본값을 읽지
+  않는다 — `lens_net_inspect`는 `proc_dir`, `lens_doctor`는
+  `root_path`가 필요하다(기본값 자체가 허용 루트 안이면 예외).
+  `lens_build_impact`는 compile DB의 `directory`/`file`/include
+  디렉터리/`-include` 경로를 모두 루트 안으로 검증한다.
+- `lens log stats`가 연도 없는 syslog 타임스탬프를 `--year`에 지정된
+  연도로 집계한다(이전에는 항상 현재 연도로 해석됐다).
+- `lens inspect`/`lens diff` 입력 판별이 `{`로 시작하는 비스냅샷
+  JSON·JSONL을 usage 오류 대신 Log로 판별한다. 이름이 다른 compile
+  DB도 첫 배열 원소를 스트리밍 파싱해 64 KiB를 넘어도 인식한다.
+- `log filter --follow`가 개행 없이 끝나는 마지막 줄을 초기 패스에서
+  내지 않는다 — append로 완성될 때 한 번만 번호가 매겨진다.
+- doctor의 마운트별 용량 검사가 `/`의 파일시스템 ID를 먼저 등록한다 —
+  `/`의 바인드 마운트·서브볼륨이 중복 용량 검사를 만들지 않는다.
+- JSON-RPC 요청의 `"id": null`은 누락된 `id`와 구분된다 — null id에도
+  `id: null`로 응답하고, `id` 멤버가 아예 없을 때만 노티피케이션이다.
+- MCP findings content 아이템이 `limit`(기본 200)으로 제한되고
+  `findings_total`/`findings_truncated`를 보고한다 — 대량 findings가
+  응답 크기 상한을 넘기지 않는다.
+- `bundle diff`가 `./`로 시작하는 엔트리 이름을 verify와 같은 규칙으로
+  정규화한다 — `./reports/…`로 패킹된 번들이 정상 이름의 번들과
+  섹션별로 비교된다(`only_in_*` 오탐 없음).
 
 ### Breaking changes
 

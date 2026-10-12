@@ -325,7 +325,11 @@ pub fn stats(
             *by_level
                 .entry(record.level.as_str().to_string())
                 .or_insert(0) += 1;
-            let ts = record.timestamp_ms as i64;
+            // Aggregation uses the filter's syslog_year — `parse_line`
+            // would stamp yearless syslog lines with the *current*
+            // year, scattering them into wrong buckets under --year.
+            let ts =
+                lens_log::timestamp::extract_timestamp_ms(&line, filter.syslog_year).unwrap_or(0);
             if ts <= 0 {
                 unknown_timestamp += 1;
             } else {
@@ -513,6 +517,26 @@ mod tests {
         let report = stats(&[p], &filter, Some(3600)).unwrap();
         assert_eq!(report.data.matched_lines, 3);
         assert_eq!(report.data.total_lines, 6);
+    }
+
+    #[test]
+    fn stats_buckets_use_configured_syslog_year() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("y.log");
+        // Yearless syslog lines must aggregate under the filter's year,
+        // not the host's current year.
+        write(
+            &p,
+            b"Oct  9 13:15:00 h kernel: <6>one\nOct  9 13:45:00 h kernel: <4>two\n",
+        );
+        let filter = LogFilter::new().with_syslog_year(2020);
+        let report = stats(std::slice::from_ref(&p), &filter, Some(3600)).unwrap();
+        let s = &report.data;
+        assert_eq!(s.first_ts.as_deref(), Some("2020-10-09T13:15:00Z"));
+        assert_eq!(s.last_ts.as_deref(), Some("2020-10-09T13:45:00Z"));
+        assert_eq!(s.buckets.len(), 1);
+        assert_eq!(s.buckets[0].start, "2020-10-09T13:00:00Z");
+        assert_eq!(s.buckets[0].total, 2);
     }
 
     #[test]

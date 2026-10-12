@@ -2915,6 +2915,69 @@ fn log_filter_follow_emits_appended_lines() {
 }
 
 #[test]
+fn log_filter_follow_defers_unterminated_tail_line() {
+    let dir = tmp_dir("log-follow-partial");
+    let log_path = dir.join("f.log");
+    // The file ends without a newline: "partial" must not be emitted by
+    // the initial pass; it becomes line 2 once an append completes it.
+    std::fs::write(&log_path, "a hit\npartial").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lens"))
+        .args([
+            "log",
+            "filter",
+            log_path.to_str().unwrap(),
+            "--query",
+            "hit",
+            "--follow",
+            "--limit",
+            "2",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn lens");
+
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(f, " hit").unwrap();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(s) => break s,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                panic!("follow did not stop after --limit was reached");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    assert!(status.success());
+    let mut stdout = String::new();
+    use std::io::Read as _;
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(stdout.contains("[1] a hit"), "{stdout}");
+    assert!(stdout.contains("[2] partial hit"), "{stdout}");
+    // The unterminated tail must appear exactly once, completed.
+    assert!(
+        !stdout.lines().any(|l| l.ends_with("] partial")),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn log_filter_follow_rejects_bad_combinations() {
     let dir = tmp_dir("log-follow-bad");
     let a = dir.join("a.log");

@@ -152,6 +152,12 @@ impl LogIndexer {
         Some(&self.data.data()[span.offset..span.offset + span.length])
     }
 
+    /// Byte offset where `index`'s line starts in the backing buffer —
+    /// used by `--follow` to resume exactly at an unterminated tail.
+    pub fn line_offset(&self, index: usize) -> Option<usize> {
+        self.spans.get(index).map(|s| s.offset)
+    }
+
     /// The full backing bytes — decoded content for `.gz`/stdin inputs.
     pub fn as_bytes(&self) -> &[u8] {
         self.data.data()

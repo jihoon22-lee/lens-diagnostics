@@ -106,7 +106,7 @@ pub fn list_tools() -> Vec<McpTool> {
             ),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {
+                "properties": with_pag(serde_json::json!({
                     "path": { "type": "string", "description": "Path to log file" },
                     "bucket": { "type": "string", "description": "Histogram bucket width: 1m|5m|15m|1h|1d (default: auto-picked, ~60 buckets)" },
                     "query": { "type": "string", "description": "Case-insensitive substring query" },
@@ -115,7 +115,7 @@ pub fn list_tools() -> Vec<McpTool> {
                     "since": { "type": "string", "description": "Only lines at/after this timestamp (RFC 3339, 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD', UTC)" },
                     "until": { "type": "string", "description": "Only lines at/before this timestamp; same forms as 'since'" },
                     "year": { "type": "integer", "description": "Year assumed for year-less syslog timestamps (default: current year)" }
-                },
+                }).as_object().unwrap().clone()),
                 "required": ["path"]
             }),
         },
