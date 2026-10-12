@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lens_core::{LensError, Result};
+use lens_core::{glob::glob_match, LensError, Result};
 use lens_test::{diff_test_runs, parse_junit_xml, TestDiff, TestRun};
 
 use crate::{Report, Severity};
@@ -124,32 +124,4 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<TestDiff>> {
         );
     }
     Ok(report)
-}
-
-/// Minimal `*`/`?` filename matcher (no recursion into subdirectories).
-fn glob_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    let (mut pi, mut ni) = (0usize, 0usize);
-    let (mut star, mut star_next) = (usize::MAX, 0usize);
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = pi;
-            star_next = ni;
-            pi += 1;
-        } else if star != usize::MAX {
-            pi = star + 1;
-            star_next += 1;
-            ni = star_next;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }

@@ -22,6 +22,18 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
   JSON의 `schema`/`schema_version`을 생산자 값과 비교하고, 다른
   스키마의 파일을 넣으면 `expected schema` 오류(exit 2)로 거부한다.
 - MCP `lens_test_diff`가 글롭 입력도 받는다(CLI와 같은 입력 확장).
+- 전역 CLI 옵션: `--format text|json|jsonl`, `--json`, `--fail-on
+  warn|fail`, `-q/--quiet`가 `Cli`의 global 인자가 됐다 — 서브커맨드
+  앞·뒤 어느 쪽에 두어도 동일하게 파싱된다. `-q`는 비오류 stderr
+  진단만 끄고 stdout과 실제 오류 출력은 그대로다.
+- 최상위 `lens inspect <path>` / `lens diff <a> <b>`: 입력을 자동
+  판별(ELF·JUnit·strace·compile_commands·venv·systemd·스냅샷
+  JSON·번들·로그·디렉터리)해 해당 도메인 명령과 동일한 출력·종료
+  코드를 낸다. `--as`로 판별을 강제할 수 있다.
+- `disk duplicates`에 `--exclude`(반복), `-x/--one-file-system`,
+  `--max-depth` 추가 — `disk scan`과 같은 스캔 범위 제한을 지원한다.
+- `env diff`와 `lens diff`가 venv 디렉터리를 입력으로 받는다 —
+  디렉터리는 그 자리에서 inspect돼 스냅샷 JSON과 자유롭게 혼합된다.
 
 ### 수정
 
@@ -50,6 +62,12 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
 - `bundle extract`가 단일 패스로 스테이징·검증한다. 목적지의
   심볼링크는 절대 따라가지 않고(`--force`여도 심볼링크·디렉터리
   덮어쓰기 거부), 검증 실패 시 스테이징된 파일은 남지 않는다.
+- `disk scan` 디렉터리 집계에서 `hard_link_count > 1`인 같은 inode를
+  한 번만 계산한다 — 하드링크가 있는 트리의 `size`·`allocated_size`
+  합계가 실제 사용량으로 줄어든다(파일 노드 자체는 변경 없음).
+- 사용자가 지정한 `disk scan --max-depth`는 더 이상 스캔 오류가 아니다
+  — `complete`가 true로 유지돼 exit 0이고, 텍스트 출력에 절단된
+  디렉터리 수가 표시된다(기본 안전 상한 512 도달은 여전히 불완전).
 - MCP `initialize`의 프로토콜 협상이 지원 버전(`2025-06-18`,
   `2025-03-26`, `2024-11-05`)만 에코하고, 미지원·누락 버전에는
   `2025-06-18`로 응답한다(이전에는 임의 버전을 그대로 에코하고
@@ -74,6 +92,13 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
   `_pagination` 메타데이터로 대체됐다.
 - 스키마가 다른 JSON을 diff 입력으로 주면 exit 2다(이전에는 잘못된
   스키마로 역직렬화되거나 모호한 오류가 났다).
+- `disk scan --exclude` 의미론: `/` 포함 패턴은 스캔 루트 상대 경로
+  글롭, `*`/`?` 포함은 이름 글롭, 그 외는 이름 정확 일치로 바뀌었다
+  (이전에는 이름 부분 문자열 매칭이라 `.git`이 `.github`·`.gitignore`도
+  제외했다). 같은 규칙이 `disk duplicates --exclude`에도 적용된다.
+- `--fail-on`이 전역 옵션이 됐다 — 이제 `doctor`뿐 아니라 모든 명령에
+  적용된다(기본 `fail`은 변경 없음). 옵션을 서브커맨드 뒤에 두는 기존
+  호출 형태는 계속 유효하다.
 
 ## 0.6.1
 

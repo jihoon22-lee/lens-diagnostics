@@ -1,9 +1,10 @@
 use crate::cli::*;
 use crate::doctor::HealthStatus;
-use crate::output::outln;
+use crate::output::{diagln, outln};
 use lens_core::{to_deterministic_pretty, Result};
 use lens_disk::{SnapshotV2, TrashManager};
 use lens_log::parse_line;
+use lens_ops::detect::InputKind;
 use lens_ops::{abi, build, bundle, disk, doctor, env, log, net, sys, test, trace};
 use lens_ops::{Finding, Report, Severity};
 use std::path::{Path, PathBuf};
@@ -99,14 +100,280 @@ pub enum Outcome {
     Findings,
 }
 
-pub fn dispatch(command: Commands) -> Result<Outcome> {
+fn usage(msg: impl Into<String>) -> lens_core::LensError {
+    lens_core::LensError::Usage {
+        message: msg.into(),
+    }
+}
+
+/// The diffable/inspectable domain a detected input belongs to. Several
+/// kinds can share one domain (e.g. SystemdDir, SystemdUnit and
+/// SysSnapshot are all `Sys`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Domain {
+    Abi,
+    Test,
+    Trace,
+    Build,
+    Sys,
+    Env,
+    Net,
+    Bundle,
+    Log,
+    Disk,
+}
+
+impl Domain {
+    fn name(self) -> &'static str {
+        match self {
+            Domain::Abi => "abi",
+            Domain::Test => "test",
+            Domain::Trace => "trace",
+            Domain::Build => "build",
+            Domain::Sys => "sys",
+            Domain::Env => "env",
+            Domain::Net => "net",
+            Domain::Bundle => "bundle",
+            Domain::Log => "log",
+            Domain::Disk => "disk",
+        }
+    }
+}
+
+fn domain_of(kind: InputKind) -> Domain {
+    match kind {
+        InputKind::Elf => Domain::Abi,
+        InputKind::Junit => Domain::Test,
+        InputKind::Strace => Domain::Trace,
+        InputKind::CompileDb => Domain::Build,
+        InputKind::Venv | InputKind::EnvSnapshot => Domain::Env,
+        InputKind::SystemdDir | InputKind::SystemdUnit | InputKind::SysSnapshot => Domain::Sys,
+        InputKind::NetReport => Domain::Net,
+        InputKind::Bundle => Domain::Bundle,
+        InputKind::Log => Domain::Log,
+        InputKind::Directory => Domain::Disk,
+    }
+}
+
+fn domain_of_as(as_kind: AsKind) -> Domain {
+    match as_kind {
+        AsKind::Abi => Domain::Abi,
+        AsKind::Test => Domain::Test,
+        AsKind::Trace => Domain::Trace,
+        AsKind::Build => Domain::Build,
+        AsKind::Sys => Domain::Sys,
+        AsKind::Env => Domain::Env,
+        AsKind::Net => Domain::Net,
+        AsKind::Log => Domain::Log,
+        AsKind::Disk => Domain::Disk,
+        AsKind::Bundle => Domain::Bundle,
+    }
+}
+
+fn kind_name(kind: InputKind) -> &'static str {
+    match kind {
+        InputKind::Elf => "elf",
+        InputKind::Junit => "junit",
+        InputKind::Strace => "strace",
+        InputKind::CompileDb => "compile_commands",
+        InputKind::Venv => "venv",
+        InputKind::SystemdDir => "systemd dir",
+        InputKind::SystemdUnit => "systemd unit",
+        InputKind::SysSnapshot => "sys snapshot",
+        InputKind::EnvSnapshot => "env snapshot",
+        InputKind::NetReport => "net report",
+        InputKind::Bundle => "bundle",
+        InputKind::Log => "log",
+        InputKind::Directory => "directory",
+    }
+}
+
+fn inspect_command(path: &Path, domain: Domain) -> Result<Commands> {
+    let p = path.to_path_buf();
+    Ok(match domain {
+        Domain::Abi => Commands::Abi {
+            action: AbiCommands::Inspect { binary: p },
+        },
+        Domain::Test => Commands::Test {
+            action: TestCommands::Parse {
+                file: p,
+                project: "default".to_string(),
+            },
+        },
+        Domain::Trace => Commands::Trace {
+            action: TraceCommands::Analyze { trace_file: p },
+        },
+        Domain::Build => Commands::Build {
+            action: BuildCommands::Inspect { file: p },
+        },
+        Domain::Sys => Commands::Sys {
+            action: SysCommands::Inspect { path: Some(p) },
+        },
+        Domain::Env => Commands::Env {
+            action: EnvCommands::Inspect {
+                venv_path: p,
+                project: None,
+            },
+        },
+        Domain::Bundle => Commands::Bundle {
+            action: BundleCommands::Inspect { bundle: p },
+        },
+        Domain::Log => Commands::Log {
+            action: LogCommands::Inspect { path: p },
+        },
+        Domain::Disk => Commands::Disk {
+            action: DiskCommands::Scan {
+                path: p,
+                parallel: false,
+                max_depth: None,
+                exclude: Vec::new(),
+                one_file_system: false,
+                top: 0,
+            },
+        },
+        Domain::Net => {
+            // `net inspect` reads live procfs; a detected/--as'd net
+            // input is a snapshot file, which is a diff input.
+            return Err(usage("already a snapshot; use `lens diff`"));
+        }
+    })
+}
+
+fn diff_command(domain: Domain, baseline: &Path, candidate: &Path) -> Result<Commands> {
+    let a = baseline.to_path_buf();
+    let b = candidate.to_path_buf();
+    Ok(match domain {
+        Domain::Abi => Commands::Abi {
+            action: AbiCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
+        Domain::Test => Commands::Test {
+            action: TestCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
+        Domain::Trace => Commands::Trace {
+            action: TraceCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
+        Domain::Build => Commands::Build {
+            action: BuildCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
+        Domain::Sys => Commands::Sys {
+            action: SysCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
+        Domain::Env => Commands::Env {
+            action: EnvCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
+        Domain::Net => Commands::Net {
+            action: NetCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
+        Domain::Bundle => {
+            return Err(usage("bundle diff is not supported yet"));
+        }
+        Domain::Log | Domain::Disk => {
+            return Err(usage(format!(
+                "cannot diff {} inputs; pass --as",
+                domain.name()
+            )));
+        }
+    })
+}
+
+/// `lens inspect PATH [--as KIND]`: detect (or honor --as), announce
+/// the verdict, and return the equivalent domain command.
+fn resolve_inspect(path: &Path, as_kind: Option<AsKind>) -> Result<Commands> {
+    match as_kind {
+        Some(as_kind) => inspect_command(path, domain_of_as(as_kind)),
+        None => {
+            let kind = lens_ops::detect::detect(path)?;
+            match kind {
+                InputKind::SysSnapshot | InputKind::EnvSnapshot | InputKind::NetReport => {
+                    Err(usage("already a snapshot; use `lens diff`"))
+                }
+                _ => {
+                    let domain = domain_of(kind);
+                    diagln!("detected: {} ({})", domain.name(), kind_name(kind));
+                    inspect_command(path, domain)
+                }
+            }
+        }
+    }
+}
+
+/// `lens diff A B [--as KIND]`: both inputs must land in the same
+/// diffable domain.
+fn resolve_diff(baseline: &Path, candidate: &Path, as_kind: Option<AsKind>) -> Result<Commands> {
+    match as_kind {
+        Some(as_kind) => diff_command(domain_of_as(as_kind), baseline, candidate),
+        None => {
+            let kind_a = lens_ops::detect::detect(baseline)?;
+            let kind_b = lens_ops::detect::detect(candidate)?;
+            let domain_a = domain_of(kind_a);
+            let domain_b = domain_of(kind_b);
+            if domain_a != domain_b {
+                return Err(usage(format!(
+                    "cannot diff {} with {}; pass --as",
+                    kind_name(kind_a),
+                    kind_name(kind_b)
+                )));
+            }
+            diagln!(
+                "detected: {} ({} + {})",
+                domain_a.name(),
+                kind_name(kind_a),
+                kind_name(kind_b)
+            );
+            diff_command(domain_a, baseline, candidate)
+        }
+    }
+}
+
+pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
     let mut outcome = Outcome::Clean;
+    // Global options: every arm reads the same --format/--json/--fail-on.
+    let format = opts.format;
+    let json = opts.json;
+    let threshold = match opts.fail_on {
+        FailOn::Warn => Severity::Warn,
+        FailOn::Fail => Severity::Fail,
+    };
     match command {
+        // `inspect`/`diff` resolve detection into the equivalent domain
+        // command and re-enter dispatch, so output and exit codes are
+        // identical to spelling the command out.
+        Commands::Inspect { path, as_kind } => {
+            let cmd = resolve_inspect(&path, as_kind)?;
+            return dispatch(cmd, opts);
+        }
+        Commands::Diff {
+            baseline,
+            candidate,
+            as_kind,
+        } => {
+            let cmd = resolve_diff(&baseline, &candidate, as_kind)?;
+            return dispatch(cmd, opts);
+        }
         Commands::Disk { action } => match action {
             DiskCommands::Scan {
                 path,
-                json,
-                format,
                 parallel,
                 max_depth,
                 exclude,
@@ -122,13 +389,16 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                 };
                 if let Some(d) = max_depth {
                     scan_opts.max_depth = d;
+                    // A depth limit the user asked for is intent, not an
+                    // evidence gap — don't fail the exit code over it.
+                    scan_opts.depth_limit_is_error = false;
                 }
                 let report = disk::scan(&path, scan_opts)?;
                 let result = &report.data;
                 // Scan errors are surfaced even in --json mode so evidence
                 // gaps never go unnoticed.
                 for e in &report.diagnostics {
-                    eprintln!("scan warning: {e}");
+                    diagln!("scan warning: {e}");
                 }
                 if json {
                     let snapshot = SnapshotV2::from_tree(
@@ -163,6 +433,18 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         root_node.allocated_size,
                         human_bytes(root_node.allocated_size)
                     );
+                    if result.depth_limited > 0 && max_depth.is_some() {
+                        outln!(
+                            "Depth limit {}: {} director{} not descended",
+                            max_depth.unwrap_or_default(),
+                            result.depth_limited,
+                            if result.depth_limited == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            }
+                        );
+                    }
                     if top > 0 {
                         let mut ranked: Vec<_> = result
                             .tree
@@ -179,23 +461,34 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         }
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
+                apply(&mut outcome, &report, threshold);
             }
             DiskCommands::Duplicates {
                 path,
                 min_size,
-                format,
+                exclude,
+                one_file_system,
+                max_depth,
             } => {
-                let report = disk::duplicates(&path, min_size)?;
+                let mut scan_opts = lens_disk::ScanOptions {
+                    one_file_system,
+                    exclude_patterns: exclude,
+                    ..Default::default()
+                };
+                if let Some(d) = max_depth {
+                    scan_opts.max_depth = d;
+                    scan_opts.depth_limit_is_error = false;
+                }
+                let report = disk::duplicates(&path, min_size, scan_opts)?;
                 let dup = &report.data;
                 for e in &report.diagnostics {
-                    eprintln!("scan warning: {e}");
+                    diagln!("scan warning: {e}");
                 }
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!("{}", to_deterministic_pretty(dup)?);
                 } else {
                     for e in &dup.errors {
-                        eprintln!("hash warning: {e}");
+                        diagln!("hash warning: {e}");
                     }
                     outln!("Found {} duplicate group(s):", dup.groups.len());
                     for (i, group) in dup.groups.iter().enumerate() {
@@ -218,13 +511,12 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("Hash errors: {}", dup.errors.len());
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
+                apply(&mut outcome, &report, threshold);
             }
             DiskCommands::Trash {
                 action,
                 paths,
                 dry_run,
-                format,
             } => {
                 let default_trash = TrashManager::default();
                 let trash_of = |dir: &Option<PathBuf>| match dir {
@@ -232,10 +524,10 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                     None => TrashManager::default(),
                 };
                 match action {
-                    Some(TrashCommands::List { trash_dir, format }) => {
+                    Some(TrashCommands::List { trash_dir }) => {
                         let trash = trash_of(&trash_dir);
                         let entries = trash.list()?;
-                        if wants_json(format, false, false) {
+                        if wants_json(format, json, false) {
                             outln!("{}", to_deterministic_pretty(&entries)?);
                         } else if entries.is_empty() {
                             outln!("Trash is empty.");
@@ -264,7 +556,7 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                                     .to_string(),
                             });
                         }
-                        let json_mode = wants_json(format, false, false);
+                        let json_mode = wants_json(format, json, false);
                         let mut failures: Vec<String> = Vec::new();
                         let mut receipts: Vec<lens_disk::TrashReceipt> = Vec::new();
                         for path in &paths {
@@ -317,10 +609,10 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
             }
         },
         Commands::Abi { action } => match action {
-            AbiCommands::Inspect { binary, format } => {
+            AbiCommands::Inspect { binary } => {
                 let report = abi::inspect(&binary, true)?;
                 let elf = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(elf)?);
                 } else {
                     // Human summary: the JSON report can be thousands of
@@ -343,16 +635,15 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  Diagnostics: {}", elf.diagnostics.len());
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
+                apply(&mut outcome, &report, threshold);
             }
             AbiCommands::Diff {
                 baseline,
                 candidate,
-                format,
             } => {
                 let report = abi::diff(&baseline, &candidate, true)?;
                 let diff = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(diff)?);
                 } else {
                     outln!(
@@ -375,14 +666,14 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  ! {}", d);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
         },
         Commands::Log { action } => match action {
-            LogCommands::Inspect { path, format } => {
+            LogCommands::Inspect { path } => {
                 let indexer = log::open(&path)?;
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!(
                         "{}",
                         to_deterministic_pretty(&serde_json::json!({
@@ -413,7 +704,6 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                 year,
                 limit,
                 context,
-                format,
             } => {
                 let indexer = log::open(&path)?;
                 let filter = log::build_filter(&log::FilterArgs {
@@ -427,7 +717,7 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                 })?;
 
                 let jsonl_mode = format == Some(OutputFormat::Jsonl);
-                let json_mode = wants_json(format, false, false);
+                let json_mode = wants_json(format, json, false);
                 let mut matched = 0usize;
                 let mut excluded_unknown = 0usize;
                 let mut excluded_unknown_ts = 0usize;
@@ -567,24 +857,24 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                     );
                 }
                 // Diagnostics stay on stderr so json/jsonl stdout stays clean.
-                eprintln!("\nMatched {} of {} line(s).", matched, indexer.len());
+                diagln!("\nMatched {} of {} line(s).", matched, indexer.len());
                 if limited {
-                    eprintln!("Stopped after {} match(es): --limit reached.", matched);
+                    diagln!("Stopped after {} match(es): --limit reached.", matched);
                 }
                 if indexer.lossy_lines() > 0 {
-                    eprintln!(
+                    diagln!(
                         "{} line(s) contain invalid UTF-8 (shown lossy as U+FFFD).",
                         indexer.lossy_lines()
                     );
                 }
                 if excluded_unknown > 0 {
-                    eprintln!(
+                    diagln!(
                         "Excluded {} line(s) whose log level could not be determined (--include-unknown to keep them).",
                         excluded_unknown
                     );
                 }
                 if excluded_unknown_ts > 0 {
-                    eprintln!(
+                    diagln!(
                         "Excluded {} line(s) whose timestamp could not be determined (--include-unknown to keep them).",
                         excluded_unknown_ts
                     );
@@ -592,14 +882,10 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
             }
         },
         Commands::Test { action } => match action {
-            TestCommands::Parse {
-                file,
-                project,
-                format,
-            } => {
+            TestCommands::Parse { file, project } => {
                 let report = test::parse(&file, &project)?;
                 let run = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(run)?);
                 } else {
                     let s = &run.summary;
@@ -617,17 +903,16 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  INCOMPLETE: the report was truncated or malformed");
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
             TestCommands::Diff {
                 baseline,
                 candidate,
-                format,
             } => {
                 let report = test::diff(&baseline, &candidate)?;
                 let diff = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(diff)?);
                 } else {
                     outln!(
@@ -652,15 +937,15 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  ! {}", d);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
         },
         Commands::Trace { action } => match action {
-            TraceCommands::Analyze { trace_file, format } => {
+            TraceCommands::Analyze { trace_file } => {
                 let report = trace::analyze(&trace_file)?;
                 let snapshot = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(snapshot)?);
                 } else {
                     outln!("Trace summary: {}", trace_file.display());
@@ -680,17 +965,16 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  fd leaks: {:?}", snapshot.fd_leaks);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
             TraceCommands::Diff {
                 baseline,
                 candidate,
-                format,
             } => {
                 let report = trace::diff_files(&baseline, &candidate)?;
                 let diff = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(diff)?);
                 } else {
                     outln!(
@@ -712,15 +996,15 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  ~ {}", s);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
         },
         Commands::Sys { action } => match action {
-            SysCommands::Inspect { path, format } => {
+            SysCommands::Inspect { path } => {
                 let report = sys::inspect(path.as_deref())?;
                 let snapshot = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(snapshot)?);
                 } else {
                     outln!(
@@ -732,13 +1016,13 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  {} {}", name, u.exec_start.as_deref().unwrap_or("-"));
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
-            SysCommands::Cycles { dir, format } => {
+            SysCommands::Cycles { dir } => {
                 let report = sys::cycles(dir.as_deref())?;
                 let (cycles, scanned_units) = (&report.data.cycles, report.data.scanned_units);
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!("{}", to_deterministic_pretty(cycles)?);
                 } else if cycles.is_empty() {
                     outln!(
@@ -777,18 +1061,17 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         }
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, false));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, false));
             }
             SysCommands::Diff {
                 baseline,
                 candidate,
-                format,
             } => {
                 // Inputs may be saved snapshots or live unit directories.
                 let report = sys::diff(&baseline, &candidate)?;
                 let diff = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(diff)?);
                 } else {
                     outln!(
@@ -803,15 +1086,15 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  ~ {}", u.unit);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
         },
         Commands::Build { action } => match action {
-            BuildCommands::Inspect { file, format } => {
+            BuildCommands::Inspect { file } => {
                 let report = build::inspect(&file)?;
                 let snapshot = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(snapshot)?);
                 } else {
                     outln!(
@@ -823,16 +1106,12 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  {} [{}]", u.file, u.compiler);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
+                apply(&mut outcome, &report, threshold);
             }
-            BuildCommands::Impact {
-                file,
-                header,
-                format,
-            } => {
+            BuildCommands::Impact { file, header } => {
                 let report = build::impact(&file, &header)?;
                 let impact = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(impact)?);
                 } else {
                     outln!(
@@ -848,28 +1127,27 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                 // missing/unresolved includes and truncation are warnings,
                 // not findings (system headers often resolve nowhere).
                 if let Some(hint) = &impact.hint {
-                    eprintln!("warning: {}", hint);
+                    diagln!("warning: {}", hint);
                 }
                 if impact.missing_sources > 0
                     || impact.unresolved_includes > 0
                     || impact.scan_truncated
                 {
-                    eprintln!(
+                    diagln!(
                         "warning: impact graph incomplete: {} missing source(s), {} unresolved include(s), truncated={}",
                         impact.missing_sources, impact.unresolved_includes, impact.scan_truncated
                     );
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
             BuildCommands::Diff {
                 baseline,
                 candidate,
-                format,
             } => {
                 let report = build::diff(&baseline, &candidate)?;
                 let diff = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(diff)?);
                 } else {
                     outln!(
@@ -882,19 +1160,15 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  ~ {}", u.file);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
         },
         Commands::Env { action } => match action {
-            EnvCommands::Inspect {
-                venv_path,
-                project,
-                format,
-            } => {
+            EnvCommands::Inspect { venv_path, project } => {
                 let report = env::inspect(&venv_path, project.as_deref())?;
                 let snapshot = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(snapshot)?);
                 } else {
                     let v = &snapshot.venv;
@@ -913,17 +1187,13 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  Shadowing issues: {}", v.shadowing_issues.len());
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
-            EnvCommands::Check {
-                venv_path,
-                extras,
-                format,
-            } => {
+            EnvCommands::Check { venv_path, extras } => {
                 let report = env::check(&venv_path, &extras)?;
                 let venv = &report.data;
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!(
                         "{}",
                         to_deterministic_pretty(&serde_json::json!({
@@ -958,17 +1228,16 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         }
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, false));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, false));
             }
             EnvCommands::Diff {
                 baseline,
                 candidate,
-                format,
             } => {
                 let report = env::diff(&baseline, &candidate)?;
                 let diff = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(diff)?);
                 } else {
                     outln!(
@@ -981,8 +1250,8 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  ~ {}: {} -> {}", p.package, p.old_version, p.new_version);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
         },
         Commands::Bundle { action } => match action {
@@ -996,7 +1265,6 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                 env,
                 net,
                 force,
-                format,
             } => {
                 let report = bundle::create(&bundle::BundleRequest {
                     output: output.clone(),
@@ -1010,7 +1278,7 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                     force,
                 })?;
                 let manifest = &report.data;
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!("{}", to_deterministic_pretty(manifest)?);
                 } else {
                     outln!(
@@ -1025,12 +1293,12 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         }
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
+                apply(&mut outcome, &report, threshold);
             }
-            BundleCommands::Inspect { bundle, format } => {
+            BundleCommands::Inspect { bundle } => {
                 let report = bundle::inspect(&bundle)?;
                 let inspect = &report.data;
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!("{}", to_deterministic_pretty(inspect)?);
                     return Ok(outcome);
                 }
@@ -1059,12 +1327,12 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                     outln!("  - {} ({} bytes)", e.name, e.size);
                 }
             }
-            BundleCommands::Verify { bundle, format } => {
+            BundleCommands::Verify { bundle } => {
                 let report = bundle::verify(&bundle)?;
                 let vr = &report.data;
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!("{}", to_deterministic_pretty(vr)?);
-                    apply(&mut outcome, &report, Severity::Fail);
+                    apply(&mut outcome, &report, threshold);
                     return Ok(outcome);
                 }
                 if vr.is_valid {
@@ -1092,16 +1360,12 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         eprintln!("  Unlisted: {}", u);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
+                apply(&mut outcome, &report, threshold);
             }
-            BundleCommands::Show {
-                bundle,
-                entry,
-                format,
-            } => {
+            BundleCommands::Show { bundle, entry } => {
                 let report = bundle::show(&bundle, &entry)?;
                 let bytes = &report.data;
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!(
                         "{}",
                         to_deterministic_pretty(&serde_json::json!({
@@ -1120,11 +1384,10 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                 bundle,
                 dest,
                 force,
-                format,
             } => {
                 let report = bundle::extract(&bundle, &dest, force)?;
                 let written = &report.data;
-                if wants_json(format, false, false) {
+                if wants_json(format, json, false) {
                     outln!(
                         "{}",
                         to_deterministic_pretty(&serde_json::json!({
@@ -1149,12 +1412,7 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
             }
         },
         Commands::Net { action } => match action {
-            NetCommands::Inspect {
-                proc_dir,
-                json,
-                format,
-                no_unix,
-            } => {
+            NetCommands::Inspect { proc_dir, no_unix } => {
                 let report = net::inspect(proc_dir.as_deref(), no_unix)?;
                 let net_report = &report.data;
                 if wants_json(format, json, false) {
@@ -1234,17 +1492,16 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         );
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
+                apply(&mut outcome, &report, threshold);
                 print_findings(&report.findings, wants_json(format, json, false));
             }
             NetCommands::Diff {
                 baseline,
                 candidate,
-                format,
             } => {
                 let report = net::diff(&baseline, &candidate)?;
                 let diff = &report.data;
-                if wants_json(format, false, true) {
+                if wants_json(format, json, true) {
                     outln!("{}", to_deterministic_pretty(diff)?);
                 } else {
                     outln!(
@@ -1262,17 +1519,14 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
                         outln!("  - {}:{}", l.local_address, l.local_port);
                     }
                 }
-                apply(&mut outcome, &report, Severity::Fail);
-                print_findings(&report.findings, wants_json(format, false, true));
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
             }
         },
         Commands::Doctor {
             root,
             procfs,
             systemd_dir,
-            json,
-            format,
-            fail_on,
         } => {
             let report = doctor::run(root.as_deref(), procfs.as_deref(), systemd_dir.as_deref())?;
             let dr = &report.data;
@@ -1311,10 +1565,6 @@ pub fn dispatch(command: Commands) -> Result<Outcome> {
             // --fail-on picks the severity threshold that counts as a
             // finding. Doctor renders its own check table — no Findings
             // trailer.
-            let threshold = match fail_on {
-                FailOn::Warn => Severity::Warn,
-                FailOn::Fail => Severity::Fail,
-            };
             apply(&mut outcome, &report, threshold);
         }
         Commands::Tui { path, log } => {

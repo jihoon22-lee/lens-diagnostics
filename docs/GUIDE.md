@@ -28,8 +28,9 @@ source <(lens completion bash)   # zsh, fish도 지원
 판정은 공유 레이어(`lens-ops`)의 `Report<T>`에서 나온다: 각 오퍼레이션이
 `findings`(Info/Warn/Fail)과 `complete`를 채우고, CLI는
 `is_actionable(threshold)`만으로 exit 1을 결정한다. 불완전 증거
-(`complete=false`)는 findings가 없어도 항상 exit 1이다. 기본 임계값은
-Fail이며 `doctor`만 `--fail-on warn|fail`(기본 `fail`)로 조절한다.
+(`complete=false`)는 findings가 없어도 항상 exit 1이다. 임계값은
+`--fail-on warn|fail`(기본 `fail`)로 조절하며 **모든 명령**에 적용된다 —
+`--fail-on warn`이면 Warn findings만 있어도 exit 1이다.
 
 text 모드에서는 도메인 출력 뒤에 findings 요약 블록이 붙는다:
 
@@ -41,15 +42,62 @@ Findings: 1 fail, 0 warn
 JSON 출력은 도메인 스키마를 그대로 유지하며 `findings` 키가 섞이지
 않는다(`doctor`는 자체 checks 렌더링이 findings를 대신한다).
 
+### 공통 옵션
+
+다음 플래그는 전역 옵션이다 — 서브커맨드 앞이나 뒤 어디에 두어도
+동일하게 동작한다(`lens --format json net diff a b` ≡
+`lens net diff a b --format json`).
+
+- `--format text|json|jsonl`: 출력 형식. `text`는 사람이 읽는
+  요약(색인·집계·top-N)이고, `json`은 기존 결정적 JSON 스키마를
+  출력한다. 기본값은 명령별 기존 동작을 유지한다(예: `abi inspect`는
+  json, `disk scan`은 text). `jsonl`은 `log filter`만 실제 줄 단위
+  출력에 사용하고, 다른 명령은 `json`과 동일하게 처리한다.
+- `--json`: `--format json`의 별칭.
+- `--fail-on warn|fail`(기본 `fail`): exit 1로 간주할 최소 finding
+  심각도. 모든 명령에 적용된다.
+- `-q`/`--quiet`: stderr의 비오류 진단(`scan warning`, `detected:`,
+  필터 통계 등)만 끈다. 실제 오류와 `error:` 줄, stdout은 영향 없음.
+
 ### 출력 형식
 
-대부분의 명령이 `--format text|json`을 지원한다. `text`는 사람이 읽는
-요약(색인·집계·top-N)이고, `json`은 기존 결정적 JSON 스키마를 출력한다.
-기본값은 명령별 기존 동작을 유지한다(예: `abi inspect`는 json,
-`disk scan`은 text). `disk scan`/`net inspect`의 기존 `--json` 플래그는
-`--format json`의 별칭으로 유지된다. 열거형에는 `jsonl`도 있으나 실제
-줄 단위 출력은 `log filter`만 사용하고, 다른 명령은 `json`과 동일하게
-처리한다.
+`--format`/`--json`은 위 공통 옵션으로 통일됐다. 기존처럼
+서브커맨드 뒤에 쓰는 형태(`lens disk scan . --json`,
+`lens doctor --fail-on warn`)도 그대로 유효하다.
+
+### 자동 판별: `lens inspect` / `lens diff`
+
+경로를 주면 입력 종류를 감지해 해당 도메인 명령과 **동일한** 출력·종료
+코드를 낸다(내부적으로 감지 결과를 해당 명령으로 디스패치). 감지 결과는
+stderr에 `detected: <domain> (<kind>)`로 표시된다(`-q`로 억제).
+`--as <kind>`로 감지를 건너뛰고 도메인을 강제할 수 있다.
+
+```bash
+lens inspect <path> [--as abi|test|trace|build|sys|env|net|log|disk|bundle]
+lens diff <a> <b> [--as ...]
+```
+
+판별 규칙(파일은 처음 64 KiB만 읽음):
+
+| 입력 | 판별 | inspect 매핑 | diff 매핑 |
+|------|------|--------------|-----------|
+| `\x7fELF` 매직 | Elf | `abi inspect` | `abi diff` (Elf+Elf) |
+| JUnit XML(`<testsuite`/`<testsuites` 루트) | Junit | `test parse` | `test diff` (Junit+Junit) |
+| strace 텍스트(처음 ≤200줄이 파싱됨) | Strace | `trace analyze` | `trace diff` (Strace+Strace) |
+| JSON 배열 + `compile_commands.json` 이름 또는 첫 원소에 `directory`+`file` | CompileDb | `build inspect` | `build diff` (CompileDb+CompileDb) |
+| `pyvenv.cfg`가 있는 디렉터리 | Venv | `env inspect` | `env diff` (Venv/EnvSnapshot 조합) |
+| `.service`/`.socket`/`.target`/`.timer`/`.mount`/`.path`/`.slice` 단위 확장자 | SystemdDir(디렉터리)/SystemdUnit(파일) | `sys inspect` | `sys diff` (Dir/Unit/SysSnapshot 조합) |
+| `.lens` 또는 gzip 매직 + 유효한 번들 매니페스트 | Bundle | `bundle inspect` | 미지원(usage 오류) |
+| 스냅샷 JSON(`schema`/`schema_version` 매칭) | EnvSnapshot/SysSnapshot/NetReport | 오류 — "already a snapshot; use `lens diff`" | `env diff`/`sys diff`/`net diff` (같은 스키마끼리) |
+| 그 외 텍스트/`.gz` | Log | `log inspect` | — |
+| 그 외 디렉터리 | Directory | `disk scan` | — |
+
+호환되지 않는 쌍은 usage 오류다(`cannot diff <a> with <b>; pass --as`,
+exit 2). 스키마를 인식하지 못한 JSON 입력도 usage 오류다
+(`unrecognized JSON input (schema …); pass --as`).
+
+`lens diff`와 `lens env diff`는 venv 디렉터리와 env 스냅샷 JSON을
+자유롭게 섞어 비교할 수 있다(디렉터리는 그 자리에서 inspect된다).
 
 ## 도메인별 사용법
 
@@ -60,18 +108,27 @@ lens disk scan <path> [--json|--format json] [--parallel]
                [--max-depth N] [--exclude PATTERN]... [-x|--one-file-system]
                [--top N]
 lens disk duplicates <path> [--min-size BYTES] [--format text|json]
+               [--exclude PATTERN]... [-x|--one-file-system] [--max-depth N]
 lens disk trash <path>... [--dry-run] [--format text|json]
 lens disk trash list [--trash-dir DIR] [--format text|json]
 lens disk trash restore <name> [--trash-dir DIR]
 ```
 
 - `scan`: 아레나 트리로 계층 구조 + 논리/할당 크기 집계. `--json`은
-  `diskmap.snapshot/v2` 출력. 심볼링크 루프 감지, 깊이/항목 상한 도달 시
-  `complete=false`로 표시되며 per-entry 오류는 stderr로 나옵니다.
-- `--max-depth`/`--exclude`/`--one-file-system`: 스캔 범위 제한
-  (`--exclude`는 반복 지정 가능, 이름에 문자열이 **포함**되면 제외 —
-  glob이 아니다). `-x`는 마운트 경계를 넘지 않는다(WSL의 `/mnt/c`,
-  `/proc` 등 제외에 유용).
+  `diskmap.snapshot/v2` 출력. 심볼링크 루프 감지, per-entry 오류는
+  stderr로 나옵니다. 하드링크(`hard_link_count > 1`)로 이어진 동일
+  inode는 디렉터리 집계에서 한 번만 계산된다 — 파일 노드 자체는 각자
+  크기를 유지한다.
+- `--max-depth`: 사용자가 명시한 깊이 제한은 의도된 절단이지 증거
+  결손이 아니다 — `complete`는 true로 유지되고 exit 0이며, 텍스트
+  출력에 `Depth limit N: M directories not descended`로 표시된다
+  (기본 안전 상한 512에 걸린 경우는 여전히 `complete=false`, exit 1).
+- `--exclude`(반복 가능)는 세 가지 형태를 지원한다: `/` 포함 패턴은
+  스캔 루트 기준 **상대 경로**에 대한 glob(`a/b`), `*`/`?` 포함은
+  **이름**에 대한 glob(`*.log`), 그 외는 이름 **정확히** 일치 — 따라서
+  `.git`은 `.git`만 제외하고 `.github`/`.gitignore`는 남는다.
+- `-x`는 마운트 경계를 넘지 않는다(WSL의 `/mnt/c`, `/proc` 등
+  제외에 유용).
 - `--top N`(기본 10, 0은 비활성): 텍스트 출력에 최상위에서 가장 큰
   항목 N개를 KiB/MiB/GiB 단위로 표시.
 - `--parallel`: rayon으로 per-entry stat 병렬화. cold cache의 대형 트리에서
@@ -80,6 +137,7 @@ lens disk trash restore <name> [--trash-dir DIR]
   회수 가능 용량에서 제외, `(dev=0,ino=0)` 파일은 경로 기반 폴백.
   해시 실패는 `errors`로 집계해 출력하고, 총 회수 가능 용량 요약을 표시.
   `--format json`은 `{groups, errors, total_reclaimable_bytes}`를 출력.
+  `--exclude`/`-x`/`--max-depth`로 `scan`과 같은 스캔 범위 제한을 지원.
 - `trash`: FreeDesktop Trash 규격으로 이동(`.trashinfo` 기록 포함,
   심볼링크는 타깃이 아닌 링크 자체가 이동됨, 복구 영수증 출력).
   다중 경로를 받고, `--dry-run`은 이동 없이 예정 동작만 출력한다.
@@ -225,7 +283,8 @@ lens build diff <baseline.json> <candidate.json> [--format text|json]
 ```bash
 lens env inspect <venv_path> [--project <dir>] [--format text|json]
 lens env check <venv_path> [--extras a,b] [--format text|json]
-lens env diff <baseline.json> <candidate.json> [--format text|json]
+lens env diff <baseline> <candidate> [--format text|json]
+               # baseline/candidate: 스냅샷 JSON 또는 venv 디렉터리(혼합 가능)
 ```
 
 - 인터프리터 실행 없이 정적 메타데이터 감사(dist-info/METADATA).
@@ -283,7 +342,7 @@ lens bundle extract incident.lens out/ [--force]
 
 ```bash
 lens doctor [--root PATH] [--procfs PATH] [--systemd-dir PATH]
-            [--json|--format json] [--fail-on warn|fail]
+            [--json|--format json]
 ```
 
 스토리지 용량(statvfs), 네트워크, 서비스, 환경 검사를 PASS/WARN/FAIL로

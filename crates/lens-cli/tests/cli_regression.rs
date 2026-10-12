@@ -935,7 +935,8 @@ fn disk_scan_top_exclude_and_human_units() {
     // --exclude drop: skipme's 9 KiB must not be counted.
     assert!(!stdout.contains("skipme"), "{stdout}");
 
-    // --max-depth 0 truncates at the root: an incomplete scan is a finding.
+    // --max-depth 0 truncates at the root — but a user-requested limit is
+    // a deliberate cut, not an evidence gap: complete stays true, exit 0.
     let out = lens(&[
         "disk",
         "scan",
@@ -944,9 +945,9 @@ fn disk_scan_top_exclude_and_human_units() {
         "0",
         "--json",
     ]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON output");
-    assert_eq!(json["complete"], false, "{json}");
+    assert_eq!(json["complete"], true, "{json}");
 }
 
 #[test]
@@ -2176,4 +2177,373 @@ fn env_diff_rejects_wrong_schema_input() {
         "{}",
         stderr_of(&out)
     );
+}
+
+// --- Phase 3: global options + auto-detection ---
+
+/// Strip runtime fields so two invocations of the same command can be
+/// compared byte-for-byte.
+fn normalize_volatile(s: &str) -> String {
+    s.lines()
+        .filter(|l| !l.contains("\"collected_at\"") && !l.contains("\"run_id\""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn inspect_junit_matches_test_parse() {
+    let dir = tmp_file("auto-inspect", "r.xml", JUNIT_XML);
+    let file = dir.path.clone();
+    let auto = lens(&["inspect", file.to_str().unwrap()]);
+    let manual = lens(&["test", "parse", file.to_str().unwrap()]);
+    assert_eq!(auto.status.code(), manual.status.code());
+    assert_eq!(
+        normalize_volatile(&stdout_of(&auto)),
+        normalize_volatile(&stdout_of(&manual)),
+    );
+    // Detection announces itself on stderr (suppressed by -q).
+    assert!(stderr_of(&auto).contains("detected: test (junit)"));
+}
+
+#[test]
+fn diff_junit_matches_test_diff_and_exits_1() {
+    let dir = tmp_dir("auto-diff");
+    let base = dir.join("base.xml");
+    let cand = dir.join("cand.xml");
+    std::fs::write(&base, JUNIT_XML).unwrap();
+    std::fs::write(
+        &cand,
+        r#"<testsuite tests="1"><testcase name="a" classname="C" time="0"><failure/></testcase></testsuite>"#,
+    )
+    .unwrap();
+
+    let auto = lens(&["diff", base.to_str().unwrap(), cand.to_str().unwrap()]);
+    let manual = lens(&[
+        "test",
+        "diff",
+        base.to_str().unwrap(),
+        cand.to_str().unwrap(),
+    ]);
+    assert_eq!(auto.status.code(), Some(1), "{}", stderr_of(&auto));
+    assert_eq!(
+        normalize_volatile(&stdout_of(&auto)),
+        normalize_volatile(&stdout_of(&manual)),
+    );
+}
+
+#[test]
+fn diff_incompatible_kinds_is_a_usage_error() {
+    let dir = tmp_dir("auto-mismatch");
+    let junit = dir.join("r.xml");
+    std::fs::write(&junit, JUNIT_XML).unwrap();
+    let ccdb = dir.join("compile_commands.json");
+    std::fs::write(
+        &ccdb,
+        r#"[{"directory":"/tmp","command":"cc -c a.c","file":"a.c"}]"#,
+    )
+    .unwrap();
+
+    let out = lens(&["diff", junit.to_str().unwrap(), ccdb.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("cannot diff"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn diff_as_trace_skips_detection() {
+    let dir = tmp_dir("auto-as-trace");
+    let a = dir.join("a.out");
+    let b = dir.join("b.out");
+    let trace = "1 openat(AT_FDCWD, \"/x\", O_RDONLY) = 3\n1 close(3) = 0\n";
+    std::fs::write(&a, trace).unwrap();
+    std::fs::write(&b, trace).unwrap();
+
+    let out = lens(&[
+        "diff",
+        "--as",
+        "trace",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON output");
+    assert_eq!(json["baseline_calls"], 2, "{json}");
+    // --as means no detection happened — nothing to announce.
+    assert!(!stderr_of(&out).contains("detected:"));
+}
+
+#[test]
+fn global_format_flag_works_before_and_after_subcommand() {
+    let dir = tmp_dir("global-fmt");
+    std::fs::write(dir.join("f.txt"), "x").unwrap();
+    let d = dir.to_str().unwrap();
+    for args in [
+        vec!["--format", "json", "disk", "scan", d],
+        vec!["disk", "scan", d, "--format", "json"],
+        vec!["disk", "scan", d, "--json"],
+    ] {
+        let out = lens(&args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr_of(&out));
+        let json: serde_json::Value = serde_json::from_str(&stdout_of(&out))
+            .unwrap_or_else(|_| panic!("{args:?} did not emit JSON"));
+        assert_eq!(json["schema_version"], "diskmap.snapshot/v2", "{args:?}");
+    }
+}
+
+#[test]
+fn legacy_doctor_fail_on_warn_still_parses() {
+    let dir = tmp_dir("doctor-legacy");
+    let out = lens(&[
+        "doctor",
+        "--root",
+        dir.to_str().unwrap(),
+        "--fail-on",
+        "warn",
+    ]);
+    // Parsing is the point; the run itself must not usage-error.
+    assert_ne!(out.status.code(), Some(2), "{}", stderr_of(&out));
+}
+
+#[test]
+fn fail_on_warn_applies_to_every_command() {
+    // test parse emits a Warn `test.failures` finding: default threshold
+    // (fail) stays 0, --fail-on warn escalates it to 1.
+    let dir = tmp_file(
+        "fail-on",
+        "fail.xml",
+        r#"<testsuite tests="1"><testcase name="t"><failure/></testcase></testsuite>"#,
+    );
+    let f = dir.path.clone();
+    let default = lens(&["test", "parse", f.to_str().unwrap()]);
+    assert_eq!(default.status.code(), Some(0), "{}", stderr_of(&default));
+    let warned = lens(&["test", "parse", f.to_str().unwrap(), "--fail-on", "warn"]);
+    assert_eq!(warned.status.code(), Some(1), "{}", stderr_of(&warned));
+}
+
+#[test]
+fn quiet_suppresses_scan_warnings_but_not_stdout() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir("quiet");
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("x"), "x").unwrap();
+    std::fs::write(dir.join("ok.txt"), "ok").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let loud = lens(&["disk", "scan", dir.to_str().unwrap()]);
+    if !stderr_of(&loud).contains("scan warning") {
+        // Running as root bypasses the chmod — nothing to assert.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let quiet = lens(&["-q", "disk", "scan", dir.to_str().unwrap()]);
+    assert!(
+        !stderr_of(&quiet).contains("scan warning"),
+        "{}",
+        stderr_of(&quiet)
+    );
+    // stdout is unaffected by -q.
+    assert_eq!(stdout_of(&quiet), stdout_of(&loud));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn user_set_max_depth_is_not_an_error() {
+    // Three levels: root/l1/l2/leaf.txt — depth 1 stops before l2.
+    let dir = tmp_dir("depth");
+    std::fs::create_dir_all(dir.join("l1/l2")).unwrap();
+    std::fs::write(dir.join("l1/l2/leaf.txt"), "x").unwrap();
+
+    let out = lens(&["disk", "scan", dir.to_str().unwrap(), "--max-depth", "1"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(
+        !stderr_of(&out).contains("scan warning"),
+        "{}",
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("Scan completed"), "{stdout}");
+    assert!(stdout.contains("Depth limit"), "{stdout}");
+}
+
+#[test]
+fn exclude_exact_name_glob_and_path_forms() {
+    let dir = tmp_dir("exclude-forms");
+    for d in [".git", ".github", "a/b"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(dir.join(".github/workflow.yml"), "w").unwrap();
+    std::fs::write(dir.join(".gitignore"), "i").unwrap();
+    std::fs::write(dir.join("app.log"), "l").unwrap();
+    std::fs::write(dir.join("a/b/deep.txt"), "d").unwrap();
+
+    // `.git` is an exact name: it must not eat .github or .gitignore.
+    let out = lens(&["disk", "scan", dir.to_str().unwrap(), "--exclude", ".git"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains(".github"), "{stdout}");
+    assert!(stdout.contains(".gitignore"), "{stdout}");
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&lens(&[
+        "disk",
+        "scan",
+        dir.to_str().unwrap(),
+        "--exclude",
+        ".git",
+        "--format",
+        "json",
+    ])))
+    .expect("JSON output");
+    let names: Vec<&str> = json["root"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["name"].as_str())
+        .collect();
+    assert!(!names.contains(&".git"), "{names:?}");
+    assert!(names.contains(&".github"), "{names:?}");
+    assert!(names.contains(&".gitignore"), "{names:?}");
+
+    // `*.log` is a name glob.
+    let out = lens(&[
+        "disk",
+        "scan",
+        dir.to_str().unwrap(),
+        "--exclude",
+        "*.log",
+        "--format",
+        "json",
+    ]);
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON output");
+    let names: Vec<&str> = json["root"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"app.log"), "{names:?}");
+
+    // `a/b` is a relative-path glob: removes b only under a.
+    let out = lens(&[
+        "disk",
+        "scan",
+        dir.to_str().unwrap(),
+        "--exclude",
+        "a/b",
+        "--format",
+        "json",
+    ]);
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON output");
+    let a = json["root"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "a")
+        .expect("a present");
+    assert!(
+        a["children"].as_array().unwrap().is_empty(),
+        "a/b should be excluded: {a}"
+    );
+}
+
+#[test]
+fn hardlinked_file_counts_once_in_aggregates() {
+    let dir = tmp_dir("hardlink");
+    let orig = dir.join("orig");
+    std::fs::write(&orig, b"12345").unwrap();
+    let link = dir.join("link");
+    if std::fs::hard_link(&orig, &link).is_err() {
+        return; // filesystem without hardlink support — nothing to check
+    }
+
+    let out = lens(&["disk", "scan", dir.to_str().unwrap(), "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON output");
+    // Two 5-byte names for one inode: the aggregate counts the data once.
+    assert_eq!(json["root"]["size"], 5, "{json}");
+    // The file nodes themselves keep their own sizes.
+    let file_sizes: Vec<u64> = json["root"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["size"].as_u64())
+        .collect();
+    assert_eq!(file_sizes, vec![5, 5], "{json}");
+}
+
+#[test]
+fn env_diff_accepts_venv_dirs_and_mixed_inputs() {
+    let base = make_venv("envdiff-a", &[("requests", "2.31.0", &[])]);
+    let cand = make_venv("envdiff-b", &[("requests", "2.32.0", &[])]);
+
+    // dir vs dir
+    let out = lens(&[
+        "env",
+        "diff",
+        base.to_str().unwrap(),
+        cand.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("version_changes"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    // dir vs snapshot JSON
+    let snapdir = tmp_dir("envdiff-snap");
+    let snap = snapdir.join("snap.json");
+    let inspect = lens(&["env", "inspect", cand.to_str().unwrap(), "--format", "json"]);
+    assert!(inspect.status.success(), "{}", stderr_of(&inspect));
+    std::fs::write(&snap, stdout_of(&inspect)).unwrap();
+    let out = lens(&[
+        "env",
+        "diff",
+        base.to_str().unwrap(),
+        snap.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    // `lens diff` auto-detects two venvs as env inputs.
+    let out = lens(&["diff", base.to_str().unwrap(), cand.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("detected: env"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("version_changes"),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
+#[test]
+fn disk_duplicates_accepts_scan_options() {
+    let dir = tmp_dir("dup-opts");
+    let keep = dir.join("keep");
+    let gone = dir.join("gone");
+    std::fs::create_dir_all(&keep).unwrap();
+    std::fs::create_dir_all(&gone).unwrap();
+    let blob = vec![9u8; 4096];
+    std::fs::write(keep.join("a.bin"), &blob).unwrap();
+    std::fs::write(keep.join("b.bin"), &blob).unwrap();
+    std::fs::write(gone.join("c.bin"), &blob).unwrap();
+    std::fs::write(gone.join("d.bin"), &blob).unwrap();
+
+    let out = lens(&[
+        "disk",
+        "duplicates",
+        dir.to_str().unwrap(),
+        "--exclude",
+        "gone",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("1 duplicate group"), "{stdout}");
+    assert!(stdout.contains("a.bin"), "{stdout}");
+    assert!(!stdout.contains("gone"), "{stdout}");
 }

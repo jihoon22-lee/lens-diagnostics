@@ -74,11 +74,25 @@ pub fn check(venv_path: &Path, extras: &[String]) -> Result<Report<PyVenv>> {
     Ok(report)
 }
 
-/// Diff two env snapshot JSONs (schema-checked). Deltas are Info.
+/// An env diff input: a saved snapshot JSON (schema-checked) or a live
+/// virtualenv directory inspected on the fly.
+fn load_env_input(path: &Path) -> Result<EnvSnapshot> {
+    if path.is_dir() {
+        let venv = open_venv(path, &[])?;
+        return Ok(EnvSnapshot {
+            schema: lens_env::SNAPSHOT_SCHEMA_V1.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            venv,
+        });
+    }
+    json::read_json_schema(path, "schema", lens_env::SNAPSHOT_SCHEMA_V1)
+}
+
+/// Diff two env inputs — saved snapshot JSONs (schema-checked) or live
+/// virtualenv directories, freely mixed. Deltas are Info.
 pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<EnvDiff>> {
-    let s1: EnvSnapshot = json::read_json_schema(baseline, "schema", lens_env::SNAPSHOT_SCHEMA_V1)?;
-    let s2: EnvSnapshot =
-        json::read_json_schema(candidate, "schema", lens_env::SNAPSHOT_SCHEMA_V1)?;
+    let s1 = load_env_input(baseline)?;
+    let s2 = load_env_input(candidate)?;
     let diff = diff_environments(&s1.venv, &s2.venv);
     let mut report = Report::new(diff);
     let (a, r, m, s) = (

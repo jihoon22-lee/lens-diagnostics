@@ -173,8 +173,30 @@ impl ArenaTree {
 
     /// Aggregates sizes post-order from leaves up to the root.
     /// Iterative so arbitrarily deep trees cannot overflow the call stack.
+    /// Hardlinks are counted once: a regular file whose inode reports
+    /// `hard_link_count > 1` contributes its size only at its first
+    /// occurrence in node-id order — the node itself keeps its own
+    /// size, directory totals just don't double-count it. Nodes with an
+    /// unknown (0,0) identity are never deduplicated.
     pub fn aggregate_sizes(&mut self, root_id: NodeId) -> u64 {
         let mut sizes = vec![0u64; self.nodes.len()];
+        // Pre-pass: mark hardlink occurrences after the first so their
+        // contribution can be skipped in the child sums.
+        let mut counted: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        let mut dup_inode = vec![false; self.nodes.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            let id = &n.metadata.identity;
+            if n.is_dir
+                || n.metadata.kind != FsKind::RegularFile
+                || (id.device, id.inode) == (0, 0)
+                || n.metadata.hard_link_count <= 1
+            {
+                continue;
+            }
+            if !counted.insert((id.device, id.inode)) {
+                dup_inode[i] = true;
+            }
+        }
         // (node, children_processed)
         let mut stack: Vec<(NodeId, bool)> = vec![(root_id, false)];
         while let Some((id, processed)) = stack.pop() {
@@ -191,8 +213,10 @@ impl ArenaTree {
             let mut total_alloc = 0u64;
             let mut child = self.nodes[id as usize].first_child;
             while let Some(c) = child {
-                total_size = total_size.saturating_add(sizes[c as usize]);
-                total_alloc = total_alloc.saturating_add(self.nodes[c as usize].allocated_size);
+                if !dup_inode[c as usize] {
+                    total_size = total_size.saturating_add(sizes[c as usize]);
+                    total_alloc = total_alloc.saturating_add(self.nodes[c as usize].allocated_size);
+                }
                 child = self.nodes[c as usize].next_sibling;
             }
             let node = &mut self.nodes[id as usize];

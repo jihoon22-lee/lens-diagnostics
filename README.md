@@ -91,6 +91,14 @@ cargo build --release -p lens-cli --jobs 2
 
 단일 실행 파일 `lens` 하나로 9개 진단 도메인(disk, abi, log, test, trace, sys, build, env, net)의 기능과 포렌식 번들링을 모두 실행할 수 있습니다.
 
+**가장 쉬운 사용법** — 도메인을 몰라도 자동 판별됩니다:
+
+```bash
+$ lens doctor            # 시스템 종합 점검
+$ lens inspect <path>    # 무엇인지 자동 감지 후 해당 검사 실행
+$ lens diff <a> <b>      # 양쪽 입력을 감지해 호환되는 diff 실행
+```
+
 ```bash
 # 1. 파일시스템 초고속 스캔 & 중복 파일 탐지 (동일 inode 하드링크 자동 인식)
 $ lens disk scan .

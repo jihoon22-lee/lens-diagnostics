@@ -204,7 +204,7 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                 .get("min_size")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1024);
-            lens_ops::disk::duplicates(&path, min_size)
+            lens_ops::disk::duplicates(&path, min_size, lens_disk::ScanOptions::default())
                 .map(ToolOutcome::from)
                 .map_err(|e| e.to_string())
         }

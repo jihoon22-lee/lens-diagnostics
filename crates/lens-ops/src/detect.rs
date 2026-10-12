@@ -1,0 +1,367 @@
+//! Input auto-detection for `lens inspect` / `lens diff`: decide which
+//! domain an input belongs to from the filesystem entry itself —
+//! extension, magic bytes, and at most the first 64 KiB of content.
+
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+
+use lens_core::{LensError, Result};
+
+/// What a path turned out to be. `lens inspect` maps each to a domain
+/// command; `lens diff` pairs compatible kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    Elf,
+    Junit,
+    Strace,
+    CompileDb,
+    Venv,
+    SystemdDir,
+    SystemdUnit,
+    SysSnapshot,
+    EnvSnapshot,
+    NetReport,
+    Bundle,
+    Log,
+    Directory,
+}
+
+/// Sniffing reads at most this much of any file.
+const SNIFF_BYTES: usize = 64 * 1024;
+
+const UNIT_EXTENSIONS: &[&str] = &[
+    "service", "socket", "target", "timer", "mount", "path", "slice",
+];
+
+fn read_head(path: &Path, cap: usize) -> Result<Vec<u8>> {
+    let f = fs::File::open(path).map_err(|e| LensError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let mut buf = Vec::new();
+    f.take(cap as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| LensError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    Ok(buf)
+}
+
+/// Skip a BOM, `<?xml …?>` prologs, comments, and whitespace, then check
+/// for the JUnit root element. `<testsuite` covers both `<testsuite>`
+/// and `<testsuites>`.
+fn looks_like_junit(head: &[u8]) -> bool {
+    let mut s = head;
+    if s.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        s = &s[3..];
+    }
+    loop {
+        while s.first().is_some_and(|b| b.is_ascii_whitespace()) {
+            s = &s[1..];
+        }
+        if let Some(rest) = s.strip_prefix(b"<?xml") {
+            match rest.windows(2).position(|w| w == b"?>") {
+                Some(i) => s = &rest[i + 2..],
+                None => return false,
+            }
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix(b"<!--") {
+            match rest.windows(3).position(|w| w == b"-->") {
+                Some(i) => s = &rest[i + 3..],
+                None => return false,
+            }
+            continue;
+        }
+        break;
+    }
+    s.starts_with(b"<testsuite")
+}
+
+fn has_unit_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| UNIT_EXTENSIONS.contains(&e))
+}
+
+/// The schema marker a producer writes — `schema` (env/sys) or
+/// `schema_version` (net).
+fn schema_of(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("schema")
+        .or_else(|| value.get("schema_version"))
+        .and_then(|v| v.as_str())
+}
+
+/// Classify a path. First match wins; an unreadable/nonexistent path is
+/// an `Io` error (exit 2). A `Usage` error is returned for files that
+/// look structured but carry no recognized schema — a wrong guess would
+/// silently produce a meaningless report.
+pub fn detect(path: &Path) -> Result<InputKind> {
+    let meta = fs::symlink_metadata(path).map_err(|e| LensError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    if meta.is_dir() {
+        if path.join("pyvenv.cfg").is_file() {
+            return Ok(InputKind::Venv);
+        }
+        if let Ok(rd) = fs::read_dir(path) {
+            let mut has_unit = false;
+            let mut has_junit = false;
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if has_unit_extension(&p) {
+                    has_unit = true;
+                    break;
+                }
+                if !has_junit
+                    && p.extension().is_some_and(|e| e == "xml")
+                    && read_head(&p, 8192)
+                        .map(|h| looks_like_junit(&h))
+                        .unwrap_or(false)
+                {
+                    has_junit = true;
+                }
+            }
+            if has_unit {
+                return Ok(InputKind::SystemdDir);
+            }
+            if has_junit {
+                return Ok(InputKind::Junit);
+            }
+        }
+        return Ok(InputKind::Directory);
+    }
+
+    let head = read_head(path, SNIFF_BYTES)?;
+    if head.starts_with(b"\x7fELF") {
+        return Ok(InputKind::Elf);
+    }
+    if path.extension().is_some_and(|e| e == "lens")
+        || (head.starts_with(&[0x1f, 0x8b]) && lens_core::inspect_bundle(path).is_ok())
+    {
+        return Ok(InputKind::Bundle);
+    }
+    if has_unit_extension(path) {
+        return Ok(InputKind::SystemdUnit);
+    }
+    if looks_like_junit(&head) {
+        return Ok(InputKind::Junit);
+    }
+
+    let first_non_ws = head.iter().find(|b| !b.is_ascii_whitespace());
+    match first_non_ws {
+        Some(b'[') => {
+            // JSON array: compile_commands by name, or a parsed first
+            // element that carries `directory` + `file` keys.
+            if path
+                .file_name()
+                .is_some_and(|n| n == "compile_commands.json")
+            {
+                return Ok(InputKind::CompileDb);
+            }
+            if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&head) {
+                if arr
+                    .first()
+                    .and_then(|v| v.as_object())
+                    .is_some_and(|o| o.contains_key("directory") && o.contains_key("file"))
+                {
+                    return Ok(InputKind::CompileDb);
+                }
+            }
+            Ok(InputKind::Log)
+        }
+        Some(b'{') => {
+            // A snapshot/report: parse the whole file and match the
+            // declared schema against the known producers.
+            let text = fs::read(path).map_err(|e| LensError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&text).map_err(|_| LensError::Usage {
+                    message: format!(
+                        "{path:?}: unrecognized JSON input; pass --as to pick a domain"
+                    ),
+                })?;
+            match schema_of(&value) {
+                Some(lens_env::SNAPSHOT_SCHEMA_V1) => Ok(InputKind::EnvSnapshot),
+                Some(lens_sys::SNAPSHOT_SCHEMA_V1) => Ok(InputKind::SysSnapshot),
+                Some(lens_net::REPORT_SCHEMA_V1) => Ok(InputKind::NetReport),
+                other => Err(LensError::Usage {
+                    message: format!(
+                        "{path:?}: unrecognized JSON input (schema {}); pass --as",
+                        other.unwrap_or("<missing>")
+                    ),
+                }),
+            }
+        }
+        _ => {
+            // Plain text: strace validation is fail-closed, so it doubles
+            // as the recognizer — markdown never parses as strace.
+            let text = String::from_utf8_lossy(&head);
+            let head_lines: String = text.lines().take(200).collect::<Vec<_>>().join("\n");
+            if lens_trace::analyze_strace_text(&head_lines).is_ok() {
+                return Ok(InputKind::Strace);
+            }
+            Ok(InputKind::Log)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write(dir: &Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn detects_elf() {
+        let dir = tempdir().unwrap();
+        let mut bytes = b"\x7fELF".to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        let p = write(dir.path(), "bin", &bytes);
+        assert_eq!(detect(&p).unwrap(), InputKind::Elf);
+    }
+
+    #[test]
+    fn detects_junit_with_prolog() {
+        let dir = tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            "r.xml",
+            br#"<?xml version="1.0"?>
+<!-- generated -->
+<testsuite tests="1"><testcase name="a"/></testsuite>"#,
+        );
+        assert_eq!(detect(&p).unwrap(), InputKind::Junit);
+    }
+
+    #[test]
+    fn detects_strace() {
+        let dir = tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            "t.log",
+            b"1 openat(AT_FDCWD, \"/a\", O_RDONLY) = 3\n1 close(3) = 0\n",
+        );
+        assert_eq!(detect(&p).unwrap(), InputKind::Strace);
+    }
+
+    #[test]
+    fn detects_compile_db_by_name_and_by_shape() {
+        let dir = tempdir().unwrap();
+        let by_name = write(
+            dir.path(),
+            "compile_commands.json",
+            br#"[{"directory":"/tmp","command":"cc -c a.c","file":"a.c"}]"#,
+        );
+        assert_eq!(detect(&by_name).unwrap(), InputKind::CompileDb);
+        let by_shape = write(
+            dir.path(),
+            "ccdb.json",
+            br#"[{"directory":"/tmp","command":"cc -c a.c","file":"a.c"}]"#,
+        );
+        assert_eq!(detect(&by_shape).unwrap(), InputKind::CompileDb);
+        let just_array = write(dir.path(), "data.json", br#"[{"x":1}]"#);
+        assert_eq!(detect(&just_array).unwrap(), InputKind::Log);
+    }
+
+    #[test]
+    fn detects_venv_and_systemd_and_plain_dirs() {
+        let dir = tempdir().unwrap();
+        let venv = dir.path().join("venv");
+        fs::create_dir_all(&venv).unwrap();
+        fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        assert_eq!(detect(&venv).unwrap(), InputKind::Venv);
+
+        let units = dir.path().join("units");
+        fs::create_dir_all(&units).unwrap();
+        fs::write(units.join("a.service"), "[Service]\n").unwrap();
+        assert_eq!(detect(&units).unwrap(), InputKind::SystemdDir);
+
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("readme.txt"), "hi\n").unwrap();
+        assert_eq!(detect(&plain).unwrap(), InputKind::Directory);
+    }
+
+    #[test]
+    fn detects_unit_file() {
+        let dir = tempdir().unwrap();
+        let p = write(dir.path(), "a.timer", b"[Timer]\nOnBootSec=1m\n");
+        assert_eq!(detect(&p).unwrap(), InputKind::SystemdUnit);
+    }
+
+    #[test]
+    fn detects_snapshot_schemas() {
+        let dir = tempdir().unwrap();
+        let env = write(
+            dir.path(),
+            "env.json",
+            br#"{"schema":"envlens.snapshot/v1","version":"x","venv":{}}"#,
+        );
+        assert_eq!(detect(&env).unwrap(), InputKind::EnvSnapshot);
+        let sys = write(
+            dir.path(),
+            "sys.json",
+            br#"{"schema":"servicelens.snapshot/v1","version":"x","semantics":"s","units":{},"cycles":[],"diagnostics":[]}"#,
+        );
+        assert_eq!(detect(&sys).unwrap(), InputKind::SysSnapshot);
+        let net = write(
+            dir.path(),
+            "net.json",
+            br#"{"schema_version":"lens.net/v1","summary":{},"sockets":[],"listening":[]}"#,
+        );
+        assert_eq!(detect(&net).unwrap(), InputKind::NetReport);
+    }
+
+    #[test]
+    fn unknown_schema_json_is_a_usage_error() {
+        let dir = tempdir().unwrap();
+        let p = write(dir.path(), "mystery.json", br#"{"schema":"other/v9"}"#);
+        let err = detect(&p).unwrap_err().to_string();
+        assert!(err.contains("unrecognized JSON input"), "{err}");
+        assert!(err.contains("pass --as"), "{err}");
+    }
+
+    #[test]
+    fn plain_text_is_a_log() {
+        let dir = tempdir().unwrap();
+        let p = write(dir.path(), "app.log", b"INFO starting up\nWARN disk\n");
+        assert_eq!(detect(&p).unwrap(), InputKind::Log);
+    }
+
+    #[test]
+    fn detects_bundle() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path().join("b.lens");
+        lens_core::create_bundle_archive(
+            &bundle,
+            "0.0.0-test",
+            &[lens_core::BundleArtifact {
+                name: "reports/x.json".to_string(),
+                data: b"{}".to_vec(),
+            }],
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(detect(&bundle).unwrap(), InputKind::Bundle);
+    }
+
+    #[test]
+    fn missing_path_is_io_error() {
+        assert!(detect(Path::new("/definitely/not/here")).is_err());
+    }
+}

@@ -7,6 +7,7 @@
 pub mod abi;
 pub mod build;
 pub mod bundle;
+pub mod detect;
 pub mod disk;
 pub mod doctor;
 pub mod env;

@@ -11,9 +11,17 @@ pub struct ScanOptions {
     pub max_depth: usize,
     pub max_entries: usize,
     pub one_file_system: bool,
+    /// Exclusion rules per entry: a pattern containing `/` is glob-matched
+    /// against the entry's path relative to the scan root; a pattern with
+    /// `*`/`?` is glob-matched against the entry name; anything else is
+    /// an exact name match. `.git` excludes `.git` only — not `.github`.
     pub exclude_patterns: Vec<String>,
     /// When true, stat calls for directory entries run on the rayon pool.
     pub parallel: bool,
+    /// Whether hitting `max_depth` is an evidence gap. The default 512
+    /// safety bound should be — but a user-set `--max-depth` is a
+    /// deliberate cut, not an error.
+    pub depth_limit_is_error: bool,
 }
 
 impl Default for ScanOptions {
@@ -24,6 +32,7 @@ impl Default for ScanOptions {
             one_file_system: false,
             exclude_patterns: Vec::new(),
             parallel: false,
+            depth_limit_is_error: true,
         }
     }
 }
@@ -52,6 +61,10 @@ pub struct ScanResult {
     pub scanned_entries: usize,
     pub complete: bool,
     pub truncated: bool,
+    /// Directories not descended because of `max_depth` — counted in
+    /// both `depth_limit_is_error` modes so callers can tell users
+    /// a deliberate limit cut the tree.
+    pub depth_limited: usize,
     pub errors: Vec<String>,
 }
 
@@ -113,16 +126,23 @@ impl DiskScanner {
 
         let mut truncated = false;
         let mut scanned_entries = 1;
+        let mut depth_limited = 0usize;
 
         if root_is_dir {
             let mut stack: Vec<(NodeId, PathBuf, usize)> = vec![(root_id, root.clone(), 0)];
 
             while let Some((parent_id, current_dir, depth)) = stack.pop() {
                 if depth >= self.options.max_depth {
-                    errors.push(format!(
-                        "Depth limit ({}) reached at {:?}; subtree not scanned",
-                        self.options.max_depth, current_dir
-                    ));
+                    depth_limited += 1;
+                    // A user-set limit is a deliberate cut, not an
+                    // evidence gap — the node still records it, but the
+                    // scan-level errors list stays clean.
+                    if self.options.depth_limit_is_error {
+                        errors.push(format!(
+                            "Depth limit ({}) reached at {:?}; subtree not scanned",
+                            self.options.max_depth, current_dir
+                        ));
+                    }
                     if let Some(p) = tree.get_mut(parent_id) {
                         p.complete = false;
                         p.error = "depth limit reached".to_string();
@@ -163,12 +183,20 @@ impl DiskScanner {
                 let stat_entry = |entry: &fs::DirEntry| -> StatOutcome {
                     let path = entry.path();
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if self
-                        .options
-                        .exclude_patterns
-                        .iter()
-                        .any(|pat| name.contains(pat))
-                    {
+                    // Exclusion semantics: `a/b` patterns glob the path
+                    // relative to the root, `*.log` globs the name, and a
+                    // plain word is an exact name — `.git` must not eat
+                    // `.github`/`.gitignore`.
+                    let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
+                    if self.options.exclude_patterns.iter().any(|pat| {
+                        if pat.contains('/') {
+                            lens_core::glob::glob_match(pat, &rel)
+                        } else if pat.contains('*') || pat.contains('?') {
+                            lens_core::glob::glob_match(pat, &name)
+                        } else {
+                            name == *pat
+                        }
+                    }) {
                         return StatOutcome::Excluded;
                     }
                     match fs::symlink_metadata(&path) {
@@ -287,6 +315,7 @@ impl DiskScanner {
             scanned_entries,
             complete: errors.is_empty() && !truncated,
             truncated,
+            depth_limited,
             errors,
         })
     }

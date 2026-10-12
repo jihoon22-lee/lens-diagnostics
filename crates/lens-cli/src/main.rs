@@ -3,7 +3,9 @@ use lens_cli::cli::Cli;
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    match lens_cli::ops::dispatch(cli.command) {
+    lens_cli::output::set_quiet(cli.quiet);
+    let opts = cli.global_opts();
+    match lens_cli::ops::dispatch(cli.command, &opts) {
         // Exit-code convention: 0 = clean, 1 = findings, 2 = error.
         Ok(outcome) => {
             lens_cli::flush_stdout();

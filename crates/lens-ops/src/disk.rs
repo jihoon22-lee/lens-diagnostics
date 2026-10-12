@@ -16,10 +16,15 @@ pub fn scan(path: &Path, options: ScanOptions) -> Result<Report<ScanResult>> {
     Ok(report)
 }
 
-/// Find duplicate files. Scan gaps or hash failures mark the report
-/// incomplete; found groups are an Info finding.
-pub fn duplicates(path: &Path, min_size: u64) -> Result<Report<DuplicateReport>> {
-    let res = DiskScanner::new(ScanOptions::default()).scan(path)?;
+/// Find duplicate files under the same scan options as `scan` (callers
+/// pass `ScanOptions::default()` for the plain sweep). Scan gaps or hash
+/// failures mark the report incomplete; found groups are an Info finding.
+pub fn duplicates(
+    path: &Path,
+    min_size: u64,
+    options: ScanOptions,
+) -> Result<Report<DuplicateReport>> {
+    let res = DiskScanner::new(options).scan(path)?;
     let scan_complete = res.complete && !res.truncated;
     let scan_errors = res.errors.clone();
     let dup = DuplicateFinder::new(min_size).find_in_tree(&res.tree, path)?;

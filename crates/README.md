@@ -20,16 +20,25 @@ Lens는 단일 Rust 워크스페이스다. 각 `lens-*` 크레이트가 하나�
 | `diff` | `Compatibility` 3상태 enum, `SetDiff<T>` |
 | `evidence` | `Evidence`, `Source`, 상한 있는 `BoundedCollector` |
 | `json` | 결정론적 JSON 직렬화(키 정렬) |
+| `glob` | `*`/`?` 미니 글롭(`glob_match`) — `--exclude` 패턴과 테스트 입력 글롭이 공유 |
 | `time` | UTC/로컬 ISO-8601 타임스탬프 유틸 |
 | `bundle` | `lens.bundle/v2` — tar.gz + `manifest.json`(SHA-256, 크기·항목 상한) 생성/검사/검증, `read_bundle_entry`(단일 엔트리 추출), `extract_bundle`(검증 우선 + 이름 검증 + `--force` 없이 덮어쓰기 거부) |
 
 ## lens-disk — 파일시스템 분석
 
 - `ArenaTree`: `u32` 인덱스 연속 아레나. 자식 삽입 O(1)(`last_child`),
-  크기 집계는 반복형 post-order(깊은 트리 스택 안전).
+  크기 집계는 반복형 post-order(깊은 트리 스택 안전). 디렉터리 집계에서
+  `hard_link_count > 1`인 같은 inode는 노드 id 순 첫 등장만 합산한다 —
+  파일 노드 자체는 각자 크기를 유지하고, `(0,0)` identity는 절대
+  중복 제거하지 않는다.
 - `DiskScanner`: 최대 깊이/항목 수, 제외 패턴, 마운트 경계(`one_file_system`),
   심볼링크 루프 감지(링크 **타깃**의 dev/ino 사용). `ScanOptions::parallel`이
-  실제 rayon 병렬 stat을 수행.
+  실제 rayon 병렬 stat을 수행. `exclude_patterns`는 `lens-core`의
+  `glob_match` 규칙 — `/` 포함은 루트 상대 경로 glob, `*`/`?` 포함은 이름
+  glob, 나머지는 이름 정확 일치(`.git`이 `.github`를 제외하지 않음).
+  `depth_limit_is_error`(기본 true)가 false면 `max_depth` 도달이 스캔
+  오류로 기록되지 않고 `complete`를 깎지 않는다 — 절단된 디렉터리 수는
+  `ScanResult::depth_limited`로 양쪽 모드에서 집계된다.
 - `DuplicateFinder`: 크기→inode 묶음→4KB 부분 해시→전체 SHA-256 순으로 필터.
   같은 inode의 하드링크는 회수 가능 용량에서 중복 계산하지 않는다.
   `find_in_tree`는 `DuplicateReport`(groups + 해시 실패 `errors` +
@@ -171,7 +180,10 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
 - 모듈: `disk`, `abi`, `log`(`open`/`build_filter`), `test`(파일/디렉터리/
   글롭 입력), `trace`(fail-closed 입력 검증), `sys`, `build`, `env`,
   `net`, `bundle`(수집기+검증/해제 래퍼), `doctor`, `json`(스키마 검증
-  포함 JSON 로더).
+  포함 JSON 로더), `detect`(`lens inspect`/`diff`용 입력 자동 판별 —
+  확장자·매직·처음 64 KiB 내용으로 `InputKind` 결정).
+- `env::diff`는 스냅샷 JSON과 venv 디렉터리를 혼합해 받는다(디렉터리는
+  그 자리에서 inspect). `disk::duplicates`는 `ScanOptions`를 통째로 받는다.
 - clap·출력 없음 — 프레젠테이션은 소비자 책임.
 
 ## lens-cli — `lens` 통합 CLI
@@ -179,9 +191,13 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
 - `src/cli.rs`: clap 커맨드 트리. `src/ops.rs`: 렌더러 — `lens-ops`
   결과를 text/JSON으로 출력하고 `is_actionable`을 종료 코드로 변환.
   `main.rs`는 얇은 래퍼.
-- `doctor`: 스토리지/네트워크/서비스/환경 종합 헬스체크(`--json`,
-  `--fail-on` 지원; 구현은 `lens-ops`에 있고 `lens_cli::doctor`로
-  re-export된다).
+- 전역 옵션(`--format`, `--json`, `--fail-on warn|fail`, `-q/--quiet`)은
+  `Cli`의 global 인자라 서브커맨드 앞·뒤 모두에서 동작한다.
+  `-q`는 `output::diagln!`으로 찍는 비오류 stderr 진단만 끈다.
+- 최상위 `inspect`/`diff`: `lens_ops::detect`로 입력을 판별해 동등한
+  도메인 명령으로 재디스패치한다(출력·종료 코드 동일, `--as`로 강제).
+- `doctor`: 스토리지/네트워크/서비스/환경 종합 헬스체크(구현은
+  `lens-ops`에 있고 `lens_cli::doctor`로 re-export된다).
 - text 모드에서는 도메인 출력 뒤에 `Findings:` 블록([FAIL]/[WARN])
   이 출력된다. JSON 출력에는 findings가 섞이지 않는다.
 - `bundle create/inspect/verify/show/extract`: `lens.bundle/v2` 아카이브.

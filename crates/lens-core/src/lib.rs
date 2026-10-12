@@ -16,6 +16,7 @@ pub mod bundle;
 pub mod diff;
 pub mod error;
 pub mod evidence;
+pub mod glob;
 pub mod hash;
 pub mod identity;
 pub mod json;

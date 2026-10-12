@@ -1,4 +1,5 @@
 use std::io::{BufWriter, Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Process-global buffered stdout (64 KiB): every `outln!`/`bytes` call
@@ -56,3 +57,28 @@ macro_rules! outln {
 }
 
 pub(crate) use outln;
+
+/// `-q/--quiet`: suppresses non-error stderr diagnostics (`diagln!`)
+/// only — real errors still print, and stdout is never touched.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet(q: bool) {
+    QUIET.store(q, Ordering::Relaxed);
+}
+
+pub fn quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
+/// Diagnostic stderr line — same as `eprintln!` but a no-op under
+/// `-q/--quiet`. For advisory output (scan warnings, filter notes,
+/// impact hints), never for errors.
+macro_rules! diagln {
+    ($($arg:tt)*) => {
+        if !$crate::output::quiet() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+pub(crate) use diagln;
