@@ -347,4 +347,51 @@ ExecStart=/usr/bin/new-daemon --fast
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0], vec!["app.service", "worker@1.service"]);
     }
+
+    #[test]
+    fn test_transitive_template_instances_reach_fixpoint() {
+        // app -> a@one (template a@.service) -> b@one (template b@.service)
+        // -> app. The b@one instance is only referenced by a synthesized
+        // instance, so a single pass over the original units would miss it.
+        let mut units = BTreeMap::new();
+        units.insert(
+            "app.service".to_string(),
+            parse_unit_content("[Unit]\nBefore=a@one.service\n", "app.service", None),
+        );
+        units.insert(
+            "a@.service".to_string(),
+            parse_unit_content("[Unit]\nBefore=b@%i.service\n", "a@.service", None),
+        );
+        units.insert(
+            "b@.service".to_string(),
+            parse_unit_content("[Unit]\nBefore=app.service\n", "b@.service", None),
+        );
+        let cycles = OrderingGraph::build(&units).find_cycles();
+        assert_eq!(
+            cycles.len(),
+            1,
+            "cycle through chained instances: {cycles:?}"
+        );
+        assert_eq!(
+            cycles[0],
+            vec!["a@one.service", "app.service", "b@one.service"]
+        );
+    }
+
+    #[test]
+    fn test_growing_template_instances_terminate() {
+        // a@.service -> a@%i-x.service never reaches a fixpoint on its own;
+        // the round cap must bound it instead of looping forever.
+        let mut units = BTreeMap::new();
+        units.insert(
+            "app.service".to_string(),
+            parse_unit_content("[Unit]\nBefore=a@one.service\n", "app.service", None),
+        );
+        units.insert(
+            "a@.service".to_string(),
+            parse_unit_content("[Unit]\nBefore=a@%i-x.service\n", "a@.service", None),
+        );
+        let graph = OrderingGraph::build(&units);
+        assert!(graph.all_nodes.len() < 200);
+    }
 }

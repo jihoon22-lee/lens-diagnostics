@@ -71,33 +71,49 @@ impl OrderingGraph {
 
         // Collect concrete template instances (e.g. `foo@bar.service`)
         // referenced by loaded units when `foo@bar.service` is not explicitly
-        // in `units` but its template `foo@.service` is.
+        // in `units` but its template `foo@.service` is. A synthesized instance
+        // can itself reference further instances (`a@one` -> `b@one`), so
+        // iterate to a fixpoint. The round cap bounds pathological templates
+        // whose instance name keeps growing (`a@.service` -> `a@%i-x.service`).
+        const MAX_INSTANTIATION_ROUNDS: usize = 32;
         let mut synthesized_instances: BTreeMap<String, SystemdUnit> = BTreeMap::new();
-        for (name, unit) in units {
-            if excluded(name) {
-                continue;
-            }
-            let refs = unit
-                .before
-                .iter()
-                .chain(unit.after.iter())
-                .chain(unit.wants.iter())
-                .chain(unit.requires.iter())
-                .chain(unit.ordering_edges.iter().map(|e| &e.target));
-            for raw_target in refs {
-                let target = resolve(raw_target);
-                if units.contains_key(&target) || synthesized_instances.contains_key(&target) {
+        for _ in 0..MAX_INSTANTIATION_ROUNDS {
+            let mut fresh: BTreeMap<String, SystemdUnit> = BTreeMap::new();
+            for (name, unit) in units.iter().chain(synthesized_instances.iter()) {
+                if excluded(name) {
                     continue;
                 }
-                if let Some(tpl_name) = template_name_of(&target) {
-                    if let Some(tpl_unit) = units.get(&tpl_name) {
-                        if !tpl_unit.masked && tpl_unit.alias_of.is_none() {
-                            synthesized_instances
-                                .insert(target.clone(), instantiate_template(tpl_unit, &target));
+                let refs = unit
+                    .before
+                    .iter()
+                    .chain(unit.after.iter())
+                    .chain(unit.wants.iter())
+                    .chain(unit.requires.iter())
+                    .chain(unit.ordering_edges.iter().map(|e| &e.target));
+                for raw_target in refs {
+                    let target = resolve(raw_target);
+                    if units.contains_key(&target)
+                        || synthesized_instances.contains_key(&target)
+                        || fresh.contains_key(&target)
+                    {
+                        continue;
+                    }
+                    if let Some(tpl_name) = template_name_of(&target) {
+                        if let Some(tpl_unit) = units.get(&tpl_name) {
+                            if !tpl_unit.masked && tpl_unit.alias_of.is_none() {
+                                fresh.insert(
+                                    target.clone(),
+                                    instantiate_template(tpl_unit, &target),
+                                );
+                            }
                         }
                     }
                 }
             }
+            if fresh.is_empty() {
+                break;
+            }
+            synthesized_instances.extend(fresh);
         }
 
         for (name, unit) in units.iter().chain(synthesized_instances.iter()) {

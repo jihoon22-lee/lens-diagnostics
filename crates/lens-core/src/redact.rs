@@ -50,34 +50,34 @@ pub fn redact_bytes(data: &[u8]) -> Vec<u8> {
 }
 
 fn redact_pem_blocks(input: &str) -> String {
+    const BEGIN: &str = "-----BEGIN ";
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
-    while let Some(start) = rest.find("-----BEGIN ") {
+    while let Some(start) = rest.find(BEGIN) {
         out.push_str(&rest[..start]);
         let after_begin = &rest[start..];
-        if let Some(header_end) = after_begin.find("-----") {
-            let header_tail = &after_begin[header_end + 5..];
-            if let Some(close_dashes) = header_tail.find("-----") {
-                let label = &header_tail[..close_dashes];
-                if label.contains("PRIVATE KEY") {
-                    let end_marker = format!("-----END {}-----", label);
-                    if let Some(end_pos) = after_begin.find(&end_marker) {
-                        let block_end = end_pos + end_marker.len();
-                        let secret_body = &after_begin[..block_end];
-                        out.push_str(&format!(
-                            "-----BEGIN {}-----{}-----END {}-----",
-                            label,
-                            token_for(secret_body),
-                            label
-                        ));
-                        rest = &after_begin[block_end..];
-                        continue;
-                    }
+        // The label sits between `-----BEGIN ` and the closing `-----`.
+        let label_area = &after_begin[BEGIN.len()..];
+        if let Some(label_len) = label_area.find("-----") {
+            let label = &label_area[..label_len];
+            if label.contains("PRIVATE KEY") {
+                let end_marker = format!("-----END {}-----", label);
+                if let Some(end_pos) = after_begin.find(&end_marker) {
+                    let block_end = end_pos + end_marker.len();
+                    let secret_body = &after_begin[..block_end];
+                    out.push_str(&format!(
+                        "-----BEGIN {}-----{}-----END {}-----",
+                        label,
+                        token_for(secret_body),
+                        label
+                    ));
+                    rest = &after_begin[block_end..];
+                    continue;
                 }
             }
         }
-        out.push_str("-----BEGIN ");
-        rest = &after_begin["-----BEGIN ".len()..];
+        out.push_str(BEGIN);
+        rest = &after_begin[BEGIN.len()..];
     }
     out.push_str(rest);
     out
@@ -313,5 +313,38 @@ mod tests {
         let scrubbed2 = redact_str(line2);
         assert!(!scrubbed2.contains("secrettoken78901234"));
         assert!(scrubbed2.contains("한글 로그 🚀 bearer <REDACTED:sha256:"));
+    }
+
+    #[test]
+    fn test_redact_pem_private_key_block() {
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\nabcDEF123==";
+        for label in ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"] {
+            let input =
+                format!("before\n-----BEGIN {label}-----\n{body}\n-----END {label}-----\nafter\n");
+            let out = redact_str(&input);
+            assert!(
+                !out.contains("MIIEvQIBADANBg"),
+                "{label} body leaked: {out}"
+            );
+            assert!(!out.contains("abcDEF123"), "{label} body leaked: {out}");
+            assert!(out.contains(&format!("-----BEGIN {label}-----")));
+            assert!(out.contains(&format!("-----END {label}-----")));
+            assert!(out.contains("<REDACTED:sha256:"));
+            assert!(out.starts_with("before\n") && out.ends_with("after\n"));
+        }
+        // Identical keys produce identical tokens (correlation across artifacts).
+        let a = redact_str(&format!(
+            "-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
+        ));
+        let b = redact_str(&format!(
+            "x\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
+        ));
+        assert!(b.ends_with(&a));
+    }
+
+    #[test]
+    fn test_redact_leaves_public_pem_and_unterminated_blocks_alone() {
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+        assert_eq!(redact_str(cert), cert);
     }
 }

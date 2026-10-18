@@ -121,6 +121,8 @@ pub(crate) fn evaluate_capacity(
     let inode_note = inode
         .map(|p| format!(", inodes {p:.1}% free"))
         .unwrap_or_default();
+    // Inode-only branches must report the inode percentage, not the space one.
+    let inode_pct = inode.unwrap_or(100.0);
     let (message, recommendation) = match status {
         HealthStatus::Fail
             if inode_status == HealthStatus::Fail && space_status != HealthStatus::Fail =>
@@ -128,7 +130,7 @@ pub(crate) fn evaluate_capacity(
             (
                 format!(
                     "Critically low free inodes: {:.1}% free ({:.2} GB space available){}",
-                    free_pct, avail_gb, inode_note
+                    inode_pct, avail_gb, inode_note
                 ),
                 Some(
                     "Clean up directories with excessive small files using 'lens disk scan'."
@@ -151,7 +153,7 @@ pub(crate) fn evaluate_capacity(
             (
                 format!(
                     "Low free inodes warning: {:.1}% free ({:.2} GB space available){}",
-                    free_pct, avail_gb, inode_note
+                    inode_pct, avail_gb, inode_note
                 ),
                 Some("Consider pruning directories with many small files.".to_string()),
             )
@@ -956,6 +958,21 @@ pub fn diff_reports(base: &DoctorReport, cand: &DoctorReport) -> Report<DoctorDi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inode_only_failure_reports_inode_percentage() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        // 80% of space free, only 2% of inodes free.
+        let c = evaluate_capacity(100 * GB, 80 * GB, Some(2.0), Path::new("/data"), "Data");
+        assert_eq!(c.status, HealthStatus::Fail);
+        assert!(
+            c.message
+                .starts_with("Critically low free inodes: 2.0% free"),
+            "{}",
+            c.message
+        );
+        assert!(!c.message.contains("80.0% free ("), "{}", c.message);
+    }
 
     #[test]
     fn test_doctor_storage_check() {

@@ -406,19 +406,10 @@ fn eval_extra(op: &str, val: &str, env: &MarkerEnv) -> TriState {
 fn compare_value(actual: &str, op: &str, expected: &str, version: bool) -> TriState {
     match op {
         "in" | "not in" => {
-            let matched = if version {
-                let tokens: Vec<&str> = expected
-                    .split(|c: char| c.is_whitespace() || c == ',')
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !tokens.is_empty() {
-                    tokens.iter().any(|t| version_eq(actual, t))
-                } else {
-                    expected.contains(actual)
-                }
-            } else {
-                expected.contains(actual)
-            };
+            // PEP 508: `in`/`not in` are string containment for every
+            // variable (version-valued ones included) — never version-token
+            // equality, which would wrongly reject e.g. '3.10' in '3.10.1 3.11'.
+            let matched = expected.contains(actual);
             return tri(if op == "in" { matched } else { !matched });
         }
         // flipped forms from flip_op
@@ -928,9 +919,21 @@ mod tests {
             evaluate_marker("python_version not in '3.10 3.11 3.12'", &e_314),
             TriState::True
         );
-        // 3.1 must not match as a substring of 3.10.
+        // PEP 508 `in` is plain string containment, so '3.1' is contained in
+        // '3.10 3.11 3.12' (users wanting exact tokens must not rely on this).
         assert_eq!(
             evaluate_marker("python_version in '3.10 3.11 3.12'", &e_31),
+            TriState::True
+        );
+        // Regression: a legal marker listing a longer patch version must
+        // still match the major.minor `python_version` by containment.
+        let e_310 = MarkerEnv::for_venv("3.10.4", &[]);
+        assert_eq!(
+            evaluate_marker("python_version in '3.10.1 3.11'", &e_310),
+            TriState::True
+        );
+        assert_eq!(
+            evaluate_marker("python_version not in '3.10.1 3.11'", &e_310),
             TriState::False
         );
     }

@@ -43,6 +43,10 @@ pub struct BundleManifest {
     /// Collection failures recorded at bundle time — evidence of absence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    /// True when artifact bytes were scrubbed by the redactor before hashing.
+    /// Older manifests lack the field and deserialize as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
 }
 
 /// One artifact destined for the bundle (typically a serialized report).
@@ -100,6 +104,27 @@ pub fn create_bundle_archive<P: AsRef<Path>>(
     diagnostics: Vec<String>,
     overwrite: bool,
 ) -> Result<BundleManifest> {
+    create_bundle_archive_with_redaction(
+        bundle_path,
+        tool_version,
+        artifacts,
+        diagnostics,
+        overwrite,
+        false,
+    )
+}
+
+/// Like [`create_bundle_archive`], additionally recording in the manifest
+/// whether the artifact bytes were passed through the redactor — so a shared
+/// bundle is never mistaken for an unredacted original capture.
+pub fn create_bundle_archive_with_redaction<P: AsRef<Path>>(
+    bundle_path: P,
+    tool_version: &str,
+    artifacts: &[BundleArtifact],
+    diagnostics: Vec<String>,
+    overwrite: bool,
+    redacted: bool,
+) -> Result<BundleManifest> {
     let path_ref = bundle_path.as_ref();
 
     let mut seen = std::collections::HashSet::new();
@@ -149,6 +174,7 @@ pub fn create_bundle_archive<P: AsRef<Path>>(
         created_at: crate::time::utc_now_iso(),
         sources,
         diagnostics,
+        redacted,
     };
     // Gate before deterministic serialization clones strings into a Value.
     let _bounded = crate::json::to_bounded_vec(&manifest, MAX_MANIFEST_BYTES as usize)?;
@@ -645,13 +671,18 @@ pub fn read_bundle_entry<P: AsRef<Path>>(bundle_path: P, name: &str) -> Result<V
                 ),
             });
         }
-        let src = manifest
+        let mut matching = manifest
             .sources
             .iter()
-            .find(|s| normalize_entry_name(&s.path) == want)
-            .ok_or_else(|| LensError::InvalidInput {
-                message: format!("entry {:?} is not listed in bundle manifest", name),
-            })?;
+            .filter(|s| normalize_entry_name(&s.path) == want);
+        let src = matching.next().ok_or_else(|| LensError::InvalidInput {
+            message: format!("entry {:?} is not listed in bundle manifest", name),
+        })?;
+        if matching.next().is_some() {
+            return Err(LensError::InvalidInput {
+                message: format!("bundle manifest lists entry {:?} more than once", name),
+            });
+        }
         let actual_hash = digest_bytes(&bytes);
         if !actual_hash.eq_ignore_ascii_case(&src.sha256) || bytes.len() as u64 != src.size {
             return Err(LensError::InvalidInput {
@@ -1011,6 +1042,54 @@ mod tests {
                 .unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn test_redacted_flag_recorded_and_omitted_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.lens");
+        let scrubbed = dir.path().join("scrubbed.lens");
+        let m_plain =
+            create_bundle_archive(&plain, "x", &sample_artifacts(), vec![], false).unwrap();
+        let m_red = create_bundle_archive_with_redaction(
+            &scrubbed,
+            "x",
+            &sample_artifacts(),
+            vec![],
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!m_plain.redacted);
+        assert!(m_red.redacted);
+
+        // Default bundles keep the exact pre-existing manifest bytes: the
+        // field is omitted when false, so older tooling/hashes are unaffected.
+        let plain_manifest = read_bundle_entry(&plain, MANIFEST_ENTRY).unwrap();
+        assert!(!String::from_utf8_lossy(&plain_manifest).contains("redacted"));
+
+        let inspected = inspect_bundle(&scrubbed).unwrap();
+        assert!(inspected.manifest.unwrap().redacted);
+        assert!(verify_bundle_archive(&scrubbed).unwrap().is_valid);
+    }
+
+    #[test]
+    fn test_show_rejects_duplicate_manifest_source() {
+        let tmp = NamedTempFile::new().unwrap();
+        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![], true).unwrap();
+        rebuild_with(tmp.path(), |entries| {
+            for (name, data) in entries.iter_mut() {
+                if name == MANIFEST_ENTRY {
+                    let mut m: serde_json::Value = serde_json::from_slice(data).unwrap();
+                    let first = m["sources"][0].clone();
+                    m["sources"].as_array_mut().unwrap().push(first);
+                    *data = serde_json::to_vec(&m).unwrap();
+                }
+            }
+        });
+        assert!(!verify_bundle_archive(tmp.path()).unwrap().is_valid);
+        let err = read_bundle_entry(tmp.path(), "reports/disk_snapshot.json").unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
     }
 
     #[test]

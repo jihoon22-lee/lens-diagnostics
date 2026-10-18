@@ -25,9 +25,9 @@ pub mod redact;
 pub mod time;
 
 pub use bundle::{
-    create_bundle_archive, extract_bundle, inspect_bundle, normalize_entry_name, read_bundle_entry,
-    verify_bundle_archive, BundleArtifact, BundleInspection, BundleManifest,
-    BundleVerificationReport, BUNDLE_SCHEMA_V2,
+    create_bundle_archive, create_bundle_archive_with_redaction, extract_bundle, inspect_bundle,
+    normalize_entry_name, read_bundle_entry, verify_bundle_archive, BundleArtifact,
+    BundleInspection, BundleManifest, BundleVerificationReport, BUNDLE_SCHEMA_V2,
 };
 pub use diff::{Compatibility, SetDiff};
 pub use error::{LensError, Result};
