@@ -4,11 +4,34 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
 
 ## Unreleased
 
-- Confine discovered systemd, JUnit, environment, network and build evidence reads to MCP allowed roots, including symlinked descendants and drop-ins.
-- Preserve bundle collection failures and incomplete JUnit/disk evidence; validate bundled section schemas before comparison.
-- Preserve MCP diagnostics, honor log-stats `include_unknown`, and enforce the response byte budget even for oversized individual values.
-- Compare individual systemd unit files, wait through log rotation gaps, and retain epoch/pre-epoch log timestamps with correct bucket boundaries.
-- Classify single-file systemd masks/aliases consistently and skip unknown bundle section fields without intermediate JSON allocations.
+## 0.8.0
+
+전수 코드 리뷰 결함 수정·리팩토링 및 포렌식 플랫폼 기능 고도화 릴리스: 제로-클론 결정론적 JSON 직렬화, 제로-할당 UTF-8 글로브 엔진, FIFO/심볼릭링크 샌드박스 보안 강화, PII/시크릿 마스킹 엔진(`--redact`), 도메인 분석기(test, trace, sys, build, env, net) 전수 결함 수정 및 CLI/TUI/MCP 사용성 개선.
+
+### 추가
+
+- `lens-core`:
+  - 증거 보존형 PII/시크릿 마스킹 엔진 (`redact_str`, `redact_bytes`): API 키(`sk-`, `ghp_`, `AKIA`, `AIza`), Bearer 토큰, `password`/`secret` 키-값, PEM 개인키를 `<REDACTED:sha256:8자리>` 솔트 해시로 결정론적 치환.
+  - `lens snapshot --redact` 및 `lens bundle create --redact` 플래그 지원.
+  - 제로-클론 결정론적 JSON 직렬화 (`BTreeMap` 기반) 및 UTF-8 바이트 슬라이스 글로브 매처 (`[0-9]`, `[!a-z]` 지원).
+  - `read_policy::check_boundary`: Dangling 심볼릭 링크 타깃 재귀 검증으로 샌드박스 우회 원천 차단.
+- `lens-disk` / `lens-abi` / `lens-log`:
+  - `lens-disk`: 비재귀 심층 디렉터리 스냅샷 직렬화 (`MAX_INLINE_DEPTH = 32`), dotfile 휴지통 복원, 중복 탐색 부분 해시 재사용 및 FIFO 제외.
+  - `lens-abi`: DWARF 구조체 바이트 크기(`DW_AT_byte_size`) 추출 및 비호환 레이아웃 변경 감지, ELF visibility 및 `STT_TLS` 지원.
+  - `lens-log`: 0바이트 빈 파일 mmap 방지, Syslog `[ERROR]` 구분자 탐지, 공백 구분 ISO 타임스탬프 타임존 오프셋 보존.
+- 도메인 분석기:
+  - `lens-test`: quick-xml 0.41 `Event::GeneralRef` 엔티티 복원, `trim_text(false)` 공백 보존.
+  - `lens-trace`: 멀티스레드 `strace -f`의 `<unfinished ...>` 파싱 지원, 시스템콜 지연시간 퍼센타일(`p50_ns`, `p95_ns`, `p99_ns`) 산출.
+  - `lens-sys`: 유닛 `masked` 및 `alias_of` 변경 감지, 템플릿 인스턴스 DAG 해석.
+  - `lens-build`: UTF-8 주석 제거 손상 수정, `#include <...>` 시스템 헤더 오탐 제외.
+  - `lens-env`: `Requires-Dist` 괄호 버전 명시자 파싱, PEP 440 Epoch 지원, editable self-shadowing 오탐 제외.
+  - `lens-net`: PID 결정론적 정렬, 소켓 지연 읽기(Lazy Read), Unix 소켓 다중 공백 보존.
+- CLI / TUI / MCP:
+  - `lens inspect`, `lens disk scan`, `lens disk duplicates` 기본 경로 `.` 지원.
+  - `lens log filter --follow --format jsonl` 지원 및 로그 로테이션 감지 시 라인 번호 초기화.
+  - `lens doctor`: 소형 파티션 용량 평가 개선 및 `remediation` 후속 조치 가이드 추가.
+  - `lens-tui`: Logs 탭 `g` 키 탐색, Network 탭 소켓 소유권 구분, 도움말 모달 `Clear` 렌더링.
+  - `lens-mcp`: `check_allowed` 경계 검증 일원화, `lens_log_filter` 고속 매칭 및 `_pagination` 메타데이터 제공.
 
 ## 0.7.0
 
