@@ -65,9 +65,8 @@ fn main() -> io::Result<()> {
             Err(_) => break,
         };
         if bytes_read > MAX_REQUEST_LINE_BYTES && !line.ends_with('\n') {
-            // Drain the rest of the oversized line so framing recovers.
-            let mut discard = Vec::new();
-            let _ = reader.read_until(b'\n', &mut discard);
+            // Drain the rest of the oversized line so framing recovers without unbounded heap allocations.
+            let _ = drain_until_newline(&mut reader);
             let err_resp = JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id: None,
@@ -304,5 +303,46 @@ fn handle_request(req: &JsonRpcRequest, id_present: bool) -> Option<JsonRpcRespo
                 data: None,
             }),
         }),
+    }
+}
+
+/// Discards bytes from `reader` through internal buffers until a newline or EOF is
+/// encountered, without allocating heap memory for the discarded data.
+fn drain_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let len = available.len();
+        reader.consume(len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_drain_until_newline() {
+        let mut data = Cursor::new(b"discarded text\nnext line");
+        drain_until_newline(&mut data).unwrap();
+        let mut rest = String::new();
+        data.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "next line");
+    }
+
+    #[test]
+    fn test_drain_until_eof_without_newline() {
+        let mut data = Cursor::new(b"discarded text without newline");
+        drain_until_newline(&mut data).unwrap();
+        let mut rest = String::new();
+        data.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "");
     }
 }

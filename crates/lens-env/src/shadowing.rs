@@ -389,10 +389,16 @@ fn extract_pkg_from_pth_stem(stem: &str) -> Option<String> {
 }
 
 fn parse_direct_url_target(content: &str) -> Option<std::path::PathBuf> {
-    let idx = content.find("\"file://")?;
-    let after = &content[idx + 1..];
-    let end = after.find('"')?;
-    let url = &after[..end];
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let is_editable = v
+        .get("dir_info")
+        .and_then(|d| d.get("editable"))
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    if !is_editable {
+        return None;
+    }
+    let url = v.get("url").and_then(|u| u.as_str())?;
     let path_str = url.strip_prefix("file://")?;
     // Handle `file://localhost/path` or `file:///path`
     let path_str = path_str.strip_prefix("localhost").unwrap_or(path_str);
@@ -528,4 +534,34 @@ fn read_pyproject_package_name(project_root: &Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_direct_url_target_requires_editable() {
+        let editable_json = r#"{
+            "url": "file:///path/to/my-pkg",
+            "dir_info": {
+                "editable": true
+            }
+        }"#;
+        assert_eq!(
+            parse_direct_url_target(editable_json),
+            Some(std::path::PathBuf::from("/path/to/my-pkg"))
+        );
+
+        let non_editable_json = r#"{
+            "url": "file:///path/to/my-pkg",
+            "dir_info": {}
+        }"#;
+        assert_eq!(parse_direct_url_target(non_editable_json), None);
+
+        let missing_dir_info = r#"{
+            "url": "file:///path/to/my-pkg"
+        }"#;
+        assert_eq!(parse_direct_url_target(missing_dir_info), None);
+    }
 }

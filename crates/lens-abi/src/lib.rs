@@ -250,6 +250,8 @@ mod tests {
         let mut a = inspect_elf("lib_v1.so", fake);
         a.status = InputStatus::Valid;
         a.abi.types = vec!["MyStruct (size=16)".to_string()];
+        // Expose MyStruct through public/defined ABI symbol
+        a.abi.symbols = vec!["create_mystruct".to_string()];
 
         let mut b = a.clone();
         b.abi.types = vec!["MyStruct (size=24)".to_string()];
@@ -257,5 +259,30 @@ mod tests {
         let diff = diff_reports(&a, &b);
         assert!(diff.changed);
         assert_eq!(diff.compatibility, lens_core::Compatibility::Incompatible);
+        assert!(diff
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("ABI-exposed DWARF type layout changed: MyStruct")));
+    }
+
+    #[test]
+    fn test_e01_unclassified_dwarf_struct_size_change_is_uncertain() {
+        let fake = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0\x01\0\0\0\0\0\0\0\0\0\0\0";
+        let mut a = inspect_elf("lib_v1.so", fake);
+        a.status = InputStatus::Valid;
+        // Private implementation struct not exposed in ABI
+        a.abi.types = vec!["PrivateState (size=16)".to_string()];
+        a.abi.symbols = vec!["public_func".to_string()];
+
+        let mut b = a.clone();
+        b.abi.types = vec!["PrivateState (size=24)".to_string()];
+
+        let diff = diff_reports(&a, &b);
+        assert!(diff.changed);
+        assert_eq!(diff.compatibility, lens_core::Compatibility::Uncertain);
+        assert!(diff
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("Unclassified DWARF type layout changed: PrivateState")));
     }
 }

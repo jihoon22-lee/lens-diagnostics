@@ -227,9 +227,14 @@ fn redact_kv_assignments(line: &str) -> String {
                     out.push_str(&line[i..cursor]);
                     let val_start = cursor;
                     if let Some(q) = quote {
+                        let mut escaped = false;
                         while cursor < line.len() {
                             let ch = line[cursor..].chars().next().unwrap();
-                            if ch == q {
+                            if escaped {
+                                escaped = false;
+                            } else if ch == '\\' {
+                                escaped = true;
+                            } else if ch == q {
                                 break;
                             }
                             cursor += ch.len_utf8();
@@ -346,5 +351,16 @@ mod tests {
     fn test_redact_leaves_public_pem_and_unterminated_blocks_alone() {
         let cert = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
         assert_eq!(redact_str(cert), cert);
+    }
+
+    #[test]
+    fn test_redact_quoted_secret_with_escaped_quotes() {
+        let input = r#"{"api_key": "abc\"def\\\"ghi", "next": 123}"#;
+        let scrubbed = redact_str(input);
+        assert!(!scrubbed.contains("abc"), "leaked abc: {scrubbed}");
+        assert!(!scrubbed.contains("def"), "leaked def: {scrubbed}");
+        assert!(!scrubbed.contains("ghi"), "leaked ghi: {scrubbed}");
+        assert!(scrubbed.contains(r#"{"api_key": "<REDACTED:sha256:"#));
+        assert!(scrubbed.ends_with(r#"", "next": 123}"#));
     }
 }
