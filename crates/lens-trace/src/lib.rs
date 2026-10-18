@@ -33,13 +33,14 @@ impl std::error::Error for TraceInputError {}
 /// share this gate instead of analyzing anything readable.
 pub fn analyze_strace_text(content: &str) -> Result<TraceSnapshot, TraceInputError> {
     let snapshot = TraceAnalyzer::new().analyze_lines(content.lines());
-    let unparsed = snapshot.total_events.saturating_sub(snapshot.total_calls);
-    if snapshot.total_events == 0 {
+    let unparsed = snapshot.unparsed_lines;
+    let valid = snapshot.total_calls + snapshot.unfinished_calls;
+    if valid == 0 && unparsed == 0 {
         return Err(TraceInputError::new(
             "contains no recognizable strace lines".to_string(),
         ));
     }
-    if unparsed > snapshot.total_calls {
+    if unparsed > valid {
         return Err(TraceInputError::new(format!(
             "does not look like strace output: {} of {} lines failed to parse",
             unparsed, snapshot.total_events
@@ -115,5 +116,71 @@ mod tests {
         assert_eq!(diff.error_delta, 1);
         assert_eq!(diff.new_errors, vec!["openat:ENOENT"]);
         assert!(diff.resolved_errors.is_empty());
+    }
+
+    #[test]
+    fn test_tr01_multithreaded_unfinished_and_resumed_accepted() {
+        let mut lines = Vec::new();
+        for i in 0..10 {
+            let tid = 1000 + i;
+            lines.push(format!("{tid} read(3, <unfinished ...>"));
+            lines.push(format!(
+                "{tid} <... read resumed>\"hello\", 5) = 5 <0.000010>"
+            ));
+        }
+        lines.push("1099 accept4(4, <unfinished ...>".to_string());
+        let text = lines.join("\n");
+
+        let snap = analyze_strace_text(&text).expect("multithreaded strace should be accepted");
+        assert_eq!(snap.total_calls, 10);
+        assert_eq!(snap.unfinished_calls, 1);
+        assert_eq!(snap.unparsed_lines, 0);
+    }
+
+    #[test]
+    fn test_tr02_reject_non_strace_lines_and_preserve_angle_path_annotations() {
+        assert!(parse_strace_line("foo(bar)").is_none());
+        assert!(parse_strace_line("if (x > 0) = 1").is_none());
+        assert!(parse_strace_line("std::vector::push_back(1) = 0").is_none());
+
+        let line = "100 openat(AT_FDCWD, \"/tmp/a<b>\", O_RDONLY) = 3</tmp/a<b>>";
+        let ev = parse_strace_line(line).expect("valid strace -y line with nested <>");
+        assert_eq!(ev.result, "3");
+        assert_eq!(ev.duration_ns, None);
+
+        let snap = TraceAnalyzer::new().analyze_lines([line, "100 close(3</tmp/a<b>>) = 0"]);
+        assert!(snap.fd_leaks.is_empty());
+    }
+
+    #[test]
+    fn test_tr03_close_range_flags_stdio_dup2_and_superseded_execve() {
+        let lines = vec![
+            // 1. close_range with CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC
+            "100 openat(AT_FDCWD, \"/a\", O_RDONLY) = 3",
+            "100 openat(AT_FDCWD, \"/b\", O_RDONLY) = 4",
+            "100 clone(child_stack=0x7f, flags=CLONE_VM|CLONE_FILES|CLONE_THREAD) = 101",
+            "101 close_range(3, 4, CLOSE_RANGE_UNSHARE|CLOSE_RANGE_CLOEXEC) = 0",
+            "101 execve(\"/bin/true\", [\"/bin/true\"], NULL) = 0",
+            "101 +++ exited with 0 +++",
+            // Parent 100 still has its own un-cloexec'd table, closes 3 & 4 cleanly:
+            "100 close(3) = 0",
+            "100 close(4) = 0",
+            // 2. dup2 onto stdout (fd 1) and stderr (fd 2) must not be flagged as fd leak:
+            "100 openat(AT_FDCWD, \"/tmp/out.log\", O_WRONLY) = 5",
+            "100 dup2(5, 1) = 1",
+            "100 dup3(5, 2, 0) = 2",
+            "100 close(5) = 0",
+            "100 +++ exited with 0 +++",
+            // 3. superseded by execve must not mark process as exited or leak fds:
+            "200 openat(AT_FDCWD, \"/tmp/z\", O_RDONLY) = 6",
+            "200 +++ superseded by execve in pid 201 +++",
+        ];
+        let snap = TraceAnalyzer::new().analyze_lines(lines);
+        assert!(
+            snap.fd_leaks.is_empty(),
+            "unexpected leaks: {:?}",
+            snap.fd_leaks
+        );
+        assert!(!snap.processes["200"].exited);
     }
 }

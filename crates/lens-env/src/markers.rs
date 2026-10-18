@@ -13,11 +13,13 @@ pub enum TriState {
     True,
     False,
     Unknown,
+    Error,
 }
 
 impl TriState {
     fn and(self, other: Self) -> Self {
         match (self, other) {
+            (Self::Error, _) | (_, Self::Error) => Self::Error,
             (Self::False, _) | (_, Self::False) => Self::False,
             (Self::True, Self::True) => Self::True,
             _ => Self::Unknown,
@@ -26,6 +28,7 @@ impl TriState {
 
     fn or(self, other: Self) -> Self {
         match (self, other) {
+            (Self::Error, _) | (_, Self::Error) => Self::Error,
             (Self::True, _) | (_, Self::True) => Self::True,
             (Self::False, Self::False) => Self::False,
             _ => Self::Unknown,
@@ -252,14 +255,14 @@ impl Parser {
             if matches!(self.next(), Some(Tok::RParen)) {
                 return v;
             }
-            return TriState::Unknown;
+            return TriState::Error;
         }
         let lhs = self.parse_operand();
         let op = self.parse_op();
         let rhs = self.parse_operand();
         match (lhs, op, rhs) {
             (Some(l), Some(o), Some(r)) => eval_comparison(&l, &o, &r, env),
-            _ => TriState::Unknown,
+            _ => TriState::Error,
         }
     }
 
@@ -336,7 +339,7 @@ fn eval_comparison(lhs: &Operand, op: &str, rhs: &Operand, env: &MarkerEnv) -> T
                 TriState::Unknown
             };
         }
-        (Operand::Lit(_), Operand::Lit(_)) => return TriState::Unknown,
+        (Operand::Lit(_), Operand::Lit(_)) => return TriState::Error,
     };
 
     if var == "extra" {
@@ -387,7 +390,7 @@ fn eval_extra(op: &str, val: &str, env: &MarkerEnv) -> TriState {
     for e in candidates {
         match compare_value(e, op, &want, false) {
             TriState::True => saw_true = true,
-            TriState::Unknown => saw_unknown = true,
+            TriState::Unknown | TriState::Error => saw_unknown = true,
             TriState::False => {}
         }
     }
@@ -401,6 +404,35 @@ fn eval_extra(op: &str, val: &str, env: &MarkerEnv) -> TriState {
 }
 
 fn compare_value(actual: &str, op: &str, expected: &str, version: bool) -> TriState {
+    match op {
+        "in" | "not in" => {
+            let matched = if version {
+                let tokens: Vec<&str> = expected
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !tokens.is_empty() {
+                    tokens.iter().any(|t| version_eq(actual, t))
+                } else {
+                    expected.contains(actual)
+                }
+            } else {
+                expected.contains(actual)
+            };
+            return tri(if op == "in" { matched } else { !matched });
+        }
+        // flipped forms from flip_op
+        "contains" => return tri(actual.contains(expected)),
+        "not contains" => return tri(!actual.contains(expected)),
+        _ => {}
+    }
+
+    if version && matches!(op, "==" | "===" | "!=") && expected.ends_with(".*") {
+        let prefix = &expected[..expected.len() - 2];
+        let is_match = actual == prefix || actual.starts_with(&format!("{}.", prefix));
+        return tri(if op == "!=" { !is_match } else { is_match });
+    }
+
     let ord = if version {
         match (version_key(actual), version_key(expected)) {
             (Some(a), Some(b)) => compare_key(&a, &b),
@@ -410,29 +442,8 @@ fn compare_value(actual: &str, op: &str, expected: &str, version: bool) -> TriSt
         actual.cmp(expected)
     };
     match op {
-        "==" | "===" => {
-            if version && expected.ends_with(".*") {
-                // prefix match: `python_version == '3.10.*'`
-                let prefix = &expected[..expected.len() - 2];
-                return if actual == prefix || actual.starts_with(&format!("{}.", prefix)) {
-                    TriState::True
-                } else {
-                    TriState::False
-                };
-            }
-            tri(ord == Ordering::Equal)
-        }
-        "!=" => {
-            if version && expected.ends_with(".*") {
-                let prefix = &expected[..expected.len() - 2];
-                return if actual == prefix || actual.starts_with(&format!("{}.", prefix)) {
-                    TriState::False
-                } else {
-                    TriState::True
-                };
-            }
-            tri(ord != Ordering::Equal)
-        }
+        "==" | "===" => tri(ord == Ordering::Equal),
+        "!=" => tri(ord != Ordering::Equal),
         "<" => tri(ord == Ordering::Less),
         "<=" => tri(ord != Ordering::Greater),
         ">" => tri(ord == Ordering::Greater),
@@ -449,11 +460,6 @@ fn compare_value(actual: &str, op: &str, expected: &str, version: bool) -> TriSt
             };
             tri(ord != Ordering::Less && upper_ok)
         }
-        "in" => tri(expected.contains(actual)),
-        "not in" => tri(!expected.contains(actual)),
-        // flipped forms from flip_op
-        "contains" => tri(actual.contains(expected)),
-        "not contains" => tri(!actual.contains(expected)),
         _ => TriState::Unknown,
     }
 }
@@ -466,57 +472,126 @@ fn tri(b: bool) -> TriState {
     }
 }
 
-// --- version comparison (PEP 440-lite: numeric release segments) ---
+// --- version comparison (PEP 440: epoch, release segments, pre/dev/post suffixes) ---
 
-/// Parse a version into numeric release segments, ignoring
-/// epoch/pre/post/local decorations after the numeric core.
-fn version_key(v: &str) -> Option<Vec<u64>> {
-    let core = v.split(['!', '+', '-']).next()?;
-    let mut parts = Vec::new();
-    for seg in core.split('.') {
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct VersionKey {
+    epoch: u64,
+    release: Vec<u64>,
+    /// Ordering within the same `(epoch, release)`:
+    /// -4 = dev, -3 = alpha (a), -2 = beta (b), -1 = rc/pre/c, 0 = final, 1 = post/rev/r
+    pre_rank: i8,
+    pre_num: u64,
+}
+
+fn parse_pre_suffix(s: &str) -> (i8, u64) {
+    let s = s.trim_start_matches(['.', '-', '_']).to_ascii_lowercase();
+    if s.is_empty() {
+        return (0, 0);
+    }
+    let prefixes: &[(&str, i8)] = &[
+        ("preview", -1),
+        ("alpha", -3),
+        ("beta", -2),
+        ("post", 1),
+        ("dev", -4),
+        ("pre", -1),
+        ("rev", 1),
+        ("rc", -1),
+        ("a", -3),
+        ("b", -2),
+        ("c", -1),
+        ("r", 1),
+    ];
+    for &(p, rank) in prefixes {
+        if let Some(rest) = s.strip_prefix(p) {
+            let rest = rest.trim_start_matches(['.', '-', '_']);
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let num = digits.parse::<u64>().unwrap_or(0);
+            return (rank, num);
+        }
+    }
+    (0, 0)
+}
+
+/// Parse a PEP 440 version into `(epoch, release, pre_rank, pre_num)`.
+fn version_key(v: &str) -> Option<VersionKey> {
+    let v = v.trim().split('+').next()?;
+    let (epoch, rest) = if let Some((ep, r)) = v.split_once('!') {
+        (ep.trim().parse::<u64>().ok()?, r.trim())
+    } else {
+        (0, v)
+    };
+    let mut release = Vec::new();
+    let mut suffix_str = String::new();
+    let segments: Vec<&str> = rest.split('.').collect();
+    for (idx, seg) in segments.iter().enumerate() {
         let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.is_empty() {
-            if parts.is_empty() {
+            if release.is_empty() {
                 return None;
+            }
+            suffix_str = segments[idx..].join(".");
+            break;
+        }
+        release.push(digits.parse::<u64>().ok()?);
+        let tail = &seg[digits.len()..];
+        if !tail.is_empty() {
+            if idx + 1 < segments.len() {
+                suffix_str = format!("{}.{}", tail, segments[idx + 1..].join("."));
+            } else {
+                suffix_str = tail.to_string();
             }
             break;
         }
-        parts.push(digits.parse::<u64>().ok()?);
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts)
+    if release.is_empty() {
+        return None;
     }
+    let (pre_rank, pre_num) = parse_pre_suffix(&suffix_str);
+    Some(VersionKey {
+        epoch,
+        release,
+        pre_rank,
+        pre_num,
+    })
 }
 
-fn compare_key(a: &[u64], b: &[u64]) -> Ordering {
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
+fn compare_key(a: &VersionKey, b: &VersionKey) -> Ordering {
+    match a.epoch.cmp(&b.epoch) {
+        Ordering::Equal => {}
+        o => return o,
+    }
+    for i in 0..a.release.len().max(b.release.len()) {
+        let x = a.release.get(i).copied().unwrap_or(0);
+        let y = b.release.get(i).copied().unwrap_or(0);
         match x.cmp(&y) {
             Ordering::Equal => continue,
             o => return o,
         }
     }
-    Ordering::Equal
+    (a.pre_rank, a.pre_num).cmp(&(b.pre_rank, b.pre_num))
 }
 
 /// `~=V` upper bound: drop the last release segment and bump the
 /// previous one (`~=3.1.2` -> `<3.2`, `~=3.1` -> `<4`).
 fn compatible_upper(v: &str) -> Option<String> {
     let key = version_key(v)?;
-    if key.len() < 2 {
+    if key.release.len() < 2 {
         return None;
     }
-    let mut up = key[..key.len() - 1].to_vec();
+    let mut up = key.release[..key.release.len() - 1].to_vec();
     *up.last_mut()? += 1;
-    Some(
-        up.iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join("."),
-    )
+    let rel = up
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    if key.epoch > 0 {
+        Some(format!("{}!{}", key.epoch, rel))
+    } else {
+        Some(rel)
+    }
 }
 
 /// Evaluate a PEP 508 marker expression against the venv context.
@@ -531,7 +606,7 @@ pub fn evaluate_marker(expr: &str, env: &MarkerEnv) -> TriState {
     }
     let mut p = Parser { toks, pos: 0 };
     let v = p.parse_or(env);
-    if p.pos != p.toks.len() {
+    if p.pos != p.toks.len() || v == TriState::Error {
         return TriState::Unknown;
     }
     v
@@ -569,13 +644,25 @@ fn split_marker(req: &str) -> (&str, Option<&str>) {
     (req, None)
 }
 
+/// Strip optional outer parentheses from a version specifier string
+/// (e.g. `(>=1.21.1,<3)` -> `>=1.21.1,<3`). Returns `None` if parentheses
+/// are unbalanced.
+fn strip_spec_parens(spec: &str) -> Option<&str> {
+    let spec = spec.trim();
+    if spec.starts_with('(') || spec.ends_with(')') {
+        spec.strip_prefix('(')?.strip_suffix(')').map(str::trim)
+    } else {
+        Some(spec)
+    }
+}
+
 /// Evaluate a full `Requires-Dist` value: `name[extras] spec ; marker`.
 pub fn eval_requirement(req: &str, env: &MarkerEnv) -> ReqVerdict {
     let (head, marker) = split_marker(req);
     if let Some(m) = marker {
         match evaluate_marker(m.trim(), env) {
             TriState::False => return ReqVerdict::Inactive,
-            TriState::Unknown => return ReqVerdict::Unevaluated,
+            TriState::Unknown | TriState::Error => return ReqVerdict::Unevaluated,
             TriState::True => {}
         }
     }
@@ -595,16 +682,19 @@ pub fn eval_requirement(req: &str, env: &MarkerEnv) -> ReqVerdict {
             None => return ReqVerdict::Unevaluated,
         }
     }
+    let Some(spec) = strip_spec_parens(rest) else {
+        return ReqVerdict::Unevaluated;
+    };
     ReqVerdict::Active {
         name,
-        spec: rest.trim().to_string(),
+        spec: spec.to_string(),
     }
 }
 
 /// Does `installed` satisfy a PEP 440 version specifier like
-/// `>=3.1,<4`? `None` when the specifier cannot be evaluated.
+/// `>=3.1,<4` or `(>=1.21.1,<3)`? `None` when the specifier cannot be evaluated.
 pub fn version_satisfies(installed: &str, spec: &str) -> Option<bool> {
-    let spec = spec.trim();
+    let spec = strip_spec_parens(spec)?;
     if spec.is_empty() {
         return Some(true);
     }
@@ -799,6 +889,80 @@ mod tests {
             TriState::False
         );
         assert_eq!(evaluate_marker("garbage (((", &e), TriState::Unknown);
+    }
+
+    #[test]
+    fn test_tristate_error_not_swallowed_by_shortcircuit() {
+        let e = env();
+        assert_eq!(TriState::True.or(TriState::Error), TriState::Error);
+        assert_eq!(TriState::Error.or(TriState::True), TriState::Error);
+        assert_eq!(TriState::False.and(TriState::Error), TriState::Error);
+        assert_eq!(TriState::Error.and(TriState::False), TriState::Error);
+
+        // Malformed marker syntax on RHS of True `or` or False `and` must fail closed (Unknown).
+        assert_eq!(
+            evaluate_marker("sys_platform == 'linux' or (", &e),
+            TriState::Unknown
+        );
+        assert_eq!(
+            evaluate_marker("sys_platform == 'win32' and ==", &e),
+            TriState::Unknown
+        );
+    }
+
+    #[test]
+    fn test_version_in_and_not_in_markers() {
+        let e_311 = MarkerEnv::for_venv("3.11.8", &[]);
+        let e_314 = MarkerEnv::for_venv("3.14.4", &[]);
+        let e_31 = MarkerEnv::for_venv("3.1.0", &[]);
+
+        assert_eq!(
+            evaluate_marker("python_version in '3.10 3.11 3.12'", &e_311),
+            TriState::True
+        );
+        assert_eq!(
+            evaluate_marker("python_version in '3.10 3.11 3.12'", &e_314),
+            TriState::False
+        );
+        assert_eq!(
+            evaluate_marker("python_version not in '3.10 3.11 3.12'", &e_314),
+            TriState::True
+        );
+        // 3.1 must not match as a substring of 3.10.
+        assert_eq!(
+            evaluate_marker("python_version in '3.10 3.11 3.12'", &e_31),
+            TriState::False
+        );
+    }
+
+    #[test]
+    fn test_parenthesized_specs_and_pep440_epochs_prereleases() {
+        let e = MarkerEnv::for_venv("3.11.2", &[]);
+        match eval_requirement(
+            "urllib3 (>=1.21.1,<3) ; python_version in '3.10 3.11 3.12'",
+            &e,
+        ) {
+            ReqVerdict::Active { name, spec } => {
+                assert_eq!(name, "urllib3");
+                assert_eq!(spec, ">=1.21.1,<3");
+                assert_eq!(version_satisfies("2.0.7", &spec), Some(true));
+            }
+            _ => panic!("expected active"),
+        }
+        assert_eq!(version_satisfies("2.0.7", "(>=1.21.1,<3)"), Some(true));
+        assert_eq!(version_satisfies("3.0.0", "(>=1.21.1,<3)"), Some(false));
+
+        // PEP 440 epochs: 1!0.1.0 > 2.0.0
+        assert_eq!(version_satisfies("1!0.1.0", ">=2.0.0"), Some(true));
+        assert_eq!(version_satisfies("2.0.0", ">=1!0.1.0"), Some(false));
+        assert_eq!(version_satisfies("1!0.2.0", ">=1!0.1.0,<1!1.0"), Some(true));
+
+        // PEP 440 pre-releases: dev < a < b < rc < final < post
+        assert_eq!(version_satisfies("1.0.0.dev1", "<1.0.0a1"), Some(true));
+        assert_eq!(version_satisfies("1.0.0a1", "<1.0.0b1"), Some(true));
+        assert_eq!(version_satisfies("1.0.0b1", "<1.0.0rc1"), Some(true));
+        assert_eq!(version_satisfies("1.0.0rc1", "<1.0.0"), Some(true));
+        assert_eq!(version_satisfies("1.0.0", "<1.0.0.post1"), Some(true));
     }
 
     #[test]

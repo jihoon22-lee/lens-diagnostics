@@ -27,6 +27,16 @@ pub fn diff_systemd(baseline: &SystemdSnapshot, candidate: &SystemdSnapshot) -> 
                 // and also keys they do not surface, like `User=`.
                 let mut details = Vec::new();
 
+                if b.masked != c.masked {
+                    details.push(format!("[Meta] Masked: {:?} -> {:?}", b.masked, c.masked));
+                }
+                if b.alias_of != c.alias_of {
+                    details.push(format!(
+                        "[Meta] AliasOf: {:?} -> {:?}",
+                        b.alias_of, c.alias_of
+                    ));
+                }
+
                 let section_names: BTreeSet<&String> =
                     b.sections.keys().chain(c.sections.keys()).collect();
                 for sec in section_names {

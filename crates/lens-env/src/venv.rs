@@ -148,6 +148,7 @@ fn validate_venv(venv_path: &Path) -> std::io::Result<()> {
 }
 
 fn scan_site_packages(site_packages: &Path, packages: &mut BTreeMap<String, PyPackage>) {
+    let mut pth_files = Vec::new();
     if let Ok(entries) = lens_core::read_policy::read_dir(site_packages) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -162,14 +163,20 @@ fn scan_site_packages(site_packages: &Path, packages: &mut BTreeMap<String, PyPa
                                     pkg.top_level_modules =
                                         read_top_level_modules(&path, &pkg.name);
                                     let norm = normalize_package_name(&pkg.name);
+                                    crate::shadowing::inspect_dist_info_editable(&path, &norm);
                                     packages.insert(norm, pkg);
                                 }
                             }
                         }
                     }
                 }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("pth") {
+                pth_files.push(path);
             }
         }
+    }
+    for pth in pth_files {
+        crate::shadowing::inspect_pth_editable(&pth, packages);
     }
 }
 
@@ -184,7 +191,7 @@ fn read_top_level_modules(dist_info: &Path, dist_name: &str) -> Vec<String> {
         let mut mods: Vec<String> = content
             .lines()
             .map(str::trim)
-            .filter(|l| !l.is_empty())
+            .filter(|l| !l.is_empty() && *l != "__pycache__")
             .map(String::from)
             .collect();
         if !mods.is_empty() {
@@ -201,12 +208,18 @@ fn read_top_level_modules(dist_info: &Path, dist_name: &str) -> Vec<String> {
                 Some(t) if !t.is_empty() && !t.starts_with('.') => t,
                 _ => continue,
             };
-            if top.ends_with(".dist-info") || top.ends_with(".data") {
+            if top == "__pycache__" || top.ends_with(".dist-info") || top.ends_with(".data") {
                 continue;
             }
             if let Some(stem) = top.strip_suffix(".py") {
-                if stem != "__init__" {
+                if stem != "__init__" && stem != "__pycache__" {
                     mods.insert(stem.to_string());
+                }
+            } else if top.ends_with(".so") || top.ends_with(".pyd") {
+                if let Some(stem) = top.split('.').next() {
+                    if !stem.is_empty() && stem != "__init__" && stem != "__pycache__" {
+                        mods.insert(stem.to_string());
+                    }
                 }
             } else if !top.contains('.') {
                 mods.insert(top.to_string());
@@ -329,5 +342,76 @@ mod tests {
         assert!(venv.missing_dependencies.is_empty());
         assert!(venv.version_conflicts.is_empty());
         assert!(venv.unevaluated_dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_record_excludes_pycache_and_extracts_c_extensions() {
+        let dir = make_venv(
+            "home = /usr/bin\nversion = 3.14.4\n",
+            &[("ujson", "5.9.0", &[])],
+        );
+        let di = dir
+            .path()
+            .join("lib/python3.14/site-packages/ujson-5.9.0.dist-info");
+        fs::write(
+            di.join("RECORD"),
+            "__pycache__/helper.cpython-314.pyc,,\nujson.cpython-314-x86_64-linux-gnu.so,,\nmyext.abi3.so,,\nwinmod.cp314-win_amd64.pyd,,\nujson-5.9.0.dist-info/METADATA,,\n",
+        )
+        .unwrap();
+
+        let venv = inspect_venv(dir.path(), &[]).unwrap();
+        let pkg = &venv.packages["ujson"];
+        assert_eq!(
+            pkg.top_level_modules,
+            vec![
+                "myext".to_string(),
+                "ujson".to_string(),
+                "winmod".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_editable_self_install_not_flagged_as_shadowing() {
+        let dir = tempdir().unwrap();
+        let proj = dir.path().join("myproj");
+        fs::create_dir_all(proj.join("src/myproj")).unwrap();
+        fs::write(proj.join("src/myproj/__init__.py"), "").unwrap();
+        fs::write(
+            proj.join("pyproject.toml"),
+            "[project]\nname = \"my-proj\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let venv_dir = proj.join(".venv");
+        let sp = venv_dir.join("lib/python3.14/site-packages");
+        let di = sp.join("my_proj-0.1.0.dist-info");
+        fs::create_dir_all(&di).unwrap();
+        fs::write(
+            venv_dir.join("pyvenv.cfg"),
+            "home = /usr/bin\nversion = 3.14.4\n",
+        )
+        .unwrap();
+        fs::write(
+            di.join("METADATA"),
+            "Metadata-Version: 2.1\nName: my-proj\nVersion: 0.1.0\n",
+        )
+        .unwrap();
+        fs::write(di.join("top_level.txt"), "myproj\n").unwrap();
+        fs::write(
+            di.join("direct_url.json"),
+            format!(
+                "{{\"dir_info\": {{\"editable\": true}}, \"url\": \"file://{}\"}}",
+                proj.display()
+            ),
+        )
+        .unwrap();
+
+        let venv = inspect_venv(&venv_dir, &[]).unwrap();
+        let issues = crate::shadowing::detect_shadowing(&proj, &venv.packages);
+        assert!(
+            issues.is_empty(),
+            "editable self-package must not shadow itself: {issues:?}"
+        );
     }
 }

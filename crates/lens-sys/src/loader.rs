@@ -158,9 +158,14 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
                         .and_then(|n| n.to_str())
                         .unwrap_or("")
                         .to_string();
+                    let is_template_instantiation = crate::parser::template_name_of(&name)
+                        .as_deref()
+                        == Some(target_name.as_str());
                     // A symlink whose basename differs from the link's
-                    // is an alias (e.g. dbus-org.foo.service).
-                    if !target_name.is_empty() && target_name != name {
+                    // is an alias (e.g. dbus-org.foo.service), unless it is
+                    // an instance symlink pointing to its own template.
+                    if !target_name.is_empty() && target_name != name && !is_template_instantiation
+                    {
                         let mut unit = SystemdUnit {
                             name: name.clone(),
                             path: Some(p.to_string_lossy().into_owned()),
@@ -219,6 +224,9 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
                 units.insert(name, unit);
             }
         }
+    }
+    if path.is_dir() {
+        apply_dep_dirs(path, &mut units);
     }
     // Fold alias names onto their canonical units.
     for (alias_name, target_name) in alias_pairs {
@@ -457,7 +465,11 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
                         .and_then(|n| n.to_str())
                         .unwrap_or("")
                         .to_string();
-                    if !target_name.is_empty() && target_name != name {
+                    let is_template_instantiation = crate::parser::template_name_of(&name)
+                        .as_deref()
+                        == Some(target_name.as_str());
+                    if !target_name.is_empty() && target_name != name && !is_template_instantiation
+                    {
                         let mut unit = SystemdUnit {
                             name: name.clone(),
                             path: Some(p.to_string_lossy().into_owned()),
@@ -516,6 +528,10 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
         units.insert(name, unit);
     }
 
+    for dir in dirs.iter().rev() {
+        apply_dep_dirs(dir.as_ref(), &mut units);
+    }
+
     // Fold alias names onto their canonical units.
     let alias_pairs: Vec<(String, String)> = units
         .iter()
@@ -528,6 +544,37 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
     }
     flag_missing_references(&mut units);
     units
+}
+
+fn apply_dep_dirs(dir: &Path, units: &mut BTreeMap<String, SystemdUnit>) {
+    let unit_names: Vec<String> = units.keys().cloned().collect();
+    for name in unit_names {
+        for (suffix, is_wants) in [(".wants", true), (".requires", false)] {
+            let dep_dir = dir.join(format!("{name}{suffix}"));
+            if !lens_core::read_policy::metadata(&dep_dir).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            let Ok(rd) = lens_core::read_policy::read_dir(&dep_dir) else {
+                continue;
+            };
+            let mut deps: Vec<String> = rd
+                .flatten()
+                .filter_map(|e| unit_name_of(&e.path()))
+                .collect();
+            deps.sort();
+            if let Some(unit) = units.get_mut(&name) {
+                if is_wants {
+                    unit.wants.extend(deps);
+                    unit.wants.sort();
+                    unit.wants.dedup();
+                } else {
+                    unit.requires.extend(deps);
+                    unit.requires.sort();
+                    unit.requires.dedup();
+                }
+            }
+        }
+    }
 }
 
 /// Apply drop-ins from every search dir, lowest precedence dir first so

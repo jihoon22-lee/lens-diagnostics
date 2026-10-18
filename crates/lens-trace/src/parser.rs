@@ -33,8 +33,11 @@ impl TraceAnalyzer {
         let mut total_events = 0u64;
         let mut total_calls = 0u64;
         let mut total_errors = 0u64;
+        let mut unparsed_lines = 0u64;
+        let mut unfinished_calls = 0u64;
 
         let mut syscalls: BTreeMap<String, SyscallStats> = BTreeMap::new();
+        let mut syscall_durations: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         let mut errors: BTreeMap<String, u64> = BTreeMap::new();
         let mut error_samples: BTreeMap<String, String> = BTreeMap::new();
         let mut processes: BTreeMap<String, ProcessInfo> = BTreeMap::new();
@@ -61,9 +64,16 @@ impl TraceAnalyzer {
             let (tid, timestamp, body) = split_tid_and_body(trimmed);
 
             // Handle process terminators: `exited with N`, `exited (status
-            // N)` (strace <= 4.6), `killed by SIGX`, `superseded by execve`.
-            // All end the process's lifetime on this tid.
+            // N)` (strace <= 4.6), `killed by SIGX`.
+            // Note: `superseded by execve` is NOT a process exit.
             if body.starts_with("+++") {
+                pending.remove(&tid);
+                if body.contains("superseded by execve") {
+                    if let Some(tbl) = tid_fd_table.remove(&tid) {
+                        fd_table_users[tbl] = fd_table_users[tbl].saturating_sub(1);
+                    }
+                    continue;
+                }
                 let proc_key = tid.to_string();
                 processes
                     .entry(proc_key)
@@ -76,15 +86,20 @@ impl TraceAnalyzer {
                         exited: true,
                     })
                     .exited = true;
-                pending.remove(&tid);
                 // Fds still open when the table's last user exits are
                 // leaks attributed to this process; other CLONE_FILES
                 // sharers keep the table alive.
                 if let Some(tbl) = tid_fd_table.remove(&tid) {
-                    fd_table_users[tbl] -= 1;
+                    fd_table_users[tbl] = fd_table_users[tbl].saturating_sub(1);
                     if fd_table_users[tbl] == 0 && !fd_tables[tbl].is_empty() {
-                        let keys: Vec<u64> = fd_tables[tbl].keys().copied().collect();
-                        leaked_fds.entry(tid).or_default().extend(keys);
+                        let keys: Vec<u64> = fd_tables[tbl]
+                            .keys()
+                            .copied()
+                            .filter(|&fd| fd > 2)
+                            .collect();
+                        if !keys.is_empty() {
+                            leaked_fds.entry(tid).or_default().extend(keys);
+                        }
                     }
                 }
                 continue;
@@ -95,26 +110,36 @@ impl TraceAnalyzer {
                 continue;
             }
 
-            total_events += 1;
-
             // Handle <unfinished ...>
-            if body.ends_with("<unfinished ...>") {
-                if let Some(open) = body.find('(') {
-                    let syscall = body[..open].trim().to_string();
-                    let raw_args = &body[open + 1..body.len() - 16];
-                    let partial_args = raw_args.trim_end_matches([',', ' ']).to_string();
-                    pending.insert(
-                        tid,
-                        PendingCall {
-                            syscall,
-                            partial_args,
-                            tid,
-                            timestamp: timestamp.map(String::from),
-                        },
-                    );
+            if let Some(prefix) = body.strip_suffix("<unfinished ...>") {
+                if let Some(open) = prefix.find('(') {
+                    let syscall = &prefix[..open];
+                    if is_valid_syscall_name(syscall) {
+                        let raw_args = &prefix[open + 1..];
+                        let partial_args = raw_args.trim_end_matches([',', ' ']).to_string();
+                        if pending
+                            .insert(
+                                tid,
+                                PendingCall {
+                                    syscall: syscall.to_string(),
+                                    partial_args,
+                                    tid,
+                                    timestamp: timestamp.map(String::from),
+                                },
+                            )
+                            .is_some()
+                        {
+                            unfinished_calls += 1;
+                        }
+                        continue;
+                    }
                 }
+                total_events += 1;
+                unparsed_lines += 1;
                 continue;
             }
+
+            total_events += 1;
 
             // Handle <... resumed>
             let event = if body.starts_with("<... ") {
@@ -125,6 +150,7 @@ impl TraceAnalyzer {
                         if pending_call.syscall == resumed_syscall {
                             parse_resumed_tail(&pending_call, rest)
                         } else {
+                            unfinished_calls += 1;
                             parse_strace_body(tid, timestamp, body)
                         }
                     } else {
@@ -168,6 +194,10 @@ impl TraceAnalyzer {
                     if ns > stat.max_ns {
                         stat.max_ns = ns;
                     }
+                    syscall_durations
+                        .entry(ev.syscall.clone())
+                        .or_default()
+                        .push(ns);
                 }
 
                 if let Some(ref err) = ev.error {
@@ -199,7 +229,14 @@ impl TraceAnalyzer {
                                     &mut fd_table_users,
                                     ev.tid,
                                 );
-                                fd_tables[tbl].insert(fd, cloexec);
+                                // Standard stream redirection via dup2/dup3 onto 0/1/2
+                                // is not a leaked descriptor.
+                                if matches!(ev.syscall.as_str(), "dup" | "dup2" | "dup3") && fd <= 2
+                                {
+                                    fd_tables[tbl].remove(&fd);
+                                } else {
+                                    fd_tables[tbl].insert(fd, cloexec);
+                                }
                             }
                         }
                         // pipe/pipe2/socketpair hand back both ends in the
@@ -265,9 +302,31 @@ impl TraceAnalyzer {
                         }
                         // close_range(first, last[, flags]); `~0U` means "all".
                         "close_range" => {
-                            if let Some((first, last)) = parse_close_range(&ev.arguments) {
+                            if let Some((first, last, unshare, cloexec)) =
+                                parse_close_range(&ev.arguments)
+                            {
                                 if let Some(&tbl) = tid_fd_table.get(&ev.tid) {
-                                    fd_tables[tbl].retain(|fd, _| *fd < first || *fd > last);
+                                    let target_tbl = if unshare && fd_table_users[tbl] > 1 {
+                                        fd_table_users[tbl] -= 1;
+                                        let cloned = fd_tables[tbl].clone();
+                                        fd_tables.push(cloned);
+                                        fd_table_users.push(1);
+                                        let new_tbl = fd_tables.len() - 1;
+                                        tid_fd_table.insert(ev.tid, new_tbl);
+                                        new_tbl
+                                    } else {
+                                        tbl
+                                    };
+                                    if cloexec {
+                                        for (fd, is_cloexec) in fd_tables[target_tbl].iter_mut() {
+                                            if *fd >= first && *fd <= last {
+                                                *is_cloexec = true;
+                                            }
+                                        }
+                                    } else {
+                                        fd_tables[target_tbl]
+                                            .retain(|fd, _| *fd < first || *fd > last);
+                                    }
                                 }
                             }
                         }
@@ -281,7 +340,11 @@ impl TraceAnalyzer {
                                         &mut fd_table_users,
                                         ev.tid,
                                     );
-                                    fd_tables[tbl].insert(fd, cloexec);
+                                    if fd <= 2 {
+                                        fd_tables[tbl].remove(&fd);
+                                    } else {
+                                        fd_tables[tbl].insert(fd, cloexec);
+                                    }
                                 }
                             } else if ev.arguments.contains("F_SETFD") {
                                 // fcntl(fd, F_SETFD, FD_CLOEXEC) toggles
@@ -318,20 +381,41 @@ impl TraceAnalyzer {
                 if events.len() < self.max_retained_events {
                     events.push(ev);
                 }
+            } else {
+                unparsed_lines += 1;
+            }
+        }
+
+        unfinished_calls += pending.len() as u64;
+        if total_calls == 0 && unfinished_calls > 0 {
+            total_events += unfinished_calls;
+        }
+
+        for (name, mut durs) in syscall_durations {
+            if !durs.is_empty() {
+                durs.sort_unstable();
+                if let Some(stat) = syscalls.get_mut(&name) {
+                    stat.p50_ns = percentile_sorted(&durs, 50);
+                    stat.p95_ns = percentile_sorted(&durs, 95);
+                    stat.p99_ns = percentile_sorted(&durs, 99);
+                }
             }
         }
 
         // Fds open at end-of-trace are leaks for still-running processes.
         for (tid, tbl) in tid_fd_table {
-            if !fd_tables[tbl].is_empty() {
-                leaked_fds
-                    .entry(tid)
-                    .or_default()
-                    .extend(fd_tables[tbl].keys().copied());
+            let open_fds: Vec<u64> = fd_tables[tbl]
+                .keys()
+                .copied()
+                .filter(|&fd| fd > 2)
+                .collect();
+            if !open_fds.is_empty() {
+                leaked_fds.entry(tid).or_default().extend(open_fds);
             }
         }
         let fd_leaks_by_process: BTreeMap<String, Vec<u64>> = leaked_fds
             .iter()
+            .filter(|(_, fds)| !fds.is_empty())
             .map(|(tid, fds)| (tid.to_string(), fds.iter().copied().collect()))
             .collect();
         let mut fd_leaks: Vec<u64> = leaked_fds
@@ -347,6 +431,8 @@ impl TraceAnalyzer {
             total_events,
             total_calls,
             total_errors,
+            unparsed_lines,
+            unfinished_calls,
             syscalls,
             errors,
             error_samples,
@@ -358,6 +444,18 @@ impl TraceAnalyzer {
             io_write_bytes,
         }
     }
+}
+
+fn percentile_sorted(sorted: &[u64], pct: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() - 1) * pct) / 100;
+    sorted[idx]
+}
+
+fn is_valid_syscall_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Return (creating on demand) the fd-table index a tid belongs to.
@@ -375,8 +473,9 @@ fn table_for(
 }
 
 /// Parse `close_range` arguments: `first, last[, flags]` where `last`
-/// may be `~0U`/`UINT_MAX` for "all higher fds".
-fn parse_close_range(arguments: &str) -> Option<(u64, u64)> {
+/// may be `~0U`/`UINT_MAX` for "all higher fds", and `flags` may include
+/// `CLOSE_RANGE_UNSHARE` (`0x1`) and/or `CLOSE_RANGE_CLOEXEC` (`0x2`).
+fn parse_close_range(arguments: &str) -> Option<(u64, u64, bool, bool)> {
     let mut parts = arguments.split(',');
     let first = parts.next()?.trim().parse::<u64>().ok()?;
     let last_raw = parts.next()?.trim();
@@ -384,10 +483,29 @@ fn parse_close_range(arguments: &str) -> Option<(u64, u64)> {
         "~0U" | "~0" | "UINT_MAX" => u64::from(u32::MAX),
         _ => last_raw
             .strip_prefix("0x")
+            .or_else(|| last_raw.strip_prefix("0X"))
             .and_then(|h| u64::from_str_radix(h, 16).ok())
             .or_else(|| last_raw.parse::<u64>().ok())?,
     };
-    Some((first, last))
+    let flags_raw = parts.next().map(str::trim).unwrap_or("0");
+    let mut unshare = flags_raw.contains("CLOSE_RANGE_UNSHARE");
+    let mut cloexec = flags_raw.contains("CLOSE_RANGE_CLOEXEC");
+    for tok in flags_raw.split('|').map(str::trim) {
+        let num = tok
+            .strip_prefix("0x")
+            .or_else(|| tok.strip_prefix("0X"))
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .or_else(|| tok.parse::<u64>().ok());
+        if let Some(bits) = num {
+            if (bits & 0x1) != 0 {
+                unshare = true;
+            }
+            if (bits & 0x2) != 0 {
+                cloexec = true;
+            }
+        }
+    }
+    Some((first, last, unshare, cloexec))
 }
 
 /// Parse a leading fd number that may carry a `strace -y` `<...>`
@@ -404,13 +522,13 @@ fn fd_from_arg(arg: &str) -> Option<u64> {
 fn parse_fd_array(arguments: &str) -> Option<Vec<u64>> {
     let open = arguments.find('[')?;
     let bytes = arguments.as_bytes();
-    let mut in_anno = false;
+    let mut anno_depth = 0usize;
     let mut close = None;
     for (i, &b) in bytes.iter().enumerate().skip(open + 1) {
         match b {
-            b'<' => in_anno = true,
-            b'>' => in_anno = false,
-            b']' if !in_anno => {
+            b'<' => anno_depth += 1,
+            b'>' => anno_depth = anno_depth.saturating_sub(1),
+            b']' if anno_depth == 0 => {
                 close = Some(i);
                 break;
             }
@@ -471,7 +589,10 @@ fn parse_resumed_tail(pending: &PendingCall, rest: &str) -> Option<TraceEvent> {
     };
 
     let after_paren = rest[close_paren + 1..].trim();
-    let (result, error, duration_ns) = parse_return_and_duration(after_paren);
+    if !after_paren.starts_with('=') {
+        return None;
+    }
+    let (result, error, duration_ns) = parse_return_and_duration(after_paren)?;
 
     Some(TraceEvent {
         kind: "call".to_string(),
@@ -487,13 +608,20 @@ fn parse_resumed_tail(pending: &PendingCall, rest: &str) -> Option<TraceEvent> {
 
 fn parse_strace_body(tid: u64, timestamp: Option<&str>, body: &str) -> Option<TraceEvent> {
     let open_paren = body.find('(')?;
-    let syscall = body[..open_paren].trim().to_string();
+    let syscall = &body[..open_paren];
+    if !is_valid_syscall_name(syscall) {
+        return None;
+    }
+    let syscall = syscall.to_string();
 
     let close_paren = find_matching_paren(&body[open_paren..])? + open_paren;
     let arguments = body[open_paren + 1..close_paren].to_string();
 
     let after_paren = body[close_paren + 1..].trim();
-    let (result, error, duration_ns) = parse_return_and_duration(after_paren);
+    if !after_paren.starts_with('=') {
+        return None;
+    }
+    let (result, error, duration_ns) = parse_return_and_duration(after_paren)?;
 
     Some(TraceEvent {
         kind: "call".to_string(),
@@ -512,48 +640,55 @@ pub fn parse_strace_line(line: &str) -> Option<TraceEvent> {
     parse_strace_body(tid, timestamp, body)
 }
 
-fn parse_return_and_duration(after_paren: &str) -> (String, Option<String>, Option<u64>) {
-    let mut result = String::new();
+fn parse_return_and_duration(after_paren: &str) -> Option<(String, Option<String>, Option<u64>)> {
+    let eq_idx = after_paren.find('=')?;
+    let mut res_part = after_paren[eq_idx + 1..].trim();
+    if res_part.is_empty() {
+        return None;
+    }
+
     let mut error = None;
     let mut duration_ns = None;
 
-    if let Some(eq_idx) = after_paren.find('=') {
-        let mut res_part = after_paren[eq_idx + 1..].trim();
-
-        // Extract duration <0.000045>
+    // Extract duration <0.000045> only when the trailing `<...>` parses as
+    // a valid finite non-negative f64.
+    if res_part.ends_with('>') {
         if let Some(dur_start) = res_part.rfind('<') {
-            if let Some(dur_end) = res_part.rfind('>') {
-                if dur_end > dur_start {
-                    let dur_str = &res_part[dur_start + 1..dur_end];
-                    if let Ok(secs) = dur_str.parse::<f64>() {
-                        duration_ns = Some((secs * 1_000_000_000.0) as u64);
-                    }
-                    res_part = res_part[..dur_start].trim();
-                }
-            }
-        }
-
-        // `strace -y` annotates fd results: `= 3</etc/hosts>` -> `3`.
-        if res_part.ends_with('>') {
-            if let Some(lt) = res_part.rfind('<') {
-                res_part = res_part[..lt].trim();
-            }
-        }
-
-        result = res_part.to_string();
-
-        // `-1 ERRNO` and `? ERESTART*` are both error/restart returns.
-        if res_part == "-1" || res_part.starts_with("-1 ") || res_part.starts_with("? ") {
-            let tokens: Vec<&str> = res_part.split_whitespace().collect();
-            if tokens.len() >= 2 {
-                error = Some(tokens[1].to_string());
-            } else {
-                error = Some("UNKNOWN_ERROR".to_string());
+            let dur_str = &res_part[dur_start + 1..res_part.len() - 1];
+            if let Some(secs) = dur_str
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+            {
+                duration_ns = Some((secs * 1_000_000_000.0) as u64);
+                res_part = res_part[..dur_start].trim();
             }
         }
     }
 
-    (result, error, duration_ns)
+    // `strace -y` annotates fd results: `= 3</etc/hosts>` or `= 3</tmp/a<b>>` -> `3`.
+    if res_part.ends_with('>') {
+        if let Some(lt) = res_part.find('<') {
+            let prefix = res_part[..lt].trim();
+            if !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_digit()) {
+                res_part = prefix;
+            }
+        }
+    }
+
+    let result = res_part.to_string();
+
+    // `-1 ERRNO` and `? ERESTART*` are both error/restart returns.
+    if res_part == "-1" || res_part.starts_with("-1 ") || res_part.starts_with("? ") {
+        let tokens: Vec<&str> = res_part.split_whitespace().collect();
+        if tokens.len() >= 2 {
+            error = Some(tokens[1].to_string());
+        } else {
+            error = Some("UNKNOWN_ERROR".to_string());
+        }
+    }
+
+    Some((result, error, duration_ns))
 }
 
 fn find_matching_paren(s: &str) -> Option<usize> {

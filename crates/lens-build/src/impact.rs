@@ -25,6 +25,11 @@ pub struct ImpactGraph {
     /// Per-file `#include` extraction cache — headers shared by many TUs
     /// are read and parsed once.
     include_cache: std::collections::HashMap<String, Option<Vec<IncludeDirective>>>,
+    /// Per-path file-existence cache gated by `lens_core::read_policy::metadata`.
+    file_exists_cache: std::collections::HashMap<std::path::PathBuf, bool>,
+    /// Headers whose transitive `#include` subgraph has already been expanded
+    /// under a given ordered include-directory list.
+    expanded_headers: std::collections::HashSet<(String, Vec<String>)>,
 }
 
 impl ImpactGraph {
@@ -46,6 +51,38 @@ impl ImpactGraph {
             .insert(included_header.to_string());
     }
 
+    fn candidate_is_file(&mut self, candidate: &Path) -> bool {
+        if let Some(&exists) = self.file_exists_cache.get(candidate) {
+            return exists;
+        }
+        let exists = lens_core::read_policy::metadata(candidate).is_ok_and(|m| m.is_file());
+        self.file_exists_cache
+            .insert(candidate.to_path_buf(), exists);
+        exists
+    }
+
+    fn resolve_include_cached(
+        &mut self,
+        name: &str,
+        quoted: bool,
+        anchor_dir: &Path,
+        include_dirs: &[&str],
+    ) -> Option<String> {
+        if quoted {
+            let candidate = anchor_dir.join(name);
+            if self.candidate_is_file(&candidate) {
+                return Some(crate::compiler::clean_path(&candidate));
+            }
+        }
+        for dir in include_dirs {
+            let candidate = Path::new(dir).join(name);
+            if self.candidate_is_file(&candidate) {
+                return Some(crate::compiler::clean_path(&candidate));
+            }
+        }
+        None
+    }
+
     /// Scan `unit`'s source file on disk, resolve every `#include` against the
     /// unit's search paths, add direct unit->header edges, then recursively
     /// scan resolved headers to build the header->header transitive graph.
@@ -53,6 +90,7 @@ impl ImpactGraph {
         let include_dirs: Vec<&str> = unit.includes.iter().map(|s| s.as_str()).collect();
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<String> = VecDeque::new();
+        let mut newly_expanded_headers: Vec<String> = Vec::new();
         queue.push_back(unit.file.clone());
         visited.insert(unit.file.clone());
 
@@ -61,18 +99,26 @@ impl ImpactGraph {
         // directory (compile_commands `directory`), not the source's dir.
         let compile_dir = Path::new(&unit.directory);
         for inc in &unit.forced_includes {
-            if let Some(resolved) = resolve_include(inc, true, compile_dir, &include_dirs) {
+            if let Some(resolved) =
+                self.resolve_include_cached(inc, true, compile_dir, &include_dirs)
+            {
                 self.add_unit_include(&unit.file, &resolved);
-                if visited.insert(resolved.clone()) {
+                if visited.insert(resolved.clone())
+                    && !self
+                        .expanded_headers
+                        .contains(&(resolved.clone(), unit.includes.clone()))
+                {
                     queue.push_back(resolved);
                 }
             }
         }
 
         let mut scanned = 0usize;
+        let mut truncated_this_unit = false;
         while let Some(current) = queue.pop_front() {
             if scanned >= MAX_SCANNED_FILES {
                 self.scan_truncated = true;
+                truncated_this_unit = true;
                 break;
             }
             // Cache include extraction per file: headers shared by many
@@ -94,14 +140,23 @@ impl ImpactGraph {
                 continue;
             };
             scanned += 1;
+            if current != unit.file {
+                newly_expanded_headers.push(current.clone());
+            }
             let anchor = Path::new(&current)
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_default();
             for inc in &includes {
-                let Some(resolved) = resolve_include(&inc.name, inc.quoted, &anchor, &include_dirs)
+                let Some(resolved) =
+                    self.resolve_include_cached(&inc.name, inc.quoted, &anchor, &include_dirs)
                 else {
-                    self.unresolved_includes += 1;
+                    // System headers (`#include <...>`) typically live in compiler
+                    // builtin paths outside `-I`/`-isystem`; only count unresolvable
+                    // quoted `#include "..."` directives as unresolved_includes.
+                    if inc.quoted {
+                        self.unresolved_includes += 1;
+                    }
                     continue;
                 };
                 if current == unit.file {
@@ -109,9 +164,19 @@ impl ImpactGraph {
                 } else {
                     self.add_header_include(&current, &resolved);
                 }
-                if visited.insert(resolved.clone()) {
+                if visited.insert(resolved.clone())
+                    && !self
+                        .expanded_headers
+                        .contains(&(resolved.clone(), unit.includes.clone()))
+                {
                     queue.push_back(resolved);
                 }
+            }
+        }
+
+        if !truncated_this_unit {
+            for h in newly_expanded_headers {
+                self.expanded_headers.insert((h, unit.includes.clone()));
             }
         }
     }
@@ -278,7 +343,8 @@ pub fn extract_includes(source_code: &str) -> Vec<IncludeDirective> {
 
 /// Remove `//` and `/* ... */` comments from one line, tracking block-comment
 /// state across lines. String and char literals are respected so a `"//"` in
-/// code is not mistaken for a comment.
+/// code is not mistaken for a comment. Advances by full UTF-8 `char` so
+/// non-ASCII header paths and comments are never corrupted into Latin-1 bytes.
 fn strip_comments(line: &str, in_block: &mut bool) -> String {
     let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
@@ -288,8 +354,10 @@ fn strip_comments(line: &str, in_block: &mut bool) -> String {
             if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
                 *in_block = false;
                 i += 2;
+            } else if let Some(ch) = line[i..].chars().next() {
+                i += ch.len_utf8();
             } else {
-                i += 1;
+                break;
             }
             continue;
         }
@@ -300,12 +368,17 @@ fn strip_comments(line: &str, in_block: &mut bool) -> String {
                 i += 1;
                 while i < bytes.len() && bytes[i] != quote {
                     if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        out.push(bytes[i] as char);
-                        out.push(bytes[i + 1] as char);
-                        i += 2;
-                    } else {
-                        out.push(bytes[i] as char);
+                        out.push('\\');
                         i += 1;
+                        if let Some(ch) = line[i..].chars().next() {
+                            out.push(ch);
+                            i += ch.len_utf8();
+                        }
+                    } else if let Some(ch) = line[i..].chars().next() {
+                        out.push(ch);
+                        i += ch.len_utf8();
+                    } else {
+                        break;
                     }
                 }
                 if i < bytes.len() {
@@ -318,9 +391,13 @@ fn strip_comments(line: &str, in_block: &mut bool) -> String {
                 *in_block = true;
                 i += 2;
             }
-            c => {
-                out.push(c as char);
-                i += 1;
+            _ => {
+                if let Some(ch) = line[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -337,6 +414,7 @@ fn strip_comments(line: &str, in_block: &mut bool) -> String {
 /// includes only search the search dirs. Returns `None` when the header
 /// cannot be found — system headers outside the project are expected to
 /// miss.
+#[allow(dead_code)]
 fn resolve_include(
     name: &str,
     quoted: bool,
@@ -345,13 +423,13 @@ fn resolve_include(
 ) -> Option<String> {
     if quoted {
         let candidate = anchor_dir.join(name);
-        if candidate.is_file() {
+        if lens_core::read_policy::metadata(&candidate).is_ok_and(|m| m.is_file()) {
             return Some(crate::compiler::clean_path(&candidate));
         }
     }
     for dir in include_dirs {
         let candidate = Path::new(dir).join(name);
-        if candidate.is_file() {
+        if lens_core::read_policy::metadata(&candidate).is_ok_and(|m| m.is_file()) {
             return Some(crate::compiler::clean_path(&candidate));
         }
     }
@@ -395,12 +473,13 @@ mod tests {
         std::fs::write(inc.join("ok.h"), "#define OK 1\n").unwrap();
         std::fs::write(
             src.join("a.c"),
-            "#include \"ok.h\"\n#include \"generated.h\"\n",
+            "#include <stdio.h>\n#include <vector>\n#include \"ok.h\"\n#include \"generated.h\"\n",
         )
         .unwrap();
 
         let mut graph = ImpactGraph::new();
-        // a.c: one resolved + one unresolved include.
+        // a.c: two system angled includes (not counted as unresolved),
+        // one resolved quoted include, and one unresolved quoted include.
         graph.add_translation_unit(&unit(&src.join("a.c"), root, &[inc.to_str().unwrap()]));
         // deleted.c no longer exists on disk -> missing source.
         graph.add_translation_unit(&unit(&src.join("deleted.c"), root, &[]));
@@ -434,5 +513,28 @@ mod tests {
         assert_eq!(graph.header_to_units[&header].len(), 2);
         // One cache entry per distinct file (a.c, b.c, shared.h).
         assert_eq!(graph.include_cache.len(), 3);
+    }
+
+    #[test]
+    fn test_strip_comments_preserves_utf8_characters() {
+        let src = r#"
+/* 멀티바이트 블록 주석 — αβγ */
+#include "한글_헤더.h" // 라인 끝 한글 주석
+#include <유니코드/시스템.h>
+"#;
+        let includes = extract_includes(src);
+        assert_eq!(
+            includes,
+            vec![
+                IncludeDirective {
+                    name: "한글_헤더.h".to_string(),
+                    quoted: true,
+                },
+                IncludeDirective {
+                    name: "유니코드/시스템.h".to_string(),
+                    quoted: false,
+                },
+            ]
+        );
     }
 }

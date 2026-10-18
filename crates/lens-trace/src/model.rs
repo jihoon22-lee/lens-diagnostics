@@ -11,6 +11,12 @@ pub struct SyscallStats {
     pub known_duration: u64,
     pub total_ns: u64,
     pub max_ns: u64,
+    #[serde(default)]
+    pub p50_ns: u64,
+    #[serde(default)]
+    pub p95_ns: u64,
+    #[serde(default)]
+    pub p99_ns: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -48,6 +54,10 @@ pub struct TraceSnapshot {
     pub total_events: u64,
     pub total_calls: u64,
     pub total_errors: u64,
+    #[serde(default)]
+    pub unparsed_lines: u64,
+    #[serde(default)]
+    pub unfinished_calls: u64,
     pub syscalls: BTreeMap<String, SyscallStats>,
     /// Error counts keyed by `syscall:errno` (e.g. `openat:ENOENT`).
     pub errors: BTreeMap<String, u64>,

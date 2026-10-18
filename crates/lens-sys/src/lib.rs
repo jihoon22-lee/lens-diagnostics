@@ -280,4 +280,71 @@ ExecStart=/usr/bin/new-daemon --fast
         assert_eq!(diff.modified_units.len(), 1);
         assert_eq!(diff.modified_units[0].unit, "a.service");
     }
+
+    #[test]
+    fn test_s01_diff_systemd_masked_and_alias_of_changes() {
+        let make_snap = |unit: SystemdUnit| SystemdSnapshot {
+            schema: SNAPSHOT_SCHEMA_V1.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            semantics: "systemd-255-subset-v1".to_string(),
+            units: {
+                let mut map = BTreeMap::new();
+                map.insert(unit.name.clone(), unit);
+                map
+            },
+            cycles: vec![],
+            diagnostics: vec![],
+        };
+
+        let mut u1 = SystemdUnit {
+            name: "a.service".to_string(),
+            masked: false,
+            alias_of: Some("old.service".to_string()),
+            ..Default::default()
+        };
+        let mut u2 = u1.clone();
+        u2.masked = true;
+        u2.alias_of = Some("new.service".to_string());
+
+        let diff = diff_systemd(&make_snap(u1.clone()), &make_snap(u2));
+        assert_eq!(diff.modified_units.len(), 1);
+        let details = &diff.modified_units[0].details;
+        assert!(details.iter().any(|d| d.contains("Masked")));
+        assert!(details.iter().any(|d| d.contains("AliasOf")));
+
+        u1.masked = false;
+    }
+
+    #[test]
+    fn test_s02_specifiers_dropin_user_reexpansion_and_template_graph() {
+        let base_content = "[Unit]\nDescription=%n vs %N\n[Service]\nExecStart=/bin/run --user=%u --home=%h --base=%N --full=%n\n";
+        let mut unit = parse_unit_content(base_content, "foo@bar.service", None);
+        assert_eq!(
+            unit.exec_start.as_deref(),
+            Some("/bin/run --user=root --home=/root --base=foo@bar --full=foo@bar.service")
+        );
+
+        // Drop-in overriding User= must re-expand %u and %h in base unit directives.
+        apply_drop_in(&mut unit, "[Service]\nUser=daemon_user\n", "/etc/foo.conf");
+        assert_eq!(
+            unit.exec_start.as_deref(),
+            Some("/bin/run --user=daemon_user --home=/home/daemon_user --base=foo@bar --full=foo@bar.service")
+        );
+
+        // Template instance referenced in ordering graph resolves via foo@.service template.
+        let mut units = BTreeMap::new();
+        units.insert(
+            "app.service".to_string(),
+            parse_unit_content("[Unit]\nBefore=worker@1.service\n", "app.service", None),
+        );
+        units.insert(
+            "worker@.service".to_string(),
+            parse_unit_content("[Unit]\nBefore=app.service\n", "worker@.service", None),
+        );
+
+        let graph = OrderingGraph::build(&units);
+        let cycles = graph.find_cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0], vec!["app.service", "worker@1.service"]);
+    }
 }

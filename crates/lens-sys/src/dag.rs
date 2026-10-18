@@ -1,5 +1,5 @@
 use crate::model::{OrderingEdge, SystemdUnit};
-use crate::parser::is_template_name;
+use crate::parser::{instantiate_template, is_template_name, template_name_of};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,7 +43,7 @@ impl OrderingGraph {
         let mut graph = OrderingGraph::new();
 
         // Symlink aliases resolve to their canonical unit; masked,
-        // alias, and template units never join the ordering graph.
+        // alias, and template units never join the ordering graph directly.
         let alias_map: BTreeMap<&str, &str> = units
             .iter()
             .filter_map(|(n, u)| u.alias_of.as_deref().map(|t| (n.as_str(), t)))
@@ -55,14 +55,52 @@ impl OrderingGraph {
                 .unwrap_or_else(|| name.to_string())
         };
         let excluded = |name: &str| -> bool {
-            is_template_name(name)
-                || units
-                    .get(name)
-                    .map(|u| u.masked || u.alias_of.is_some())
-                    .unwrap_or(false)
+            if is_template_name(name) {
+                return true;
+            }
+            if let Some(u) = units.get(name) {
+                return u.masked || u.alias_of.is_some();
+            }
+            if let Some(tpl_name) = template_name_of(name) {
+                if let Some(tpl) = units.get(&tpl_name) {
+                    return tpl.masked || tpl.alias_of.is_some();
+                }
+            }
+            false
         };
 
+        // Collect concrete template instances (e.g. `foo@bar.service`)
+        // referenced by loaded units when `foo@bar.service` is not explicitly
+        // in `units` but its template `foo@.service` is.
+        let mut synthesized_instances: BTreeMap<String, SystemdUnit> = BTreeMap::new();
         for (name, unit) in units {
+            if excluded(name) {
+                continue;
+            }
+            let refs = unit
+                .before
+                .iter()
+                .chain(unit.after.iter())
+                .chain(unit.wants.iter())
+                .chain(unit.requires.iter())
+                .chain(unit.ordering_edges.iter().map(|e| &e.target));
+            for raw_target in refs {
+                let target = resolve(raw_target);
+                if units.contains_key(&target) || synthesized_instances.contains_key(&target) {
+                    continue;
+                }
+                if let Some(tpl_name) = template_name_of(&target) {
+                    if let Some(tpl_unit) = units.get(&tpl_name) {
+                        if !tpl_unit.masked && tpl_unit.alias_of.is_none() {
+                            synthesized_instances
+                                .insert(target.clone(), instantiate_template(tpl_unit, &target));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (name, unit) in units.iter().chain(synthesized_instances.iter()) {
             if excluded(name) {
                 continue;
             }
@@ -95,6 +133,7 @@ impl OrderingGraph {
                     continue;
                 }
                 graph.all_nodes.insert(target.clone());
+                graph.adj.entry(target.clone()).or_default();
                 // A has Before=T => A before T => edge A -> T;
                 // A has After=T  => T before A => edge T -> A.
                 let (before, after) = if e.directive == "After" {
