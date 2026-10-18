@@ -21,6 +21,7 @@ pub mod hash;
 pub mod identity;
 pub mod json;
 pub mod read_policy;
+pub mod redact;
 pub mod time;
 
 pub use bundle::{
@@ -34,3 +35,4 @@ pub use evidence::{BoundedCollector, Diagnostic, Evidence, Source};
 pub use hash::{digest_bytes, digest_file, digest_reader, IncrementalHasher};
 pub use identity::{FileIdentity, SafeInput};
 pub use json::{to_deterministic_pretty, to_deterministic_string};
+pub use redact::{redact_bytes, redact_str};

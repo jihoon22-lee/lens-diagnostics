@@ -59,7 +59,9 @@ impl FileIdentity {
     }
 
     pub fn is_same_file(&self, other: &Self) -> bool {
-        self.device == other.device && self.inode == other.inode
+        (self.device != 0 || self.inode != 0)
+            && self.device == other.device
+            && self.inode == other.inode
     }
 
     pub fn is_unchanged(&self, current: &Self) -> bool {
@@ -68,6 +70,7 @@ impl FileIdentity {
 }
 
 /// A securely opened file with identity tracking against TOCTOU race conditions.
+#[derive(Debug)]
 pub struct SafeInput {
     pub path: PathBuf,
     pub file: File,
@@ -77,17 +80,46 @@ pub struct SafeInput {
 impl SafeInput {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
+        // Check read policy and verify regular-file mode via stat before open(2)
+        // so that opening a FIFO (named pipe) or device node never blocks.
+        let pre_meta = crate::read_policy::metadata(&path_buf).map_err(|e| LensError::Io {
+            path: path_buf.clone(),
+            source: e,
+        })?;
+        let pre_identity = FileIdentity::from_metadata(&pre_meta);
+        if (pre_identity.mode & 0o170000) != 0o100000 {
+            return Err(LensError::InvalidInput {
+                message: format!("Target {:?} is not a regular file", path_buf),
+            });
+        }
+
+        #[cfg(target_os = "linux")]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0o4000) // O_NONBLOCK
+                .open(&path_buf)
+                .map_err(|e| LensError::Io {
+                    path: path_buf.clone(),
+                    source: e,
+                })?
+        };
+        #[cfg(not(target_os = "linux"))]
         let file = File::open(&path_buf).map_err(|e| LensError::Io {
             path: path_buf.clone(),
             source: e,
         })?;
         let initial_identity = FileIdentity::from_file(&file, &path_buf)?;
 
-        // Verify it is a regular file
+        // Verify it is still a regular file and matches pre-open identity
         if (initial_identity.mode & 0o170000) != 0o100000 {
             return Err(LensError::InvalidInput {
                 message: format!("Target {:?} is not a regular file", path_buf),
             });
+        }
+        if !pre_identity.is_same_file(&initial_identity) {
+            return Err(LensError::InputChanged { path: path_buf });
         }
 
         Ok(Self {
@@ -128,5 +160,24 @@ impl SafeInput {
                     source: e,
                 })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_zero_file_identity_is_not_same_file() {
+        let a = FileIdentity::default();
+        let b = FileIdentity::default();
+        assert!(!a.is_same_file(&b));
+    }
+
+    #[test]
+    fn safe_input_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = SafeInput::open(dir.path()).unwrap_err();
+        assert!(matches!(err, LensError::InvalidInput { .. }));
     }
 }
