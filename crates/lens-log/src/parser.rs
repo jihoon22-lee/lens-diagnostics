@@ -12,7 +12,9 @@ pub fn parse_line<'a>(raw: &'a str, line_number: usize) -> LogRecordView<'a> {
             let mut level = LogLevel::Unknown;
             let mut message = String::new();
             let mut source = String::new();
+            let mut source_priority: u8 = 0;
             let mut timestamp_ms = 0;
+            let mut has_primary_ts = false;
             let mut fields = Vec::new();
 
             for (k, v) in map {
@@ -53,14 +55,33 @@ pub fn parse_line<'a>(raw: &'a str, line_number: usize) -> LogRecordView<'a> {
                 } else if k.eq_ignore_ascii_case("source")
                     || k.eq_ignore_ascii_case("logger")
                     || k.eq_ignore_ascii_case("component")
+                    || k.eq_ignore_ascii_case("service")
                 {
                     if let Some(s) = v.as_str() {
-                        source = s.to_string();
+                        if !s.is_empty() && source_priority < 3 {
+                            source = s.to_string();
+                            source_priority = 3;
+                        }
+                    }
+                } else if k.eq_ignore_ascii_case("SYSLOG_IDENTIFIER") {
+                    if let Some(s) = v.as_str() {
+                        if !s.is_empty() && source_priority < 2 {
+                            source = s.to_string();
+                            source_priority = 2;
+                        }
+                    }
+                } else if k.eq_ignore_ascii_case("_COMM") {
+                    if let Some(s) = v.as_str() {
+                        if !s.is_empty() && source_priority < 1 {
+                            source = s.to_string();
+                            source_priority = 1;
+                        }
                     }
                 } else if k.eq_ignore_ascii_case("ts")
                     || k.eq_ignore_ascii_case("time")
                     || k.eq_ignore_ascii_case("timestamp")
                 {
+                    has_primary_ts = true;
                     if let Some(n) = v.as_u64() {
                         timestamp_ms = n;
                     } else if let Some(n) = v.as_i64() {
@@ -73,6 +94,16 @@ pub fn parse_line<'a>(raw: &'a str, line_number: usize) -> LogRecordView<'a> {
                         timestamp_ms = crate::timestamp::parse_bound(s)
                             .and_then(|t| u64::try_from(t).ok())
                             .unwrap_or(0);
+                    }
+                } else if k.eq_ignore_ascii_case("__REALTIME_TIMESTAMP") {
+                    if !has_primary_ts {
+                        if let Some(n) = v
+                            .as_u64()
+                            .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                        {
+                            timestamp_ms = n / 1000;
+                        }
                     }
                 } else {
                     // Preserve unrecognized structured fields instead of
@@ -105,6 +136,7 @@ pub fn parse_line<'a>(raw: &'a str, line_number: usize) -> LogRecordView<'a> {
 
     // Standard log format heuristic: [LEVEL] or LEVEL
     let detected_level = detect_level(raw);
+    let extracted_source = extract_syslog_source(raw);
 
     // ISO/RFC3339 or syslog (`Oct  9 …`, current UTC year) prefixes
     // yield a usable timestamp; anything else stays 0 = unknown.
@@ -116,11 +148,147 @@ pub fn parse_line<'a>(raw: &'a str, line_number: usize) -> LogRecordView<'a> {
     LogRecordView {
         timestamp_ms,
         level: detected_level,
-        source: Cow::Borrowed(""),
+        source: Cow::Borrowed(extracted_source),
         message: Cow::Borrowed(raw),
         raw,
         line_number,
         fields: Vec::new(),
+    }
+}
+
+fn looks_like_iso_date(w: &str) -> bool {
+    let b = w.as_bytes();
+    b.len() >= 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn looks_like_time_token(w: &str) -> bool {
+    let b = w.as_bytes();
+    b.len() >= 8
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2] == b':'
+        && b[3].is_ascii_digit()
+        && b[4].is_ascii_digit()
+        && b[5] == b':'
+        && b[6].is_ascii_digit()
+        && b[7].is_ascii_digit()
+}
+
+fn is_syslog_month(w: &str) -> bool {
+    matches!(
+        w,
+        "Jan"
+            | "Feb"
+            | "Mar"
+            | "Apr"
+            | "May"
+            | "Jun"
+            | "Jul"
+            | "Aug"
+            | "Sep"
+            | "Oct"
+            | "Nov"
+            | "Dec"
+    )
+}
+
+/// Extract the application/tag name from standard syslog or ISO-syslog
+/// prefixes (`Oct  9 12:00:00 host app[123]: msg` -> `"app"`).
+fn extract_syslog_source(raw: &str) -> &str {
+    let s = crate::timestamp::strip_syslog_pri_prefix(raw.trim_start());
+    let mut words = s.split_whitespace();
+    let w0 = match words.next() {
+        Some(w) => w,
+        None => return "",
+    };
+
+    // Advance past a leading timestamp if present.
+    let host_word = if is_syslog_month(w0) {
+        // `Mmm DD HH:MM:SS <host> <tag>: ...`
+        let day = match words.next() {
+            Some(w) if (1..=2).contains(&w.len()) && w.bytes().all(|b| b.is_ascii_digit()) => w,
+            _ => return "",
+        };
+        let _ = day;
+        match words.next() {
+            Some(t) if looks_like_time_token(t) => {}
+            _ => return "",
+        }
+        match words.next() {
+            Some(h) => h,
+            None => return "",
+        }
+    } else if looks_like_iso_date(w0) {
+        if w0.len() == 10 {
+            // `YYYY-MM-DD HH:MM:SS... <host> <tag>: ...`
+            let next = match words.next() {
+                Some(w) => w,
+                None => return "",
+            };
+            if looks_like_time_token(next) {
+                match words.next() {
+                    Some(h) => h,
+                    None => return "",
+                }
+            } else {
+                next
+            }
+        } else {
+            // `YYYY-MM-DDTHH:MM:SS... <host> <tag>: ...`
+            match words.next() {
+                Some(h) => h,
+                None => return "",
+            }
+        }
+    } else {
+        w0
+    };
+
+    if host_word.ends_with(':') || host_word.starts_with('[') {
+        return "";
+    }
+
+    let tag_word = match words.next() {
+        Some(t) => t,
+        None => return "",
+    };
+
+    let without_colon = match tag_word.strip_suffix(':') {
+        Some(t) if !t.is_empty() => t,
+        _ => return "",
+    };
+
+    // Strip optional `[pid]` suffix (`sshd[1234]` -> `sshd`).
+    let tag = if let Some(bracket_start) = without_colon.find('[') {
+        if without_colon.ends_with(']')
+            && without_colon[bracket_start + 1..without_colon.len() - 1]
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        {
+            &without_colon[..bracket_start]
+        } else {
+            return "";
+        }
+    } else {
+        without_colon
+    };
+
+    if tag.is_empty() || LogLevel::parse(tag) != LogLevel::Unknown {
+        return "";
+    }
+
+    if tag
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+    {
+        tag
+    } else {
+        ""
     }
 }
 
@@ -162,16 +330,24 @@ fn syslog_priority_token(word: &str, prefix_form: bool, max: u32) -> Option<LogL
 pub fn detect_level(raw: &str) -> LogLevel {
     let trimmed = raw.trim();
     let mut after_tag = false;
-    // The word-name scan keeps its historical 5-word bound; the
-    // `<PRI>`-after-tag scan reaches a few words further because syslog
-    // prefixes (`ts host kernel:`) can push the printk marker to ~word 5.
+    let mut seen_tag = false;
+    let mut w0_is_iso = false;
+    let mut w0_is_iso_date_only = false;
+    let mut w1_is_time = false;
+
     for (i, word) in trimmed.split_whitespace().take(8).enumerate() {
         if i == 0 {
             // Syslog/RFC5424 line head: `<PRI>` / `<PRI>1`.
             if let Some(lvl) = syslog_priority_token(word, true, 191) {
                 return lvl;
             }
-        } else if after_tag {
+            w0_is_iso = looks_like_iso_date(word);
+            w0_is_iso_date_only = w0_is_iso && word.len() == 10;
+        } else if i == 1 {
+            w1_is_time = looks_like_time_token(word);
+        }
+
+        if i > 0 && after_tag {
             // printk level embedded at message start: `kernel: <3>msg`.
             // Restricted to 0-7 so hex dumps like `Code: <89> ...` are
             // not misread as levels.
@@ -179,23 +355,63 @@ pub fn detect_level(raw: &str) -> LogLevel {
                 return lvl;
             }
         }
-        if i < 5 {
-            // journald short/verbose exports carry PRIORITY=<0-7>.
-            if let Some(rest) = word.strip_prefix("PRIORITY=") {
-                if let Ok(n) = rest.parse::<u32>() {
-                    if n <= 7 {
-                        return syslog_severity(n);
-                    }
+
+        // journald short/verbose exports carry PRIORITY=<0-7>.
+        if let Some(rest) = word.strip_prefix("PRIORITY=") {
+            if let Ok(n) = rest.parse::<u32>() {
+                if n <= 7 {
+                    return syslog_severity(n);
                 }
             }
-            let clean =
-                word.trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == ':');
+        }
+
+        // Key-value level tokens (`level=error`, `lvl=warn`, `severity=info`)
+        if let Some((k, v)) = word.split_once('=') {
+            if k.eq_ignore_ascii_case("level")
+                || k.eq_ignore_ascii_case("lvl")
+                || k.eq_ignore_ascii_case("severity")
+            {
+                let clean_v = v.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';');
+                let lvl = LogLevel::parse(clean_v);
+                if lvl != LogLevel::Unknown {
+                    return lvl;
+                }
+            }
+        }
+
+        // Check if token is explicitly delimited (`[ERROR]`, `(WARN)`, `<INFO>`, `ERROR:`)
+        let is_bracketed = (word.starts_with('[') && (word.ends_with(']') || word.ends_with("]:")))
+            || (word.starts_with('(') && (word.ends_with(')') || word.ends_with("):")))
+            || (word.starts_with('<') && (word.ends_with('>') || word.ends_with(">:")));
+        let is_colon_suffixed = word.ends_with(':') && word.len() > 1;
+
+        if is_bracketed || is_colon_suffixed {
+            let clean = word.trim_matches(|c| {
+                c == '[' || c == ']' || c == '(' || c == ')' || c == '<' || c == '>' || c == ':'
+            });
             let lvl = LogLevel::parse(clean);
             if lvl != LogLevel::Unknown {
                 return lvl;
             }
+        } else {
+            // Bare level word (`INFO`, `ERROR`, etc.): only match at line start
+            // (`i == 0`) or immediately after a leading ISO timestamp before any tag.
+            let allow_bare = !seen_tag
+                && (i == 0
+                    || (i == 1 && w0_is_iso)
+                    || (i == 2 && w0_is_iso_date_only && w1_is_time));
+            if allow_bare {
+                let lvl = LogLevel::parse(word);
+                if lvl != LogLevel::Unknown {
+                    return lvl;
+                }
+            }
         }
+
         after_tag = word.ends_with(':');
+        if after_tag {
+            seen_tag = true;
+        }
     }
     LogLevel::Unknown
 }
@@ -257,5 +473,43 @@ mod tests {
         assert_eq!(rec.level, LogLevel::Warn);
         let rec2 = parse_line(r#"{"severity":"2","msg":"crit"}"#, 2);
         assert_eq!(rec2.level, LogLevel::Fatal);
+    }
+
+    #[test]
+    fn test_l02_syslog_and_journald_source_extraction() {
+        let sys1 = parse_line("Oct  9 12:00:00 myhost sshd[1234]: Accepted publickey", 1);
+        assert_eq!(sys1.source, "sshd");
+
+        let sys2 = parse_line("<131>Oct  9 12:00:00 myhost nginx: worker exited", 2);
+        assert_eq!(sys2.source, "nginx");
+
+        let j1 = parse_line(
+            r#"{"SYSLOG_IDENTIFIER":"systemd","MESSAGE":"Started unit","__REALTIME_TIMESTAMP":"1791547200000000"}"#,
+            3,
+        );
+        assert_eq!(j1.source, "systemd");
+        assert_eq!(j1.timestamp_ms, 1_791_547_200_000);
+    }
+
+    #[test]
+    fn test_l03_detect_level_avoids_prose_false_positives_and_reaches_after_syslog_tag() {
+        // Delimited level at word index 5 (after syslog header) is detected
+        assert_eq!(
+            detect_level("Oct  9 12:00:00 host app[123]: [ERROR] disk full"),
+            LogLevel::Error
+        );
+        assert_eq!(
+            detect_level("Oct  9 12:00:00 host app[123]: level=warn disk almost full"),
+            LogLevel::Warn
+        );
+        // Bare prose word "error" or "debug" after tag is NOT a log level
+        assert_eq!(
+            detect_level("2026-10-09T12:00:00Z host app: error count is 0"),
+            LogLevel::Unknown
+        );
+        assert_eq!(
+            detect_level("Oct  9 12:00:00 host app: debug mode is disabled"),
+            LogLevel::Unknown
+        );
     }
 }

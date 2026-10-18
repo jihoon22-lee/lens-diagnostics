@@ -42,6 +42,13 @@ pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
     if left.elf.dynamic != right.elf.dynamic {
         header_changes.push("linkage: dynamic/static changed".to_string());
     }
+    if left.dependencies.soname != right.dependencies.soname {
+        header_changes.push(format!(
+            "soname: {} -> {}",
+            left.dependencies.soname.as_deref().unwrap_or("<none>"),
+            right.dependencies.soname.as_deref().unwrap_or("<none>")
+        ));
+    }
 
     let needed_diff = SetDiff::compute(
         left.dependencies.needed.clone(),
@@ -83,22 +90,20 @@ pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
             .collect::<Vec<String>>(),
     );
 
-    // Symbol attributes diff (size, type, binding)
+    // Symbol attributes diff (size, type, binding) — compare only defined
+    // (exported) symbols on both sides so an undefined import becoming a
+    // defined export is classified as Added (Compatible), not a type change.
     let left_evidence_map: HashMap<&str, &SymbolEvidence> = left
         .evidence
         .iter()
+        .filter(|s| s.defined)
         .map(|s| (s.identity.as_str(), s))
         .collect();
 
     let mut symbol_changes = Vec::new();
     let mut breaking_attribute = false;
 
-    for r_sym in &right.evidence {
-        // Attribute drift on an imported (undefined) symbol is a
-        // dependency detail, not an export change.
-        if !r_sym.defined {
-            continue;
-        }
+    for r_sym in right.evidence.iter().filter(|s| s.defined) {
         if let Some(l_sym) = left_evidence_map.get(r_sym.identity.as_str()) {
             let mut diffs = Vec::new();
             if l_sym.symbol_type != r_sym.symbol_type {
@@ -108,9 +113,11 @@ pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
             if l_sym.binding != r_sym.binding {
                 diffs.push("binding");
             }
-            // If data object size changed, ABI layout broken
+            // If data/TLS object size changed, ABI layout is broken
             if l_sym.size != r_sym.size
-                && (r_sym.symbol_type == "OBJECT" || r_sym.symbol_type == "COMMON")
+                && (r_sym.symbol_type == "OBJECT"
+                    || r_sym.symbol_type == "COMMON"
+                    || r_sym.symbol_type == "TLS")
             {
                 diffs.push("size");
                 breaking_attribute = true;
@@ -118,6 +125,29 @@ pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
 
             if !diffs.is_empty() {
                 symbol_changes.push(format!("{}: {}", r_sym.identity, diffs.join(" ")));
+            }
+        }
+    }
+
+    // Check DWARF type byte-size changes (`TypeName (size=N)`).
+    fn parse_type_size(entry: &str) -> Option<(&str, &str)> {
+        let (name, rest) = entry.rsplit_once(" (size=")?;
+        let size = rest.strip_suffix(')')?;
+        Some((name, size))
+    }
+    let left_type_sizes: HashMap<&str, &str> = left
+        .abi
+        .types
+        .iter()
+        .filter_map(|t| parse_type_size(t))
+        .collect();
+    let mut breaking_type_layout = false;
+    for r_type in &right.abi.types {
+        if let Some((name, r_sz)) = parse_type_size(r_type) {
+            if let Some(&l_sz) = left_type_sizes.get(name) {
+                if l_sz != r_sz {
+                    breaking_type_layout = true;
+                }
             }
         }
     }
@@ -152,7 +182,7 @@ pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
                 vtables_diff.removed.len()
             ));
         }
-        if breaking_attribute {
+        if breaking_attribute || breaking_type_layout {
             incompatible = true;
         }
         if needed_diff.has_changed() || rpath_diff.has_changed() || runpath_diff.has_changed() {
@@ -167,7 +197,11 @@ pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
             ));
         }
         if abi_diff.has_changed() {
-            uncertain = true;
+            if abi_diff.removed.iter().any(|v| v.starts_with("self:")) {
+                incompatible = true;
+            } else {
+                uncertain = true;
+            }
             diagnostics.push(format!(
                 "Symbol version requirements changed (+{} -{})",
                 abi_diff.added.len(),

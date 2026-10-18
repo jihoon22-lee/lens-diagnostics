@@ -122,4 +122,140 @@ mod tests {
         assert_eq!(diff.left_status, "valid");
         assert_eq!(diff.schema, "abilens.diff/v3");
     }
+
+    #[test]
+    fn test_a01_undefined_symbol_does_not_overwrite_defined_size() {
+        let fake = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0\x01\0\0\0\0\0\0\0\0\0\0\0";
+        let mut a = inspect_elf("lib_v1.so", fake);
+        a.status = InputStatus::Valid;
+        a.abi.symbols = vec!["global_buf".to_string()];
+        // Exported definition followed by an undefined entry with the same identity
+        a.evidence = vec![
+            model::SymbolEvidence {
+                identity: "global_buf".to_string(),
+                size: 64,
+                binding: "global".to_string(),
+                visibility: "default".to_string(),
+                symbol_type: "OBJECT".to_string(),
+                default_version: false,
+                defined: true,
+                demangled: None,
+            },
+            model::SymbolEvidence {
+                identity: "global_buf".to_string(),
+                size: 0,
+                binding: "global".to_string(),
+                visibility: "default".to_string(),
+                symbol_type: "OBJECT".to_string(),
+                default_version: false,
+                defined: false,
+                demangled: None,
+            },
+        ];
+
+        let mut b_same = a.clone();
+        b_same.evidence = vec![model::SymbolEvidence {
+            identity: "global_buf".to_string(),
+            size: 64,
+            binding: "global".to_string(),
+            visibility: "default".to_string(),
+            symbol_type: "OBJECT".to_string(),
+            default_version: false,
+            defined: true,
+            demangled: None,
+        }];
+        let diff_same = diff_reports(&a, &b_same);
+        assert_eq!(
+            diff_same.compatibility,
+            lens_core::Compatibility::Compatible
+        );
+        assert!(diff_same.symbol_changes.is_empty());
+
+        let mut b = b_same.clone();
+        b.evidence[0].size = 32;
+
+        let diff = diff_reports(&a, &b);
+        assert_eq!(diff.compatibility, lens_core::Compatibility::Incompatible);
+        assert_eq!(diff.symbol_changes, vec!["global_buf: size"]);
+    }
+
+    #[test]
+    fn test_a02_tls_size_change_is_incompatible() {
+        let fake = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0\x01\0\0\0\0\0\0\0\0\0\0\0";
+        let mut a = inspect_elf("lib_v1.so", fake);
+        a.status = InputStatus::Valid;
+        a.abi.symbols = vec!["tls_var".to_string()];
+        a.evidence = vec![model::SymbolEvidence {
+            identity: "tls_var".to_string(),
+            size: 8,
+            binding: "global".to_string(),
+            visibility: "default".to_string(),
+            symbol_type: "TLS".to_string(),
+            default_version: false,
+            defined: true,
+            demangled: None,
+        }];
+
+        let mut b = a.clone();
+        b.evidence[0].size = 16;
+
+        let diff = diff_reports(&a, &b);
+        assert_eq!(diff.compatibility, lens_core::Compatibility::Incompatible);
+        assert_eq!(diff.symbol_changes.len(), 1);
+    }
+
+    #[test]
+    fn test_a03_soname_change_and_removed_self_verdef_are_incompatible() {
+        let fake = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0\x01\0\0\0\0\0\0\0\0\0\0\0";
+        let mut a = inspect_elf("libfoo.so.1", fake);
+        a.status = InputStatus::Valid;
+        a.dependencies.soname = Some("libfoo.so.1".to_string());
+
+        let mut b = a.clone();
+        b.dependencies.soname = Some("libfoo.so.2".to_string());
+
+        let diff_soname = diff_reports(&a, &b);
+        assert!(diff_soname.changed);
+        assert_eq!(
+            diff_soname.compatibility,
+            lens_core::Compatibility::Incompatible
+        );
+        assert!(diff_soname
+            .header_changes
+            .iter()
+            .any(|h| h.contains("soname:")));
+
+        // Now test removed exported version definition ("self:")
+        let mut c = a.clone();
+        c.abi.versions = vec![model::VersionRequirement {
+            library: "self".to_string(),
+            namespace: "LIBFOO".to_string(),
+            version: "LIBFOO_1.0".to_string(),
+        }];
+        let mut d = c.clone();
+        d.abi.versions.clear();
+
+        let diff_verdef = diff_reports(&c, &d);
+        assert!(diff_verdef.changed);
+        assert_eq!(
+            diff_verdef.compatibility,
+            lens_core::Compatibility::Incompatible
+        );
+        assert_eq!(diff_verdef.abi.removed, vec!["self:LIBFOO_1.0"]);
+    }
+
+    #[test]
+    fn test_e01_dwarf_struct_size_change_is_incompatible() {
+        let fake = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0\x01\0\0\0\0\0\0\0\0\0\0\0";
+        let mut a = inspect_elf("lib_v1.so", fake);
+        a.status = InputStatus::Valid;
+        a.abi.types = vec!["MyStruct (size=16)".to_string()];
+
+        let mut b = a.clone();
+        b.abi.types = vec!["MyStruct (size=24)".to_string()];
+
+        let diff = diff_reports(&a, &b);
+        assert!(diff.changed);
+        assert_eq!(diff.compatibility, lens_core::Compatibility::Incompatible);
+    }
 }

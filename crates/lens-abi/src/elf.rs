@@ -32,7 +32,8 @@ const PT_INTERP: u64 = 3;
 const SHF_ALLOC: u64 = 0x2;
 
 fn rd_u16(d: &[u8], off: usize, le: bool) -> Option<u64> {
-    let b: [u8; 2] = d.get(off..off + 2)?.try_into().ok()?;
+    let end = off.checked_add(2)?;
+    let b: [u8; 2] = d.get(off..end)?.try_into().ok()?;
     Some(if le {
         u16::from_le_bytes(b) as u64
     } else {
@@ -41,7 +42,8 @@ fn rd_u16(d: &[u8], off: usize, le: bool) -> Option<u64> {
 }
 
 fn rd_u32(d: &[u8], off: usize, le: bool) -> Option<u64> {
-    let b: [u8; 4] = d.get(off..off + 4)?.try_into().ok()?;
+    let end = off.checked_add(4)?;
+    let b: [u8; 4] = d.get(off..end)?.try_into().ok()?;
     Some(if le {
         u32::from_le_bytes(b) as u64
     } else {
@@ -51,8 +53,10 @@ fn rd_u32(d: &[u8], off: usize, le: bool) -> Option<u64> {
 
 fn rd_dyn(d: &[u8], off: usize, is64: bool, le: bool) -> Option<(i64, u64)> {
     if is64 {
-        let tag: [u8; 8] = d.get(off..off + 8)?.try_into().ok()?;
-        let val: [u8; 8] = d.get(off + 8..off + 16)?.try_into().ok()?;
+        let mid = off.checked_add(8)?;
+        let end = off.checked_add(16)?;
+        let tag: [u8; 8] = d.get(off..mid)?.try_into().ok()?;
+        let val: [u8; 8] = d.get(mid..end)?.try_into().ok()?;
         let (t, v) = if le {
             (i64::from_le_bytes(tag), u64::from_le_bytes(val))
         } else {
@@ -60,8 +64,10 @@ fn rd_dyn(d: &[u8], off: usize, is64: bool, le: bool) -> Option<(i64, u64)> {
         };
         Some((t, v))
     } else {
-        let tag: [u8; 4] = d.get(off..off + 4)?.try_into().ok()?;
-        let val: [u8; 4] = d.get(off + 4..off + 8)?.try_into().ok()?;
+        let mid = off.checked_add(4)?;
+        let end = off.checked_add(8)?;
+        let tag: [u8; 4] = d.get(off..mid)?.try_into().ok()?;
+        let val: [u8; 4] = d.get(mid..end)?.try_into().ok()?;
         let (t, v) = if le {
             (
                 i32::from_le_bytes(tag) as i64,
@@ -101,7 +107,8 @@ fn parse_program_headers(data: &[u8], is64: bool, le: bool) -> ProgramHeaders {
         interp: None,
     };
     let read32 = |off: usize| -> Option<u64> {
-        let b: [u8; 4] = data.get(off..off + 4)?.try_into().ok()?;
+        let end = off.checked_add(4)?;
+        let b: [u8; 4] = data.get(off..end)?.try_into().ok()?;
         Some(if le {
             u32::from_le_bytes(b) as u64
         } else {
@@ -109,7 +116,8 @@ fn parse_program_headers(data: &[u8], is64: bool, le: bool) -> ProgramHeaders {
         })
     };
     let read64 = |off: usize| -> Option<u64> {
-        let b: [u8; 8] = data.get(off..off + 8)?.try_into().ok()?;
+        let end = off.checked_add(8)?;
+        let b: [u8; 8] = data.get(off..end)?.try_into().ok()?;
         Some(if le {
             u64::from_le_bytes(b)
         } else {
@@ -119,15 +127,15 @@ fn parse_program_headers(data: &[u8], is64: bool, le: bool) -> ProgramHeaders {
     // ELF header: e_phoff, e_phentsize, e_phnum
     let (phoff, phentsize, phnum) = if is64 {
         (
-            read64(32).map(|v| v as usize),
-            rd_u16(data, 54, le).map(|v| v as usize),
-            rd_u16(data, 56, le).map(|v| v as usize),
+            read64(32).and_then(|v| usize::try_from(v).ok()),
+            rd_u16(data, 54, le).and_then(|v| usize::try_from(v).ok()),
+            rd_u16(data, 56, le).and_then(|v| usize::try_from(v).ok()),
         )
     } else {
         (
-            read32(28).map(|v| v as usize),
-            rd_u16(data, 42, le).map(|v| v as usize),
-            rd_u16(data, 44, le).map(|v| v as usize),
+            read32(28).and_then(|v| usize::try_from(v).ok()),
+            rd_u16(data, 42, le).and_then(|v| usize::try_from(v).ok()),
+            rd_u16(data, 44, le).and_then(|v| usize::try_from(v).ok()),
         )
     };
     let (Some(phoff), Some(phentsize), Some(phnum)) = (phoff, phentsize, phnum) else {
@@ -138,20 +146,25 @@ fn parse_program_headers(data: &[u8], is64: bool, le: bool) -> ProgramHeaders {
     }
 
     for i in 0..phnum.min(4096) {
-        let base = phoff + i * phentsize;
+        let Some(base) = i
+            .checked_mul(phentsize)
+            .and_then(|off| phoff.checked_add(off))
+        else {
+            break;
+        };
         let (p_type, p_offset, p_vaddr, p_filesz) = if is64 {
             (
                 read32(base),
-                read64(base + 8),
-                read64(base + 16),
-                read64(base + 32),
+                base.checked_add(8).and_then(read64),
+                base.checked_add(16).and_then(read64),
+                base.checked_add(32).and_then(read64),
             )
         } else {
             (
                 read32(base),
-                read32(base + 4),
-                read32(base + 8),
-                read32(base + 16),
+                base.checked_add(4).and_then(read32),
+                base.checked_add(8).and_then(read32),
+                base.checked_add(16).and_then(read32),
             )
         };
         let (Some(t), Some(off), Some(vaddr), Some(filesz)) = (p_type, p_offset, p_vaddr, p_filesz)
@@ -193,7 +206,8 @@ fn vaddr_bytes<'a>(
 ) -> Option<&'a [u8]> {
     for seg in &ph.loads {
         if vaddr >= seg.vaddr && vaddr < seg.vaddr.saturating_add(seg.filesz) {
-            let off = (seg.offset + (vaddr - seg.vaddr)) as usize;
+            let file_off = seg.offset.checked_add(vaddr - seg.vaddr)?;
+            let off = usize::try_from(file_off).ok()?;
             if off <= data.len() {
                 return Some(&data[off..]);
             }
@@ -207,7 +221,7 @@ fn vaddr_bytes<'a>(
         let end = start.saturating_add(s.size());
         if s.size() > 0 && vaddr >= start && vaddr < end {
             if let Ok(d) = s.data() {
-                let off = (vaddr - start) as usize;
+                let off = usize::try_from(vaddr - start).ok()?;
                 if off <= d.len() {
                     return Some(&d[off..]);
                 }
@@ -218,7 +232,11 @@ fn vaddr_bytes<'a>(
 }
 
 fn cstr_at(d: &[u8], off: usize) -> Option<String> {
-    let end = d.get(off..)?.iter().position(|&b| b == 0)? + off;
+    let end = d
+        .get(off..)?
+        .iter()
+        .position(|&b| b == 0)?
+        .checked_add(off)?;
     Some(String::from_utf8_lossy(&d[off..end]).into_owned())
 }
 
@@ -294,6 +312,9 @@ fn parse_verdef<'a>(
         let Some(ent) = map(cur) else {
             break;
         };
+        let Some(flags) = rd_u16(ent, 2, le) else {
+            break;
+        };
         let Some(cnt) = rd_u16(ent, 6, le) else { break };
         let Some(aux) = rd_u32(ent, 12, le) else {
             break;
@@ -302,27 +323,21 @@ fn parse_verdef<'a>(
             break;
         };
 
-        let mut aux_cur = cur.saturating_add(aux);
-        // Verdaux: vda_name@0 u32, vda_next@4 u32 (8 bytes)
-        for _ in 0..cnt.min(1024) {
-            let Some(a) = map(aux_cur) else {
-                break;
-            };
-            let Some(name_off) = rd_u32(a, 0, le) else {
-                break;
-            };
-            let Some(anext) = rd_u32(a, 4, le) else { break };
-            if let Some(version) = cstr_at(strtab, name_off as usize) {
-                out.push(VersionRequirement {
-                    library: String::new(),
-                    namespace: "self".to_string(),
-                    version,
-                });
+        // Skip VER_FLG_BASE (0x1) which names the file itself, and read only
+        // the first Verdaux entry (subsequent Verdaux entries are parent predecessors).
+        if (flags & 1) == 0 && cnt > 0 {
+            let aux_cur = cur.saturating_add(aux);
+            if let Some(a) = map(aux_cur) {
+                if let Some(name_off) = rd_u32(a, 0, le) {
+                    if let Some(version) = cstr_at(strtab, name_off as usize) {
+                        out.push(VersionRequirement {
+                            library: String::new(),
+                            namespace: "self".to_string(),
+                            version,
+                        });
+                    }
+                }
             }
-            if anext == 0 {
-                break;
-            }
-            aux_cur = aux_cur.saturating_add(anext);
         }
 
         if next == 0 {
@@ -330,6 +345,13 @@ fn parse_verdef<'a>(
         }
         cur = cur.saturating_add(next);
     }
+}
+
+fn slice_from_u64_range(data: &[u8], off: u64, size: u64) -> Option<&[u8]> {
+    let start = usize::try_from(off).ok()?;
+    let len = usize::try_from(size).ok()?;
+    let end = start.checked_add(len)?;
+    data.get(start..end)
 }
 
 fn parse_dynamic(file: &object::File, data: &[u8]) -> DynamicInfo {
@@ -340,7 +362,7 @@ fn parse_dynamic(file: &object::File, data: &[u8]) -> DynamicInfo {
 
     let interp_bytes = ph
         .interp
-        .and_then(|(off, size)| data.get(off as usize..(off + size) as usize))
+        .and_then(|(off, size)| slice_from_u64_range(data, off, size))
         .or_else(|| file.section_by_name(".interp").and_then(|s| s.data().ok()));
     let mut info = DynamicInfo {
         interpreter: interp_bytes.and_then(|d| cstr_at(d, 0)),
@@ -350,7 +372,7 @@ fn parse_dynamic(file: &object::File, data: &[u8]) -> DynamicInfo {
     // .dynamic via PT_DYNAMIC first — section headers may be stripped.
     let dyn_data: &[u8] = ph
         .dynamic
-        .and_then(|(off, size)| data.get(off as usize..(off + size) as usize))
+        .and_then(|(off, size)| slice_from_u64_range(data, off, size))
         .or_else(|| file.section_by_name(".dynamic").and_then(|s| s.data().ok()))
         .unwrap_or(&[]);
     if dyn_data.is_empty() {
@@ -518,35 +540,67 @@ pub fn inspect_elf<P: AsRef<Path>>(path: P, data: &[u8]) -> ElfReport {
                 continue;
             }
 
+            let (st_info, st_other) = match sym.flags() {
+                object::SymbolFlags::Elf { st_info, st_other } => (Some(st_info), Some(st_other)),
+                _ => (None, None),
+            };
+
+            let visibility = match st_other.map(|o| o & 0x03).unwrap_or(0) {
+                0 => "default",
+                1 => "internal",
+                2 => "hidden",
+                3 => "protected",
+                _ => "default",
+            };
+
+            // SymbolScope::Linkage is not ELF weakness — ask the symbol / st_info.
+            let binding = if sym.is_weak() {
+                "weak"
+            } else if sym.is_local() || st_info.map(|i| (i >> 4) == 0).unwrap_or(false) {
+                "local"
+            } else {
+                "global"
+            };
+
+            let st_type = st_info.map(|i| i & 0x0f);
+            let symbol_type = if sym.kind() == SymbolKind::Tls || matches!(st_type, Some(6 | 7)) {
+                "TLS"
+            } else if st_type == Some(5) {
+                "COMMON"
+            } else {
+                match sym.kind() {
+                    SymbolKind::Text => "FUNC",
+                    SymbolKind::Data => "OBJECT",
+                    SymbolKind::Section => "SECTION",
+                    SymbolKind::File => "FILE",
+                    _ => "NOTYPE",
+                }
+            };
+
             // Undefined dynamic symbols are imports, not exports —
             // keep them out of `abi.symbols` so the diff never reports
             // a changed dependency as a removed export.
+            // Defined symbols are exported only when binding is global/weak
+            // and visibility is default/protected.
             let defined = !sym.is_undefined();
+            let is_export_binding = binding == "global" || binding == "weak";
+            let is_export_vis = visibility == "default" || visibility == "protected";
             let is_vtable = defined && name.starts_with("_ZTV");
             if !defined {
                 imports.push(name.to_string());
-            } else if is_vtable {
-                vtables.push(name.to_string());
-            } else {
-                symbols.push(name.to_string());
+            } else if is_export_binding && is_export_vis {
+                if is_vtable {
+                    vtables.push(name.to_string());
+                } else {
+                    symbols.push(name.to_string());
+                }
             }
-
-            // SymbolScope::Linkage is not ELF weakness — ask the symbol.
-            let binding = if sym.is_weak() { "weak" } else { "global" };
-
-            let symbol_type = match sym.kind() {
-                SymbolKind::Text => "FUNC",
-                SymbolKind::Data => "OBJECT",
-                SymbolKind::Section => "SECTION",
-                SymbolKind::File => "FILE",
-                _ => "NOTYPE",
-            };
 
             evidence.push(SymbolEvidence {
                 identity: name.to_string(),
                 size: sym.size(),
                 binding: binding.to_string(),
-                visibility: "default".to_string(),
+                visibility: visibility.to_string(),
                 symbol_type: symbol_type.to_string(),
                 default_version: name.contains("@@"),
                 defined,

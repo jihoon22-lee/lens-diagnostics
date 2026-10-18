@@ -223,9 +223,17 @@ impl DiskScanner {
                     entries.iter().map(stat_entry).collect()
                 };
 
+                let mut child_dirs = Vec::new();
+
                 for stat in stats {
                     if scanned_entries >= self.options.max_entries {
                         truncated = true;
+                        if let Some(p) = tree.get_mut(parent_id) {
+                            p.complete = false;
+                            if p.error.is_empty() {
+                                p.error = "Scan truncated at max_entries limit".to_string();
+                            }
+                        }
                         break;
                     }
 
@@ -247,17 +255,18 @@ impl DiskScanner {
                     };
 
                     let is_symlink = sym_meta.file_type().is_symlink();
+                    let is_dir = !is_symlink && sym_meta.is_dir();
                     let mut cycle_skipped = false;
                     let mut mount_boundary_skipped = false;
                     let mut target_meta: Option<DiskMetadata> = None;
-                    let mut actual_is_dir = sym_meta.is_dir();
+                    let mut target_is_dir = is_dir;
 
                     if let Some(target_m) = target {
-                        actual_is_dir = target_m.is_dir();
+                        target_is_dir = target_m.is_dir();
                         target_meta = Some(Self::extract_metadata(&target_m));
                     }
 
-                    if actual_is_dir {
+                    if target_is_dir {
                         // For symlinks the traversal boundary is defined by the
                         // target filesystem, not the link's own inode.
                         let (check_dev, check_ino) = match &target_meta {
@@ -279,14 +288,14 @@ impl DiskScanner {
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
-                    let mut node = FsNode::new(name, rel_path, actual_is_dir);
+                    let mut node = FsNode::new(name, rel_path, is_dir);
                     node.metadata = Self::extract_metadata(&sym_meta);
                     node.target_metadata = target_meta;
                     node.followed = is_symlink && node.target_metadata.is_some();
                     node.cycle_skipped = cycle_skipped;
                     node.mount_boundary_skipped = mount_boundary_skipped;
 
-                    if !actual_is_dir {
+                    if !is_dir {
                         node.size = sym_meta.len();
                         node.allocated_size = sym_meta.blocks() * 512;
                     }
@@ -295,13 +304,36 @@ impl DiskScanner {
                     tree.add_child(parent_id, child_id);
                     scanned_entries += 1;
 
-                    if actual_is_dir && !cycle_skipped && !mount_boundary_skipped && !is_symlink {
-                        stack.push((child_id, path, depth + 1));
+                    if is_dir && !cycle_skipped && !mount_boundary_skipped {
+                        child_dirs.push((child_id, path, depth + 1));
                     }
+                }
+
+                // Push in reverse order so the LIFO stack visits directories in a -> z order.
+                for child_dir in child_dirs.into_iter().rev() {
+                    stack.push(child_dir);
                 }
 
                 if truncated {
                     break;
+                }
+            }
+
+            if truncated {
+                errors.push("Scan truncated at max_entries limit".to_string());
+                if let Some(r) = tree.get_mut(root_id) {
+                    r.complete = false;
+                    if r.error.is_empty() {
+                        r.error = "Scan truncated at max_entries limit".to_string();
+                    }
+                }
+                while let Some((unvisited_id, _, _)) = stack.pop() {
+                    if let Some(n) = tree.get_mut(unvisited_id) {
+                        n.complete = false;
+                        if n.error.is_empty() {
+                            n.error = "Scan truncated at max_entries limit".to_string();
+                        }
+                    }
                 }
             }
         }
@@ -321,9 +353,11 @@ impl DiskScanner {
     }
 
     fn extract_metadata(meta: &fs::Metadata) -> DiskMetadata {
-        let kind = if meta.file_type().is_symlink() {
+        let is_symlink = meta.file_type().is_symlink();
+        let is_dir = !is_symlink && meta.is_dir();
+        let kind = if is_symlink {
             FsKind::Symlink
-        } else if meta.is_dir() {
+        } else if is_dir {
             FsKind::Directory
         } else if meta.is_file() {
             FsKind::RegularFile
@@ -343,7 +377,10 @@ impl DiskScanner {
             owner: meta.uid() as u64,
             group: meta.gid() as u64,
             ownership_known: true,
-            modified_ns: meta.mtime_nsec(),
+            modified_ns: meta
+                .mtime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.mtime_nsec()),
             modified_time_known: true,
         }
     }

@@ -113,6 +113,28 @@ impl TrashManager {
     }
 
     pub fn ensure_directories(&self) -> Result<()> {
+        #[cfg(unix)]
+        let is_topdir = self
+            .trash_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(".Trash-"))
+            .unwrap_or(false);
+
+        #[cfg(unix)]
+        if is_topdir {
+            if let Ok(sym_meta) = fs::symlink_metadata(&self.trash_dir) {
+                if sym_meta.file_type().is_symlink() {
+                    return Err(LensError::InvalidInput {
+                        message: format!(
+                            "Refusing to use symlinked topdir trash {:?}",
+                            self.trash_dir
+                        ),
+                    });
+                }
+            }
+        }
+
         fs::create_dir_all(self.files_dir()).map_err(|e| LensError::Io {
             path: self.files_dir(),
             source: e,
@@ -121,22 +143,35 @@ impl TrashManager {
             path: self.info_dir(),
             source: e,
         })?;
-        // FreeDesktop: a topdir `.Trash-$uid` directory must be mode 0700.
+        // FreeDesktop: a topdir `.Trash-$uid` directory must not be a symlink,
+        // must be owned by current euid, and must be mode 0700.
         #[cfg(unix)]
-        if self
-            .trash_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(".Trash-"))
-            .unwrap_or(false)
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&self.trash_dir)
-                .map_err(|e| LensError::Io {
-                    path: self.trash_dir.clone(),
-                    source: e,
-                })?
-                .permissions();
+        if is_topdir {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let sym_meta = fs::symlink_metadata(&self.trash_dir).map_err(|e| LensError::Io {
+                path: self.trash_dir.clone(),
+                source: e,
+            })?;
+            if sym_meta.file_type().is_symlink() {
+                return Err(LensError::InvalidInput {
+                    message: format!(
+                        "Refusing to use symlinked topdir trash {:?}",
+                        self.trash_dir
+                    ),
+                });
+            }
+            let euid = unsafe { libc::geteuid() };
+            if sym_meta.uid() != euid {
+                return Err(LensError::InvalidInput {
+                    message: format!(
+                        "Topdir trash {:?} is not owned by current user (uid {} != {})",
+                        self.trash_dir,
+                        sym_meta.uid(),
+                        euid
+                    ),
+                });
+            }
+            let mut perms = sym_meta.permissions();
             perms.set_mode(0o700);
             let _ = fs::set_permissions(&self.trash_dir, perms);
         }
@@ -219,7 +254,8 @@ impl TrashManager {
             let Some(name) = info_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.trim_end_matches(".trashinfo").to_string())
+                .and_then(|n| n.strip_suffix(".trashinfo"))
+                .map(str::to_string)
             else {
                 continue;
             };
@@ -248,8 +284,15 @@ impl TrashManager {
     /// path. Fails closed: refuses overwrite and, when the identity
     /// sidecar exists, refuses a file whose metadata changed in trash.
     pub fn restore_by_name(&self, name: &str) -> Result<TrashReceipt> {
-        // `name` is a trash-internal key — reject traversal outright.
-        if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        // `name` is a trash-internal key — reject traversal outright while
+        // permitting legitimate dotfiles (`.env`, `.bashrc`).
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0')
+        {
             return Err(LensError::InvalidInput {
                 message: format!("invalid trash entry name {:?}", name),
             });
@@ -363,6 +406,7 @@ impl TrashManager {
                     .info_dir()
                     .join(format!("{}.trashinfo", candidate_name)),
             )
+            || occupied(&self.identity_path(&candidate_name))
         {
             candidate_name = format!("{}_{}", file_name, counter);
             counter += 1;
@@ -510,9 +554,9 @@ impl TrashManager {
             .info_path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".trashinfo").to_string())
+            .and_then(|n| n.strip_suffix(".trashinfo"))
         {
-            let _ = fs::remove_file(self.identity_path(&name));
+            let _ = fs::remove_file(self.identity_path(name));
         }
 
         Ok(())
@@ -569,7 +613,36 @@ mod tests {
         // Traversal / unsafe names fail closed.
         assert!(trash.restore_by_name("../escape").is_err());
         assert!(trash.restore_by_name("").is_err());
-        assert!(trash.restore_by_name(".hidden").is_err());
+        assert!(trash.restore_by_name(".").is_err());
+        assert!(trash.restore_by_name("..").is_err());
+        assert!(trash.restore_by_name("bad\0name").is_err());
+    }
+
+    #[test]
+    fn test_trash_dotfile_and_info_suffix_roundtrip() {
+        let (root, trash) = tmp_trash("dotfile");
+        let src_dir = root.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let dot_env = src_dir.join(".env");
+        let report_info = src_dir.join("report.info");
+        fs::write(&dot_env, "SECRET=1").unwrap();
+        fs::write(&report_info, "info-body").unwrap();
+
+        trash.move_to_trash(&dot_env).unwrap();
+        trash.move_to_trash(&report_info).unwrap();
+        assert!(!dot_env.exists() && !report_info.exists());
+
+        let entries = trash.list().unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&".env"), "{names:?}");
+        assert!(names.contains(&"report.info"), "{names:?}");
+
+        trash.restore_by_name(".env").unwrap();
+        trash.restore_by_name("report.info").unwrap();
+        assert_eq!(fs::read_to_string(&dot_env).unwrap(), "SECRET=1");
+        assert_eq!(fs::read_to_string(&report_info).unwrap(), "info-body");
+        assert!(trash.list().unwrap().is_empty());
+        assert!(!trash.identity_path("report.info").exists());
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct DuplicateReport {
     pub total_reclaimable_bytes: u64,
 }
 
+const PARTIAL_HASH_BYTES: u64 = 4096;
+
 pub struct DuplicateFinder {
     min_size: u64,
 }
@@ -37,18 +39,19 @@ impl DuplicateFinder {
 
     /// Finds duplicates across files registered in an ArenaTree.
     pub fn find_in_tree(&self, tree: &ArenaTree, base_dir: &Path) -> Result<DuplicateReport> {
-        // Step 1: Bucket regular files by size. Symlinks are excluded: their
-        // node size is the link's own, not the target's, so hashing them would
-        // compare the wrong bytes. Hardlinks are folded by (dev, ino) using
-        // the identity already captured during the scan — no extra stat, and
-        // each inode is hashed at most once.
+        // Step 1: Bucket regular files by size. Non-regular files (symlinks,
+        // FIFOs, sockets, device nodes) are excluded so we never block on pipes
+        // or compare symlink target bytes. Hardlinks are folded by (dev, ino)
+        // using the identity already captured during the scan — no extra stat,
+        // and each inode is hashed at most once.
         use crate::arena::FsKind;
 
-        // Pass 1: count files by size so only multi-candidate sizes pay the
-        // PathBuf materialization cost.
+        // Pass 1: count regular files by size so only multi-candidate sizes pay
+        // the PathBuf materialization cost.
         let mut file_count_by_size: HashMap<u64, usize> = HashMap::new();
         for node in &tree.nodes {
-            if node.is_dir || node.metadata.kind == FsKind::Symlink || node.size < self.min_size {
+            if node.is_dir || node.metadata.kind != FsKind::RegularFile || node.size < self.min_size
+            {
                 continue;
             }
             *file_count_by_size.entry(node.size).or_default() += 1;
@@ -59,7 +62,8 @@ impl DuplicateFinder {
         // giant bucket that masks every duplicate.
         let mut size_buckets: HashMap<u64, HashMap<String, Vec<PathBuf>>> = HashMap::new();
         for node in &tree.nodes {
-            if node.is_dir || node.metadata.kind == FsKind::Symlink || node.size < self.min_size {
+            if node.is_dir || node.metadata.kind != FsKind::RegularFile || node.size < self.min_size
+            {
                 continue;
             }
             if file_count_by_size.get(&node.size).copied().unwrap_or(0) < 2 {
@@ -83,6 +87,11 @@ impl DuplicateFinder {
         let mut errors = Vec::new();
 
         for (size, inode_buckets) in size_buckets {
+            // Skip size buckets where all files are hardlinks to a single inode.
+            if inode_buckets.len() < 2 {
+                continue;
+            }
+
             // Step 2: Partial hash (first 4KB) once per unique inode.
             let mut partial_buckets: HashMap<String, Vec<String>> = HashMap::new();
             for (key, paths) in &inode_buckets {
@@ -96,17 +105,22 @@ impl DuplicateFinder {
             }
 
             // Step 3: Full SHA-256 for matching partial hashes.
-            for (_p_hash, inode_ids) in partial_buckets {
+            for (p_hash, inode_ids) in partial_buckets {
                 if inode_ids.len() < 2 {
                     continue;
                 }
 
                 let mut full_buckets: HashMap<String, Vec<String>> = HashMap::new();
-                for id in inode_ids {
-                    match digest_file(&inode_buckets[&id][0]) {
-                        Ok(full_hash) => full_buckets.entry(full_hash).or_default().push(id),
-                        Err(e) => {
-                            errors.push(format!("{}: {}", inode_buckets[&id][0].display(), e))
+                if size <= PARTIAL_HASH_BYTES {
+                    // For files <= 4 KiB, the partial hash already covered the entire file.
+                    full_buckets.insert(p_hash, inode_ids);
+                } else {
+                    for id in inode_ids {
+                        match digest_file(&inode_buckets[&id][0]) {
+                            Ok(full_hash) => full_buckets.entry(full_hash).or_default().push(id),
+                            Err(e) => {
+                                errors.push(format!("{}: {}", inode_buckets[&id][0].display(), e))
+                            }
                         }
                     }
                 }
@@ -159,8 +173,8 @@ impl DuplicateFinder {
         // 4 KiB window is full so identical files can't land in different
         // buckets.
         let file = File::open(path)?;
-        let mut buffer = Vec::with_capacity(4096);
-        file.take(4096).read_to_end(&mut buffer)?;
+        let mut buffer = Vec::with_capacity(PARTIAL_HASH_BYTES as usize);
+        file.take(PARTIAL_HASH_BYTES).read_to_end(&mut buffer)?;
         Ok(digest_bytes(&buffer))
     }
 }
