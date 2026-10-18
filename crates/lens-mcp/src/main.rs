@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use lens_mcp::handler::set_allowed_roots;
 use lens_mcp::protocol::{get_prompt, list_prompts};
@@ -50,12 +50,39 @@ fn main() -> io::Result<()> {
     }
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut reader = stdin.lock();
+    let mut line = String::new();
+    const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        line.clear();
+        let bytes_read = match (&mut reader)
+            .take((MAX_REQUEST_LINE_BYTES + 1) as u64)
+            .read_line(&mut line)
+        {
+            Ok(0) => break,
+            Ok(n) => n,
             Err(_) => break,
         };
+        if bytes_read > MAX_REQUEST_LINE_BYTES && !line.ends_with('\n') {
+            // Drain the rest of the oversized line so framing recovers.
+            let mut discard = Vec::new();
+            let _ = reader.read_until(b'\n', &mut discard);
+            let err_resp = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32600,
+                    message: "Invalid Request: request line exceeds 8 MiB limit".to_string(),
+                    data: None,
+                }),
+            };
+            let out = serde_json::to_string(&err_resp)?;
+            writeln!(stdout, "{}", out)?;
+            stdout.flush()?;
+            continue;
+        }
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -84,17 +111,21 @@ fn main() -> io::Result<()> {
         // `"id": null` and a missing `id` differ in JSON-RPC: the null
         // is a present id (response carries `id: null`), absence makes
         // the request a notification (no response at all).
-        let id_present = parsed.get("id").is_some();
+        let raw_id = parsed.get("id").cloned();
+        let id_present = raw_id.is_some();
         let req: JsonRpcRequest = match serde_json::from_value(parsed) {
             Ok(r) => r,
             Err(e) => {
+                let valid_id = raw_id
+                    .filter(|v| v.is_string() || v.is_number() || v.is_null())
+                    .or(Some(Value::Null));
                 let err_resp = JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
-                    id: None,
+                    id: valid_id,
                     result: None,
                     error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("Parse error: {}", e),
+                        code: -32600,
+                        message: format!("Invalid Request: {}", e),
                         data: None,
                     }),
                 };

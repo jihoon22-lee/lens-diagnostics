@@ -133,6 +133,7 @@ pub enum Commands {
     /// log → `log inspect`, other dir → `disk scan`)
     Inspect {
         /// File or directory to inspect
+        #[arg(default_value = ".")]
         path: PathBuf,
         /// Treat the input as this domain instead of auto-detecting
         #[arg(long = "as", value_enum)]
@@ -182,6 +183,9 @@ pub enum Commands {
         /// Overwrite the output file if it already exists
         #[arg(long)]
         force: bool,
+        /// Redact secrets, tokens, and API keys from embedded artifacts
+        #[arg(long)]
+        redact: bool,
     },
     /// Forensic Flight Recorder: bundle multiple diagnostic artifacts into a .lens container
     Bundle {
@@ -222,6 +226,7 @@ pub enum DiskCommands {
     /// Scan directory and print space usage summary or snapshot JSON
     Scan {
         /// Directory to scan
+        #[arg(default_value = ".")]
         path: PathBuf,
         /// Parallelize per-entry stat with rayon
         #[arg(long)]
@@ -244,6 +249,7 @@ pub enum DiskCommands {
     /// Find duplicate files with hard link deduplication
     Duplicates {
         /// Directory to scan for duplicates
+        #[arg(default_value = ".")]
         path: PathBuf,
         /// Minimum file size in bytes to consider
         #[arg(long, default_value = "1024")]
@@ -568,6 +574,9 @@ pub enum BundleCommands {
         /// Overwrite the output file if it already exists
         #[arg(long)]
         force: bool,
+        /// Redact secrets, tokens, and API keys from embedded artifacts
+        #[arg(long)]
+        redact: bool,
     },
     /// Diff two .lens bundles section by section (verified first)
     Diff {

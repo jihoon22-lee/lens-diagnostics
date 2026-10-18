@@ -225,16 +225,24 @@ where
                                 .iter()
                                 .enumerate()
                                 .map(|(idx, l)| {
-                                    let proc = l
-                                        .process
-                                        .as_ref()
-                                        .map(|p| p.name.as_str())
-                                        .unwrap_or("<orphan>");
+                                    let owner = if let Some(p) = &l.process {
+                                        format!("{} (PID: {})", p.name, p.pid)
+                                    } else {
+                                        match l.owner_state {
+                                            Some(lens_net::OwnerState::OwnerUnknown) => {
+                                                "<permission-denied>".to_string()
+                                            }
+                                            Some(lens_net::OwnerState::Orphan) => {
+                                                "<orphan>".to_string()
+                                            }
+                                            None => "<kernel>".to_string(),
+                                        }
+                                    };
                                     let line = format!(
-                                        "{:<6} {:<20} (PID: {:?})",
+                                        "{:<6} {:<20} {}",
                                         format!("{:?}", l.kind),
                                         format!("{}:{}", l.local_address, l.local_port),
-                                        proc
+                                        owner
                                     );
                                     let style = if idx == app.net_selected {
                                         Style::default()
@@ -413,6 +421,7 @@ where
             }
 
             if app.show_help {
+                f.render_widget(ratatui::widgets::Clear, chunks[1]);
                 let help = Paragraph::new(vec![
                     Line::from("Keys:"),
                     Line::from("  Tab / 1-4   switch views"),
@@ -453,7 +462,7 @@ where
                         KeyCode::Enter => {
                             app.log_search = Some(app.search_buf.clone());
                             app.search_active = false;
-                            app.log_scroll = usize::MAX;
+                            app.log_scroll = app.visible_log_indices().len();
                         }
                         KeyCode::Esc => {
                             app.search_active = false;

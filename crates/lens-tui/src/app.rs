@@ -351,9 +351,14 @@ impl TuiApp {
         }
     }
 
-    /// Force a fresh background scan of the current directory.
+    /// Force a fresh reload of the active tab (or background scan on Storage).
     pub fn reload(&mut self) {
-        self.request_scan(self.current_path.clone());
+        match self.active_tab {
+            TuiTab::Storage => self.request_scan(self.current_path.clone()),
+            TuiTab::Services => self.reload_services(),
+            TuiTab::Logs => self.reload_logs(),
+            TuiTab::Network => self.reload_network(),
+        }
     }
 
     fn current_node_id(&self) -> Option<NodeId> {
@@ -492,7 +497,9 @@ impl TuiApp {
         match self.active_tab {
             TuiTab::Storage => self.selected_index = 0,
             TuiTab::Services => self.sys_selected = 0,
-            TuiTab::Logs => self.log_scroll = 0,
+            TuiTab::Logs => {
+                self.log_scroll = self.page_size.max(1).min(self.visible_log_count());
+            }
             TuiTab::Network => self.net_selected = 0,
         }
     }
@@ -556,6 +563,9 @@ impl TuiApp {
         };
         if in_tree {
             let id = item.node_id.unwrap();
+            if let Some(tree) = self.tree.as_ref() {
+                self.total_size = tree.nodes[id as usize].size;
+            }
             self.nav_stack.push(id);
             self.current_path = target;
             self.selected_index = 0;
@@ -573,6 +583,7 @@ impl TuiApp {
             if let (Some(tree), Some(id)) = (self.tree.as_ref(), self.current_node_id()) {
                 let node = &tree.nodes[id as usize];
                 self.current_path = self.scan_root.join(&node.rel_path);
+                self.total_size = node.size;
             }
             self.selected_index = 0;
             self.populate_items();

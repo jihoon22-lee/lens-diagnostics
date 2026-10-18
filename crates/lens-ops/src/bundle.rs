@@ -113,6 +113,8 @@ pub struct BundleRequest {
     /// systemd unit-dir override for the doctor collector.
     pub systemd_dir: Option<PathBuf>,
     pub force: bool,
+    /// Redact secrets/tokens from all collected artifacts before hashing and archiving.
+    pub redact: bool,
 }
 
 /// Collect every requested artifact and write the bundle. Fail-closed
@@ -282,6 +284,12 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
                 diagnostics.join("; ")
             ),
         });
+    }
+
+    if req.redact {
+        for artifact in &mut artifacts {
+            artifact.data = lens_core::redact_bytes(&artifact.data);
+        }
     }
 
     let manifest = create_bundle_archive(

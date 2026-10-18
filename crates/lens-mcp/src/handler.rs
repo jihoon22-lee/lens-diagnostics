@@ -199,22 +199,7 @@ fn check_allowed(p: &Path) -> Result<(), String> {
     if roots.is_empty() {
         return Ok(());
     }
-    let mut candidate = p.to_path_buf();
-    let canon = loop {
-        match std::fs::canonicalize(&candidate) {
-            Ok(c) => break c,
-            Err(_) => {
-                if !candidate.pop() {
-                    return Err(format!("path {} is outside the allowed roots", p.display()));
-                }
-            }
-        }
-    };
-    if roots.iter().any(|r| canon.starts_with(r)) {
-        Ok(())
-    } else {
-        Err(format!("path {} is outside the allowed roots", p.display()))
-    }
+    lens_core::read_policy::check_boundary(p).map_err(|e| e.to_string())
 }
 
 /// Resolve a caller-supplied path string. Paths are interpreted relative
@@ -243,6 +228,7 @@ fn roots_active() -> bool {
 /// inside an allowed root (e.g. the caller allowed `/`).
 fn require_allowed_default(default: &Path, arg: &str) -> Result<(), String> {
     if roots_active() && check_allowed(default).is_err() {
+        let _ = lens_core::read_policy::take_denial();
         Err(format!("{arg} is required when --allow-root is set"))
     } else {
         Ok(())
@@ -373,6 +359,7 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             let mut scanned = 0usize;
             let mut seen = 0usize;
             let mut lossy_lines = 0usize;
+            let need_full_parse = filter.min_level.is_some() || filter.time_filter_active();
             for idx in start..total {
                 scanned += 1;
                 // Lossy view: invalid-UTF-8 lines are still matched (shown
@@ -382,14 +369,30 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                     if matches!(line, std::borrow::Cow::Owned(_)) {
                         lossy_lines += 1;
                     }
-                    let record = parse_line(&line, idx + 1);
-                    if filter.matches(&record) {
+                    if need_full_parse {
+                        let record = parse_line(&line, idx + 1);
+                        if filter.matches(&record) {
+                            seen += 1;
+                            if seen > offset + limit {
+                                truncated = true;
+                                break;
+                            }
+                            if seen > offset {
+                                matches.push(serde_json::json!({
+                                    "line": record.line_number,
+                                    "level": record.level.as_str(),
+                                    "raw": record.raw,
+                                }));
+                            }
+                        }
+                    } else if filter.matches_line(&line, idx + 1) {
                         seen += 1;
                         if seen > offset + limit {
                             truncated = true;
                             break;
                         }
                         if seen > offset {
+                            let record = parse_line(&line, idx + 1);
                             matches.push(serde_json::json!({
                                 "line": record.line_number,
                                 "level": record.level.as_str(),
@@ -399,16 +402,20 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                     }
                 }
             }
+            let mut val = serde_json::json!({
+                "_self_paginated": true,
+                "matches": matches,
+                "scanned_lines": scanned,
+                "total_lines": total,
+                "lossy_lines": lossy_lines,
+                "tail": tail,
+                "truncated": truncated,
+            });
+            if truncated {
+                val["next_offset"] = serde_json::json!(offset + limit);
+            }
             Ok(ToolOutcome {
-                value: serde_json::json!({
-                    "_self_paginated": true,
-                    "matches": matches,
-                    "scanned_lines": scanned,
-                    "total_lines": total,
-                    "lossy_lines": lossy_lines,
-                    "tail": tail,
-                    "truncated": truncated,
-                }),
+                value: val,
                 findings: Vec::new(),
                 diagnostics: Vec::new(),
                 complete: true,
@@ -461,6 +468,7 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
                     .iter()
                     .map(|c| c.members.clone())
                     .collect::<Vec<_>>(),
+                "cycle_details": report.data.cycles,
             });
             Ok(ToolOutcome {
                 value,
