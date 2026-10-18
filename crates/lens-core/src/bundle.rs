@@ -327,7 +327,7 @@ where
 
     let mut count = 0usize;
     for entry_res in entries {
-        let mut entry = entry_res.map_err(&map_io)?;
+        let mut entry = entry_res.map_err(map_io)?;
         count += 1;
         if count > MAX_BUNDLE_ENTRIES {
             return Err(LensError::LimitExceeded {
@@ -347,7 +347,7 @@ where
             });
         }
         let size = entry.header().size().unwrap_or(0);
-        let name = entry.path().map_err(&map_io)?.to_string_lossy().to_string();
+        let name = entry.path().map_err(map_io)?.to_string_lossy().to_string();
         if normalize_entry_name(&name) == MANIFEST_ENTRY && size > MAX_MANIFEST_BYTES {
             return Err(LensError::LimitExceeded {
                 message: "manifest exceeds maximum metadata size".into(),
