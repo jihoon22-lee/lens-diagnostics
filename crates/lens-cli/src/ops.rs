@@ -833,7 +833,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     if p.extension().is_some_and(|e| e == "gz") {
                         return Err(usage("--follow cannot tail a compressed (.gz) file"));
                     }
-                    if json_mode {
+                    if json_mode && !jsonl_mode {
                         return Err(usage("--follow requires --format text or jsonl output"));
                     }
                     if context != 0 {
@@ -908,6 +908,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 }
 
                 if follow && !stopped {
+                    crate::output::flush();
                     let indexer = follow_indexer.unwrap();
                     // Resume exactly at the unterminated tail: the partial
                     // line's bytes belong to the next appended line, so
@@ -928,6 +929,9 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         let poll = follower.poll()?;
                         if let Some(note) = &poll.note {
                             diagln!("{note}");
+                            if note.contains("rotated") || note.contains("truncated") {
+                                line_no = 0;
+                            }
                         }
                         let mut emitted = false;
                         for line in poll.lines {
@@ -1450,6 +1454,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
             test,
             trace,
             force,
+            redact,
         } => {
             // The log source defaults to the first conventional syslog
             // path — its absence is noted quietly, not counted as a
@@ -1483,6 +1488,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 systemd_dir,
                 procfs,
                 force,
+                redact,
             })?;
             let manifest = &report.data;
             if wants_json(format, json, false) {
@@ -1515,6 +1521,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 net,
                 doctor,
                 force,
+                redact,
             } => {
                 let report = bundle::create(&bundle::BundleRequest {
                     output: output.clone(),
@@ -1525,6 +1532,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     env,
                     net,
                     force,
+                    redact,
                     doctor,
                     systemd_dir: sys.clone(),
                     sys,

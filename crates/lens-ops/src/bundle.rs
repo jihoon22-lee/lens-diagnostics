@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use lens_core::{
-    create_bundle_archive, extract_bundle, inspect_bundle, read_bundle_entry,
+    create_bundle_archive_with_redaction, extract_bundle, inspect_bundle, read_bundle_entry,
     verify_bundle_archive, BundleArtifact, BundleInspection, BundleManifest,
     BundleVerificationReport, LensError, Result,
 };
@@ -113,6 +113,8 @@ pub struct BundleRequest {
     /// systemd unit-dir override for the doctor collector.
     pub systemd_dir: Option<PathBuf>,
     pub force: bool,
+    /// Redact secrets/tokens from all collected artifacts before hashing and archiving.
+    pub redact: bool,
 }
 
 /// Collect every requested artifact and write the bundle. Fail-closed
@@ -284,12 +286,19 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
         });
     }
 
-    let manifest = create_bundle_archive(
+    if req.redact {
+        for artifact in &mut artifacts {
+            artifact.data = lens_core::redact_bytes(&artifact.data);
+        }
+    }
+
+    let manifest = create_bundle_archive_with_redaction(
         &req.output,
         env!("CARGO_PKG_VERSION"),
         &artifacts,
         diagnostics.clone(),
         req.force,
+        req.redact,
     )?;
 
     let mut report = Report::new(manifest);
@@ -713,6 +722,8 @@ pub fn extract(bundle: &PathBuf, dest: &PathBuf, force: bool) -> Result<Report<V
 
 #[cfg(test)]
 mod tests {
+    use lens_core::create_bundle_archive;
+
     #[test]
     fn review2_manifest_diagnostics_are_bounded_before_cloning() {
         let dir = tempfile::tempdir().unwrap();

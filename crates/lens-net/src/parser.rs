@@ -101,22 +101,35 @@ pub fn parse_proc_net_unix(content: &str) -> Vec<SocketEntry> {
     let mut entries = Vec::new();
 
     for line in content.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
         // Format: Num RefCount Protocol Flags Type St Inode [Path]
-        if parts.len() < 7 {
+        let mut rest = line;
+        let mut fields = Vec::with_capacity(7);
+        for _ in 0..7 {
+            rest = rest.trim_start();
+            if rest.is_empty() {
+                break;
+            }
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            fields.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+        if fields.len() < 7 {
             continue;
         }
 
-        let inode = parts[6].parse::<u64>().unwrap_or(0);
-        // Paths may contain whitespace — the kernel prints them verbatim.
-        let path = if parts.len() >= 8 {
-            Some(parts[7..].join(" "))
-        } else {
+        let inode = fields[6].parse::<u64>().unwrap_or(0);
+        // Paths may contain multiple consecutive spaces — preserve them verbatim.
+        let path_str = rest
+            .trim_start_matches([' ', '\t'])
+            .trim_end_matches(['\r', '\n']);
+        let path = if path_str.is_empty() {
             None
+        } else {
+            Some(path_str.to_string())
         };
         // Type column: 0001=stream, 0002=dgram, 0005=seqpacket.
-        let kind = match u32::from_str_radix(parts[4], 16).unwrap_or(0) {
-            0x0001 => SocketKind::UnixStream,
+        let kind = match u32::from_str_radix(fields[4], 16).unwrap_or(0) {
+            0x0001 | 0x0005 => SocketKind::UnixStream,
             0x0002 => SocketKind::UnixDgram,
             _ => SocketKind::Other,
         };
@@ -166,29 +179,21 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
         Err(_) => return scan,
     };
 
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        let pid = match name_str.parse::<u32>() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+    let mut pids: Vec<(u32, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            Some((pid, entry.path()))
+        })
+        .collect();
+    // Sort PIDs in ascending order so shared sockets (e.g. pre-fork workers)
+    // deterministically attribute to the lowest PID (master process).
+    pids.sort_by_key(|(pid, _)| *pid);
 
-        let pid_path = entry.path();
+    for (pid, pid_path) in pids {
         let fd_dir = pid_path.join("fd");
 
-        // Read proc name and cmdline
-        let comm = lens_core::read_policy::read_to_string(pid_path.join("comm"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let cmdline = lens_core::read_policy::read_to_string(pid_path.join("cmdline"))
-            .unwrap_or_default()
-            .replace('\0', " ")
-            .trim()
-            .to_string();
-
-        let fd_entries = match lens_core::read_policy::read_dir(fd_dir) {
+        let fd_entries = match lens_core::read_policy::read_dir(&fd_dir) {
             Ok(e) => e,
             Err(_) => {
                 // EACCES on /proc/<pid>/fd — the process exists but its
@@ -198,7 +203,7 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt;
-                    if let Ok(meta) = fs::metadata(&pid_path) {
+                    if let Ok(meta) = lens_core::read_policy::metadata(&pid_path) {
                         scan.uninspectable_uids.insert(meta.uid());
                     }
                 }
@@ -206,6 +211,7 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
             }
         };
 
+        let mut socket_fds: Vec<(u32, u64)> = Vec::new();
         for fd_entry in fd_entries.flatten() {
             let fd_num = fd_entry
                 .file_name()
@@ -220,22 +226,64 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
                     .and_then(|s| s.strip_suffix(']'))
                 {
                     if let Ok(inode) = inode_str.parse::<u64>() {
-                        inode_map.insert(
-                            inode,
-                            SocketProcess {
-                                pid,
-                                name: comm.clone(),
-                                cmdline: cmdline.clone(),
-                                fd: fd_num,
-                            },
-                        );
+                        socket_fds.push((fd_num, inode));
                     }
                 }
             }
         }
+
+        if socket_fds.is_empty() {
+            continue;
+        }
+        socket_fds.sort_by_key(|(fd_num, _)| *fd_num);
+
+        // Read proc name and cmdline lazily only after at least one socket fd is found.
+        let comm = lens_core::read_policy::read_to_string(pid_path.join("comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let cmdline = lens_core::read_policy::read_to_string(pid_path.join("cmdline"))
+            .unwrap_or_default()
+            .replace('\0', " ")
+            .trim()
+            .to_string();
+
+        for (fd_num, inode) in socket_fds {
+            inode_map.entry(inode).or_insert_with(|| SocketProcess {
+                pid,
+                name: comm.clone(),
+                cmdline: cmdline.clone(),
+                fd: fd_num,
+            });
+        }
     }
 
     scan
+}
+
+fn socket_kind_rank(kind: SocketKind) -> u8 {
+    match kind {
+        SocketKind::Tcp => 0,
+        SocketKind::Tcp6 => 1,
+        SocketKind::Udp => 2,
+        SocketKind::Udp6 => 3,
+        SocketKind::UnixStream => 4,
+        SocketKind::UnixDgram => 5,
+        SocketKind::Other => 6,
+    }
+}
+
+fn sort_sockets(sockets: &mut [SocketEntry]) {
+    sockets.sort_by(|a, b| {
+        socket_kind_rank(a.kind)
+            .cmp(&socket_kind_rank(b.kind))
+            .then_with(|| a.local_address.cmp(&b.local_address))
+            .then_with(|| a.local_port.cmp(&b.local_port))
+            .then_with(|| a.remote_address.cmp(&b.remote_address))
+            .then_with(|| a.remote_port.cmp(&b.remote_port))
+            .then_with(|| a.unix_path.cmp(&b.unix_path))
+            .then_with(|| a.inode.cmp(&b.inode))
+    });
 }
 
 pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
@@ -278,7 +326,12 @@ pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
         } else if s.inode != 0
             && matches!(
                 s.kind,
-                SocketKind::Tcp | SocketKind::Tcp6 | SocketKind::Udp | SocketKind::Udp6
+                SocketKind::Tcp
+                    | SocketKind::Tcp6
+                    | SocketKind::Udp
+                    | SocketKind::Udp6
+                    | SocketKind::UnixStream
+                    | SocketKind::UnixDgram
             )
         {
             // Not attributable to any inspected process. If the socket's
@@ -291,6 +344,8 @@ pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
             });
         }
     }
+
+    sort_sockets(&mut sockets);
 
     let mut summary = NetSummary::default();
     let mut listening = Vec::new();
@@ -407,10 +462,76 @@ mod tests {
     fn test_parse_proc_net_unix() {
         let sample = "Num       RefCount Protocol Flags    Type St Inode Path
 0000000000000000: 00000002 00000000 00010000 0001 01 123456 /run/test.sock
+0000000000000000: 00000002 00000000 00010000 0005 01 654321 /tmp/path  with   multiple spaces.sock
 ";
         let entries = parse_proc_net_unix(sample);
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].inode, 123456);
+        assert_eq!(entries[0].kind, SocketKind::UnixStream);
         assert_eq!(entries[0].unix_path, Some("/run/test.sock".to_string()));
+
+        assert_eq!(entries[1].inode, 654321);
+        assert_eq!(entries[1].kind, SocketKind::UnixStream);
+        assert_eq!(
+            entries[1].unix_path,
+            Some("/tmp/path  with   multiple spaces.sock".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shared_socket_attributes_to_lowest_pid_and_sorts_deterministically() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("lensnet-n01-")
+            .tempdir()
+            .unwrap();
+        let root = tmp.path();
+        let net = root.join("net");
+        std::fs::create_dir_all(&net).unwrap();
+
+        // Put port 9090 before port 8080 in /proc/net/tcp to verify deterministic sorting.
+        std::fs::write(
+            net.join("tcp"),
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:2382 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 77777 1 0000000000000000 100 0 0 10 0\n   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 88888 1 0000000000000000 100 0 0 10 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            net.join("unix"),
+            "Num       RefCount Protocol Flags    Type St Inode Path\n0000000000000000: 00000002 00000000 00010000 0005 01 99999 /run/orphan  seq.sock\n",
+        )
+        .unwrap();
+
+        // Both PID 200 (worker) and PID 100 (master) hold socket:[88888].
+        for (pid, name) in [(200u32, "nginx-worker"), (100u32, "nginx-master")] {
+            let pdir = root.join(pid.to_string());
+            let fddir = pdir.join("fd");
+            std::fs::create_dir_all(&fddir).unwrap();
+            std::fs::write(pdir.join("comm"), format!("{name}\n")).unwrap();
+            std::fs::write(pdir.join("cmdline"), format!("{name}\0--daemon\0")).unwrap();
+            symlink("socket:[88888]", fddir.join("3")).unwrap();
+        }
+
+        let report = inspect_network(Some(root)).unwrap();
+        // Listening sockets must be sorted deterministically: 8080 then 9090.
+        assert_eq!(report.listening.len(), 2);
+        assert_eq!(report.listening[0].local_port, 8080);
+        assert_eq!(report.listening[1].local_port, 9090);
+
+        // Shared socket 88888 must attribute to lowest PID (100, nginx-master).
+        let proc = report.listening[0].process.as_ref().unwrap();
+        assert_eq!(proc.pid, 100);
+        assert_eq!(proc.name, "nginx-master");
+
+        // Unowned unix seqpacket socket with non-zero inode has owner_state = Orphan.
+        let unix_sock = report
+            .sockets
+            .iter()
+            .find(|s| s.inode == 99999)
+            .expect("unix socket");
+        assert_eq!(unix_sock.kind, SocketKind::UnixStream);
+        assert_eq!(unix_sock.owner_state, Some(OwnerState::Orphan));
+        assert_eq!(report.summary.unix_domain_sockets, 1);
     }
 }

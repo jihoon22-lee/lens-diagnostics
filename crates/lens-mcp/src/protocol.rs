@@ -156,7 +156,7 @@ pub fn list_tools() -> Vec<McpTool> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to log file" },
-                    "query": { "type": "string", "description": "Case-sensitive substring query" },
+                    "query": { "type": "string", "description": "Case-insensitive substring query" },
                     "regex": { "type": "string", "description": "Regex pattern (alternative to query)" },
                     "min_level": { "type": "string", "description": "Minimum level (trace, debug, info, warn, error, fatal)" },
                     "include_unknown": { "type": "boolean", "description": "Keep lines whose level or timestamp could not be determined" },

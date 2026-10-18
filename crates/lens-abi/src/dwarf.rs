@@ -5,7 +5,7 @@
 
 use gimli::Reader;
 use object::{Object, ObjectSection};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 /// Upper bound on extracted type names to keep reports bounded.
@@ -16,11 +16,16 @@ type GimliReader = gimli::EndianRcSlice<gimli::RunTimeEndian>;
 /// Extract declared type names from a parsed object file.
 /// Returns `(types, diagnostic)`.
 pub fn extract_dwarf_types(file: &object::File) -> (Vec<String>, Option<String>) {
-    if file
+    let has_debug_info = file
         .section_by_name(".debug_info")
-        .map(|s| s.size() == 0)
-        .unwrap_or(true)
-    {
+        .map(|s| s.size() > 0)
+        .unwrap_or(false)
+        || file
+            .section_by_name(".zdebug_info")
+            .map(|s| s.size() > 0)
+            .unwrap_or(false);
+
+    if !has_debug_info {
         return (
             Vec::new(),
             Some("no .debug_info section (stripped or built without -g)".to_string()),
@@ -56,7 +61,7 @@ pub fn extract_dwarf_types(file: &object::File) -> (Vec<String>, Option<String>)
         }
     };
 
-    let mut types: BTreeSet<String> = BTreeSet::new();
+    let mut types: BTreeMap<String, Option<u64>> = BTreeMap::new();
     let mut units = dwarf.units();
     let mut truncated = false;
     let mut parse_error = false;
@@ -94,7 +99,16 @@ pub fn extract_dwarf_types(file: &object::File) -> (Vec<String>, Option<String>)
                             if let Ok(reader) = dwarf.attr_string(&unit, attr.value()) {
                                 if let Ok(name) = reader.to_string() {
                                     if !name.is_empty() {
-                                        types.insert(name.into_owned());
+                                        let byte_size = entry
+                                            .attr(gimli::DW_AT_byte_size)
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|a| a.udata_value());
+                                        let name_owned = name.into_owned();
+                                        let slot = types.entry(name_owned).or_insert(byte_size);
+                                        if slot.is_none() && byte_size.is_some() {
+                                            *slot = byte_size;
+                                        }
                                     }
                                 }
                             }
@@ -124,5 +138,13 @@ pub fn extract_dwarf_types(file: &object::File) -> (Vec<String>, Option<String>)
         None
     };
 
-    (types.into_iter().collect(), diagnostic)
+    let formatted = types
+        .into_iter()
+        .map(|(name, sz)| match sz {
+            Some(s) => format!("{name} (size={s})"),
+            None => name,
+        })
+        .collect();
+
+    (formatted, diagnostic)
 }

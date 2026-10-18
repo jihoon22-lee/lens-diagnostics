@@ -270,4 +270,145 @@ mod tests {
         assert!(!res.complete);
         assert!(res.errors.iter().any(|e| e.contains("Depth limit")));
     }
+
+    #[test]
+    fn test_d01_modified_ns_includes_epoch_seconds() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("recent.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        let res = DiskScanner::new(ScanOptions::default())
+            .scan(dir.path())
+            .unwrap();
+        let node = res
+            .tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "recent.txt")
+            .unwrap();
+        assert!(
+            node.metadata.modified_ns >= 1_700_000_000_000_000_000,
+            "modified_ns was {}",
+            node.metadata.modified_ns
+        );
+    }
+
+    #[test]
+    fn test_d03_deep_snapshot_serde_roundtrip() {
+        // Build a 100-level deep tree and verify SnapshotV2 serializes and
+        // deserializes via serde_json without hitting the 128 recursion limit.
+        let mut tree = ArenaTree::new();
+        let root_id = tree.alloc(FsNode::new("root".to_string(), ".".to_string(), true));
+        let mut parent = root_id;
+        for depth in 1..=100 {
+            let is_dir = depth < 100;
+            let name = format!("lvl_{depth}");
+            let rel_path = format!("p/{depth}");
+            let mut node = FsNode::new(name, rel_path, is_dir);
+            if !is_dir {
+                node.size = 42;
+                node.metadata.kind = FsKind::RegularFile;
+            } else {
+                node.metadata.kind = FsKind::Directory;
+            }
+            let child_id = tree.alloc(node);
+            tree.add_child(parent, child_id);
+            parent = child_id;
+        }
+        tree.aggregate_sizes(root_id);
+
+        let snap = SnapshotV2::from_tree(&tree, root_id, true, false);
+        assert_eq!(snap.root.size, 42);
+
+        let json = serde_json::to_string(&snap).expect("serialize 100-level snapshot");
+        let decoded: SnapshotV2 =
+            serde_json::from_str(&json).expect("deserialize 100-level snapshot");
+        assert_eq!(snap, decoded);
+
+        let diff = SnapshotDiff::compute(&snap, &decoded);
+        assert_eq!(diff.net_bytes_delta, 0);
+        assert!(diff.added.is_empty() && diff.removed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_d04_duplicates_skips_fifo_and_reuses_small_partial_hash() {
+        let dir = tempdir().unwrap();
+        let fifo_path = dir.path().join("pipe.fifo");
+        let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0);
+
+        let f1 = dir.path().join("small1.txt");
+        let f2 = dir.path().join("small2.txt");
+        fs::write(&f1, b"small duplicate payload").unwrap();
+        fs::write(&f2, b"small duplicate payload").unwrap();
+
+        // Hardlink pair of unique size: should be skipped before partial hashing.
+        let hl1 = dir.path().join("hl1.txt");
+        let hl2 = dir.path().join("hl2.txt");
+        fs::write(&hl1, b"unique-hardlink-size-content").unwrap();
+        let _ = fs::hard_link(&hl1, &hl2);
+
+        use std::os::unix::ffi::OsStrExt;
+        let res = DiskScanner::new(ScanOptions::default())
+            .scan(dir.path())
+            .unwrap();
+        // min_size = 0 must not open the 0-byte FIFO and block.
+        let report = DuplicateFinder::new(0)
+            .find_in_tree(&res.tree, dir.path())
+            .unwrap();
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].files.len(), 2);
+    }
+
+    #[test]
+    fn test_d05_symlink_is_not_dir_alphabetical_visit_and_max_entries_truncation() {
+        let dir = tempdir().unwrap();
+        let sub_a = dir.path().join("a_dir");
+        let sub_b = dir.path().join("b_dir");
+        fs::create_dir(&sub_a).unwrap();
+        fs::create_dir(&sub_b).unwrap();
+        fs::write(sub_a.join("inside_a.txt"), b"aaa").unwrap();
+        fs::write(sub_b.join("inside_b.txt"), b"bbb").unwrap();
+        std::os::unix::fs::symlink(&sub_a, dir.path().join("link_to_dir")).unwrap();
+
+        let res = DiskScanner::new(ScanOptions::default())
+            .scan(dir.path())
+            .unwrap();
+        let link_node = res
+            .tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "link_to_dir")
+            .unwrap();
+        assert!(!link_node.is_dir, "symlink to dir must have is_dir = false");
+        assert_eq!(link_node.metadata.kind, FsKind::Symlink);
+
+        // Alphabetical visit order: a_dir's child is allocated before b_dir's child.
+        let pos_a = res
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.name == "inside_a.txt")
+            .unwrap();
+        let pos_b = res
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.name == "inside_b.txt")
+            .unwrap();
+        assert!(pos_a < pos_b, "expected inside_a before inside_b");
+
+        // Truncated scan marks root and unvisited directories incomplete.
+        let trunc_res = DiskScanner::new(ScanOptions {
+            max_entries: 3,
+            ..Default::default()
+        })
+        .scan(dir.path())
+        .unwrap();
+        assert!(trunc_res.truncated);
+        assert!(!trunc_res.complete);
+        assert!(!trunc_res.tree.nodes[trunc_res.root_id as usize].complete);
+    }
 }

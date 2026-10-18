@@ -44,7 +44,7 @@ const UNIT_EXTENSIONS: &[&str] = &[
 ];
 
 fn read_head(path: &Path, cap: usize) -> Result<Vec<u8>> {
-    let f = fs::File::open(path).map_err(|e| LensError::Io {
+    let f = lens_core::read_policy::open(path).map_err(|e| LensError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -95,13 +95,16 @@ pub(crate) fn has_unit_extension(path: &Path) -> bool {
         .is_some_and(|e| UNIT_EXTENSIONS.contains(&e))
 }
 
-/// The schema marker a producer writes — `schema` (env/sys) or
-/// `schema_version` (net).
-fn schema_of(value: &serde_json::Value) -> Option<&str> {
-    value
-        .get("schema")
-        .or_else(|| value.get("schema_version"))
-        .and_then(|v| v.as_str())
+#[derive(serde::Deserialize)]
+struct SchemaProbe {
+    schema: Option<String>,
+    schema_version: Option<String>,
+}
+
+impl SchemaProbe {
+    fn schema_str(&self) -> Option<&str> {
+        self.schema.as_deref().or(self.schema_version.as_deref())
+    }
 }
 
 /// Stream-parse just the first element of a `[`-starting file and check
@@ -132,7 +135,7 @@ fn first_array_element_has_compile_shape(path: &Path) -> bool {
         }
     }
 
-    let Ok(f) = fs::File::open(path) else {
+    let Ok(f) = lens_core::read_policy::open(path) else {
         return false;
     };
     let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(f));
@@ -150,16 +153,34 @@ fn first_array_element_has_compile_shape(path: &Path) -> bool {
 /// no recognized schema classify as logs — guessing a domain would
 /// silently produce a meaningless report.
 pub fn detect(path: &Path) -> Result<InputKind> {
-    let meta = fs::symlink_metadata(path).map_err(|e| LensError::Io {
+    let sym_meta = fs::symlink_metadata(path).map_err(|e| LensError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
+    let is_dir = if sym_meta.file_type().is_symlink() {
+        if has_unit_extension(path) {
+            lens_core::read_policy::check_boundary(path).map_err(|e| LensError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+            return Ok(InputKind::SystemdUnit);
+        }
+        lens_core::read_policy::metadata(path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+    } else {
+        lens_core::read_policy::check_boundary(path).map_err(|e| LensError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        sym_meta.is_dir()
+    };
 
-    if meta.is_dir() {
+    if is_dir {
         if path.join("pyvenv.cfg").is_file() {
             return Ok(InputKind::Venv);
         }
-        if let Ok(rd) = fs::read_dir(path) {
+        if let Ok(rd) = lens_core::read_policy::read_dir(path) {
             let mut has_unit = false;
             let mut has_junit = false;
             for entry in rd.flatten() {
@@ -219,20 +240,19 @@ pub fn detect(path: &Path) -> Result<InputKind> {
             Ok(InputKind::Log)
         }
         Some(b'{') => {
-            // A snapshot/report: parse the whole file and match the
-            // declared schema against the known producers. Anything
-            // else that merely starts with `{` — JSONL streams,
-            // concatenated objects, foreign JSON — is just a log.
-            let f = fs::File::open(path).map_err(|e| LensError::Io {
+            // A snapshot/report: stream-parse just the schema fields without
+            // materializing a full DOM in memory. Anything else that merely
+            // starts with `{` — JSONL streams, concatenated objects, foreign
+            // JSON — is just a log.
+            let f = lens_core::read_policy::open(path).map_err(|e| LensError::Io {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-            let Ok(value) =
-                serde_json::from_reader::<_, serde_json::Value>(std::io::BufReader::new(f))
+            let Ok(probe) = serde_json::from_reader::<_, SchemaProbe>(std::io::BufReader::new(f))
             else {
                 return Ok(InputKind::Log);
             };
-            match schema_of(&value) {
+            match probe.schema_str() {
                 Some(lens_env::SNAPSHOT_SCHEMA_V1) => Ok(InputKind::EnvSnapshot),
                 Some(lens_sys::SNAPSHOT_SCHEMA_V1) => Ok(InputKind::SysSnapshot),
                 Some(lens_net::REPORT_SCHEMA_V1) => Ok(InputKind::NetReport),

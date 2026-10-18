@@ -17,7 +17,7 @@ use tar::{Archive, Builder, Header};
 
 use crate::error::{LensError, Result};
 use crate::evidence::Source;
-use crate::hash::{digest_bytes, digest_reader};
+use crate::hash::digest_bytes;
 
 pub const BUNDLE_SCHEMA_V2: &str = "lens.bundle/v2";
 pub const MANIFEST_ENTRY: &str = "manifest.json";
@@ -43,6 +43,10 @@ pub struct BundleManifest {
     /// Collection failures recorded at bundle time — evidence of absence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    /// True when artifact bytes were scrubbed by the redactor before hashing.
+    /// Older manifests lack the field and deserialize as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
 }
 
 /// One artifact destined for the bundle (typically a serialized report).
@@ -100,6 +104,27 @@ pub fn create_bundle_archive<P: AsRef<Path>>(
     diagnostics: Vec<String>,
     overwrite: bool,
 ) -> Result<BundleManifest> {
+    create_bundle_archive_with_redaction(
+        bundle_path,
+        tool_version,
+        artifacts,
+        diagnostics,
+        overwrite,
+        false,
+    )
+}
+
+/// Like [`create_bundle_archive`], additionally recording in the manifest
+/// whether the artifact bytes were passed through the redactor — so a shared
+/// bundle is never mistaken for an unredacted original capture.
+pub fn create_bundle_archive_with_redaction<P: AsRef<Path>>(
+    bundle_path: P,
+    tool_version: &str,
+    artifacts: &[BundleArtifact],
+    diagnostics: Vec<String>,
+    overwrite: bool,
+    redacted: bool,
+) -> Result<BundleManifest> {
     let path_ref = bundle_path.as_ref();
 
     let mut seen = std::collections::HashSet::new();
@@ -149,6 +174,7 @@ pub fn create_bundle_archive<P: AsRef<Path>>(
         created_at: crate::time::utc_now_iso(),
         sources,
         diagnostics,
+        redacted,
     };
     // Gate before deterministic serialization clones strings into a Value.
     let _bounded = crate::json::to_bounded_vec(&manifest, MAX_MANIFEST_BYTES as usize)?;
@@ -270,11 +296,21 @@ fn io_err(path: &Path, e: std::io::Error) -> LensError {
 struct LimitedReader<R> {
     inner: R,
     remaining: u64,
+    exceeded: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            self.exceeded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "bundle exceeds maximum decompressed size",
@@ -296,49 +332,61 @@ where
     F: FnMut(&str, &mut dyn std::io::Read, u64) -> Result<()>,
 {
     let path_ref = bundle_path.as_ref();
-    let file = File::open(path_ref).map_err(|e| io_err(path_ref, e))?;
+    let file = crate::read_policy::open(path_ref).map_err(|e| io_err(path_ref, e))?;
+    let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let gz = LimitedReader {
         inner: GzDecoder::new(file),
         remaining: MAX_BUNDLE_BYTES,
+        exceeded: exceeded.clone(),
     };
     let mut archive = Archive::new(gz);
     let entries = archive.entries().map_err(|e| io_err(path_ref, e))?;
 
+    let map_io = |e: std::io::Error| -> LensError {
+        if exceeded.load(std::sync::atomic::Ordering::SeqCst) {
+            return LensError::LimitExceeded {
+                message: format!("bundle exceeds {} decompressed bytes", MAX_BUNDLE_BYTES),
+            };
+        }
+        io_err(path_ref, e)
+    };
+
     let mut count = 0usize;
     for entry_res in entries {
-        let mut entry = entry_res.map_err(|e| {
-            let err = io_err(path_ref, e);
-            // Surface the decompressed-size limit as a typed error.
-            if let LensError::Io { source, .. } = &err {
-                if source.kind() == std::io::ErrorKind::InvalidData {
-                    return LensError::LimitExceeded {
-                        message: format!("bundle exceeds {} decompressed bytes", MAX_BUNDLE_BYTES),
-                    };
-                }
-            }
-            err
-        })?;
+        let mut entry = entry_res.map_err(map_io)?;
         count += 1;
         if count > MAX_BUNDLE_ENTRIES {
             return Err(LensError::LimitExceeded {
                 message: format!("bundle exceeds {} entries", MAX_BUNDLE_ENTRIES),
             });
         }
-        if !entry.header().entry_type().is_file() {
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
             continue;
         }
+        if !entry_type.is_file() {
+            return Err(LensError::InvalidInput {
+                message: format!(
+                    "bundle contains unsupported non-regular tar entry type: {:?}",
+                    entry_type
+                ),
+            });
+        }
         let size = entry.header().size().unwrap_or(0);
-        let name = entry
-            .path()
-            .map_err(|e| io_err(path_ref, e))?
-            .to_string_lossy()
-            .to_string();
+        let name = entry.path().map_err(map_io)?.to_string_lossy().to_string();
         if normalize_entry_name(&name) == MANIFEST_ENTRY && size > MAX_MANIFEST_BYTES {
             return Err(LensError::LimitExceeded {
                 message: "manifest exceeds maximum metadata size".into(),
             });
         }
-        on_entry(&name, &mut entry, size)?;
+        if let Err(err) = on_entry(&name, &mut entry, size) {
+            if exceeded.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(LensError::LimitExceeded {
+                    message: format!("bundle exceeds {} decompressed bytes", MAX_BUNDLE_BYTES),
+                });
+            }
+            return Err(err);
+        }
     }
     Ok(())
 }
@@ -348,12 +396,12 @@ pub fn normalize_entry_name(name: &str) -> &str {
     name.strip_prefix("./").unwrap_or(name)
 }
 
-/// Compare collected entry hashes against the manifest — the validation
+/// Compare collected entry hashes and sizes against the manifest — the validation
 /// half shared by `verify_bundle_archive` (hashes computed while
 /// streaming) and `extract_bundle` (hashes computed while staging).
 fn evaluate_bundle_contents(
     path_ref: &Path,
-    file_hashes: HashMap<String, String>,
+    file_hashes: HashMap<String, (String, u64)>,
     manifest_content: Option<Vec<u8>>,
     manifest_count: usize,
 ) -> BundleVerificationReport {
@@ -416,20 +464,30 @@ fn evaluate_bundle_contents(
     let mut consumed: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for src in &manifest.sources {
         let normalized = normalize_entry_name(&src.path);
+        if !consumed.insert(normalized) {
+            report
+                .unexpected_files
+                .push(format!("duplicate manifest source: {}", normalized));
+            continue;
+        }
         match file_hashes.get(normalized) {
-            Some(actual_hash) => {
-                consumed.insert(normalized);
+            Some((actual_hash, actual_size)) => {
                 if actual_hash == "DUPLICATE" {
                     report
                         .unexpected_files
                         .push(format!("duplicate entry: {}", normalized));
-                } else if actual_hash.eq_ignore_ascii_case(&src.sha256) {
-                    report.verified_files += 1;
-                } else {
+                } else if !actual_hash.eq_ignore_ascii_case(&src.sha256) {
                     report.tampered_files.push(format!(
                         "{}: expected {} got {}",
                         src.path, src.sha256, actual_hash
                     ));
+                } else if *actual_size != src.size {
+                    report.tampered_files.push(format!(
+                        "{}: expected size {} got {}",
+                        src.path, src.size, actual_size
+                    ));
+                } else {
+                    report.verified_files += 1;
                 }
             }
             None => report.missing_files.push(src.path.clone()),
@@ -449,11 +507,11 @@ fn evaluate_bundle_contents(
     report
 }
 
-/// Verifies every manifest-listed file's SHA-256 against the archive contents.
+/// Verifies every manifest-listed file's SHA-256 and byte size against the archive contents.
 pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVerificationReport> {
     let path_ref = bundle_path.as_ref();
 
-    let mut file_hashes: HashMap<String, String> = HashMap::new();
+    let mut file_hashes: HashMap<String, (String, u64)> = HashMap::new();
     let mut manifest_content: Option<Vec<u8>> = None;
     let mut manifest_count = 0usize;
 
@@ -469,11 +527,25 @@ pub fn verify_bundle_archive<P: AsRef<Path>>(bundle_path: P) -> Result<BundleVer
                 .map_err(|e| io_err(path_ref, e))?;
             manifest_content = Some(content);
         } else {
-            let hash = digest_reader(reader).map_err(|e| io_err(path_ref, e))?;
+            let mut hasher = crate::hash::IncrementalHasher::new();
+            let mut actual_size = 0u64;
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| io_err(path_ref, e))?;
+                if n == 0 {
+                    break;
+                }
+                actual_size += n as u64;
+                hasher.update(&buf[..n]);
+            }
+            let hash = hasher.finish();
             let key = normalize_entry_name(name).to_string();
-            if file_hashes.insert(key.clone(), hash).is_some() {
+            if file_hashes
+                .insert(key.clone(), (hash, actual_size))
+                .is_some()
+            {
                 // Duplicate entry name — archive is not reproducible evidence.
-                file_hashes.insert(key, "DUPLICATE".to_string());
+                file_hashes.insert(key, ("DUPLICATE".to_string(), actual_size));
             }
         }
         Ok(())
@@ -526,29 +598,100 @@ pub fn inspect_bundle<P: AsRef<Path>>(bundle_path: P) -> Result<BundleInspection
 }
 
 /// Read a single entry's bytes by exact (normalized) name. Enforces the
-/// same traversal/size rules as verification.
+/// same traversal, size, duplicate, and SHA-256 integrity rules as verification.
 pub fn read_bundle_entry<P: AsRef<Path>>(bundle_path: P, name: &str) -> Result<Vec<u8>> {
     if !valid_entry_name(name) {
         return Err(LensError::InvalidInput {
             message: format!("unsafe or empty bundle entry name: {:?}", name),
         });
     }
+    let path_ref = bundle_path.as_ref();
     let want = normalize_entry_name(name);
-    let mut found = None;
-    stream_entries(bundle_path.as_ref(), |entry_name, reader, _size| {
-        if normalize_entry_name(entry_name) == want {
+    let mut found: Option<Vec<u8>> = None;
+    let mut manifest_bytes: Option<Vec<u8>> = None;
+    let mut manifest_count = 0usize;
+
+    stream_entries(path_ref, |entry_name, reader, _size| {
+        let norm = normalize_entry_name(entry_name);
+        if norm == MANIFEST_ENTRY {
+            manifest_count += 1;
             let mut buf = Vec::new();
             reader
                 .take(MAX_BUNDLE_BYTES)
                 .read_to_end(&mut buf)
-                .map_err(|e| io_err(bundle_path.as_ref(), e))?;
+                .map_err(|e| io_err(path_ref, e))?;
+            if want == MANIFEST_ENTRY {
+                if found.is_some() {
+                    return Err(LensError::InvalidInput {
+                        message: "duplicate manifest.json in bundle".to_string(),
+                    });
+                }
+                found = Some(buf.clone());
+            }
+            manifest_bytes = Some(buf);
+        } else if norm == want {
+            if found.is_some() {
+                return Err(LensError::InvalidInput {
+                    message: format!("duplicate entry {:?} in bundle", name),
+                });
+            }
+            let mut buf = Vec::new();
+            reader
+                .take(MAX_BUNDLE_BYTES)
+                .read_to_end(&mut buf)
+                .map_err(|e| io_err(path_ref, e))?;
             found = Some(buf);
         }
         Ok(())
     })?;
-    found.ok_or_else(|| LensError::InvalidInput {
+
+    if manifest_count > 1 {
+        return Err(LensError::InvalidInput {
+            message: format!("bundle contains {} manifest.json entries", manifest_count),
+        });
+    }
+
+    let bytes = found.ok_or_else(|| LensError::InvalidInput {
         message: format!("entry {:?} not found in bundle", name),
-    })
+    })?;
+
+    if want != MANIFEST_ENTRY {
+        let m_bytes = manifest_bytes.ok_or_else(|| LensError::InvalidInput {
+            message: "bundle does not contain manifest.json".to_string(),
+        })?;
+        let manifest: BundleManifest =
+            serde_json::from_slice(&m_bytes).map_err(|e| LensError::InvalidInput {
+                message: format!("Invalid manifest.json: {}", e),
+            })?;
+        if manifest.schema != BUNDLE_SCHEMA_V2 {
+            return Err(LensError::InvalidInput {
+                message: format!(
+                    "Unsupported manifest schema {:?} (expected {:?})",
+                    manifest.schema, BUNDLE_SCHEMA_V2
+                ),
+            });
+        }
+        let mut matching = manifest
+            .sources
+            .iter()
+            .filter(|s| normalize_entry_name(&s.path) == want);
+        let src = matching.next().ok_or_else(|| LensError::InvalidInput {
+            message: format!("entry {:?} is not listed in bundle manifest", name),
+        })?;
+        if matching.next().is_some() {
+            return Err(LensError::InvalidInput {
+                message: format!("bundle manifest lists entry {:?} more than once", name),
+            });
+        }
+        let actual_hash = digest_bytes(&bytes);
+        if !actual_hash.eq_ignore_ascii_case(&src.sha256) || bytes.len() as u64 != src.size {
+            return Err(LensError::InvalidInput {
+                message: format!("bundle entry {:?} failed integrity verification", name),
+            });
+        }
+    }
+
+    Ok(bytes)
 }
 
 /// Check (and when `create`, fill in) the ancestor chain of `name`
@@ -630,10 +773,12 @@ fn place_staged(
     for (name, stage_path) in staged {
         let target = dest_dir.join(name);
         check_ancestors(dest_dir, name, true)?;
+        #[cfg(not(unix))]
         if force && target.symlink_metadata().is_ok() {
             // Pre-checked: only a regular file reaches this point.
             std::fs::remove_file(&target).map_err(|e| io_err(&target, e))?;
         }
+        // On Unix, rename(2) atomically replaces an existing regular file.
         std::fs::rename(stage_path, &target).map_err(|e| io_err(&target, e))?;
         written.push(target);
     }
@@ -656,13 +801,21 @@ pub fn extract_bundle<P: AsRef<Path>>(
     let bundle_path = bundle_path.as_ref();
     let dest_dir = dest_dir.as_ref();
 
+    if let Ok(md) = std::fs::symlink_metadata(dest_dir) {
+        if md.file_type().is_symlink() {
+            return Err(LensError::InvalidInput {
+                message: format!("refusing to extract into symlink {:?}", dest_dir),
+            });
+        }
+    }
+
     std::fs::create_dir_all(dest_dir).map_err(|e| io_err(dest_dir, e))?;
     let staging = tempfile::Builder::new()
         .prefix(".lens-extract-")
         .tempdir_in(dest_dir)
         .map_err(|e| io_err(dest_dir, e))?;
 
-    let mut file_hashes: HashMap<String, String> = HashMap::new();
+    let mut file_hashes: HashMap<String, (String, u64)> = HashMap::new();
     let mut manifest_content: Option<Vec<u8>> = None;
     let mut manifest_count = 0usize;
     let mut staged: Vec<(String, PathBuf)> = Vec::new();
@@ -678,7 +831,15 @@ pub fn extract_bundle<P: AsRef<Path>>(
         let target = dest_dir.join(name);
         let normalized_target = normalize_path_str(&target.to_string_lossy());
         let normalized_dest = normalize_path_str(&dest_dir.to_string_lossy());
-        if !format!("{normalized_target}/").starts_with(&format!("{normalized_dest}/")) {
+        let stays_within_dest = if normalized_dest.is_empty() {
+            !normalized_target.is_empty() && !normalized_target.starts_with('/')
+        } else if normalized_dest == "/" {
+            normalized_target.starts_with('/') && normalized_target.len() > 1
+        } else {
+            let prefix = format!("{}/", normalized_dest.trim_end_matches('/'));
+            format!("{normalized_target}/").starts_with(&prefix)
+        };
+        if !stays_within_dest {
             return Err(LensError::InvalidInput {
                 message: format!("entry {:?} escapes destination", name),
             });
@@ -703,6 +864,7 @@ pub fn extract_bundle<P: AsRef<Path>>(
         // Stage the entry while hashing it — one pass over the bytes.
         let mut file = File::create(&stage_path).map_err(|e| io_err(&stage_path, e))?;
         let mut hasher = crate::hash::IncrementalHasher::new();
+        let mut actual_size = 0u64;
         let mut limited = reader.take(MAX_BUNDLE_BYTES);
         let mut buf = [0u8; 65536];
         loop {
@@ -710,14 +872,18 @@ pub fn extract_bundle<P: AsRef<Path>>(
             if n == 0 {
                 break;
             }
+            actual_size += n as u64;
             std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| io_err(&stage_path, e))?;
             hasher.update(&buf[..n]);
         }
         let hash = hasher.finish();
         let key = name.to_string();
-        if file_hashes.insert(key.clone(), hash).is_some() {
+        if file_hashes
+            .insert(key.clone(), (hash, actual_size))
+            .is_some()
+        {
             // Duplicate entry name — archive is not reproducible evidence.
-            file_hashes.insert(key, "DUPLICATE".to_string());
+            file_hashes.insert(key, ("DUPLICATE".to_string(), actual_size));
         }
         staged.push((name.to_string(), stage_path));
         Ok(())
@@ -876,6 +1042,54 @@ mod tests {
                 .unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn test_redacted_flag_recorded_and_omitted_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.lens");
+        let scrubbed = dir.path().join("scrubbed.lens");
+        let m_plain =
+            create_bundle_archive(&plain, "x", &sample_artifacts(), vec![], false).unwrap();
+        let m_red = create_bundle_archive_with_redaction(
+            &scrubbed,
+            "x",
+            &sample_artifacts(),
+            vec![],
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!m_plain.redacted);
+        assert!(m_red.redacted);
+
+        // Default bundles keep the exact pre-existing manifest bytes: the
+        // field is omitted when false, so older tooling/hashes are unaffected.
+        let plain_manifest = read_bundle_entry(&plain, MANIFEST_ENTRY).unwrap();
+        assert!(!String::from_utf8_lossy(&plain_manifest).contains("redacted"));
+
+        let inspected = inspect_bundle(&scrubbed).unwrap();
+        assert!(inspected.manifest.unwrap().redacted);
+        assert!(verify_bundle_archive(&scrubbed).unwrap().is_valid);
+    }
+
+    #[test]
+    fn test_show_rejects_duplicate_manifest_source() {
+        let tmp = NamedTempFile::new().unwrap();
+        create_bundle_archive(tmp.path(), "x", &sample_artifacts(), vec![], true).unwrap();
+        rebuild_with(tmp.path(), |entries| {
+            for (name, data) in entries.iter_mut() {
+                if name == MANIFEST_ENTRY {
+                    let mut m: serde_json::Value = serde_json::from_slice(data).unwrap();
+                    let first = m["sources"][0].clone();
+                    m["sources"].as_array_mut().unwrap().push(first);
+                    *data = serde_json::to_vec(&m).unwrap();
+                }
+            }
+        });
+        assert!(!verify_bundle_archive(tmp.path()).unwrap().is_valid);
+        let err = read_bundle_entry(tmp.path(), "reports/disk_snapshot.json").unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
     }
 
     #[test]
@@ -1227,5 +1441,67 @@ mod tests {
         // extracted files and no leftover `.lens-extract-*` dirs.
         assert!(dest.exists());
         assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_extract_into_dot_relative_path_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("b.lens");
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
+
+        let sub = dir.path().join("work");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Verify "." normalization logic directly via relative path with "./"
+        let rel_dot = sub.join(".");
+        let written = extract_bundle(&bundle, &rel_dot, false).unwrap();
+        assert_eq!(written.len(), 3);
+        assert!(sub.join("manifest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_refuses_symlink_dest_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("b.lens");
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let symlink_dest = dir.path().join("sym_dest");
+        std::os::unix::fs::symlink(&outside, &symlink_dest).unwrap();
+
+        let err = extract_bundle(&bundle, &symlink_dest, true).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_corrupt_gzip_is_not_misclassified_as_limit_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("corrupt.lens");
+        std::fs::write(&corrupt, b"not a valid gzip stream at all").unwrap();
+
+        let err = verify_bundle_archive(&corrupt).unwrap_err();
+        assert!(
+            !matches!(err, LensError::LimitExceeded { .. }),
+            "corrupt gzip must not report LimitExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_bundle_entry_rejects_tampered_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("b.lens");
+        create_bundle_archive(&bundle, "x", &sample_artifacts(), vec![], false).unwrap();
+        rebuild_with(&bundle, |entries| {
+            for (name, data) in entries.iter_mut() {
+                if name == "reports/disk_snapshot.json" {
+                    data[0] ^= 0xFF;
+                }
+            }
+        });
+
+        let err = read_bundle_entry(&bundle, "reports/disk_snapshot.json").unwrap_err();
+        assert!(err.to_string().contains("integrity"), "{err}");
     }
 }

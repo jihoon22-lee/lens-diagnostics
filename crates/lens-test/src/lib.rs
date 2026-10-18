@@ -208,4 +208,69 @@ mod tests {
         let c = parse_junit_xml(other, "p").unwrap();
         assert_ne!(a.run_id, c.run_id);
     }
+
+    #[test]
+    fn test_t01_general_ref_entities_and_whitespace() {
+        let xml = r#"<testsuite tests="1">
+            <testcase name="t1" classname="C" time="0.1">
+                <failure>expected x &lt; y &amp; z == &quot;ok&quot; &apos;1&apos; &#65; &#x42;</failure>
+                <system-out>out &lt;tag&gt; &amp; more</system-out>
+            </testcase>
+        </testsuite>"#;
+        let run = parse_junit_xml(xml.as_bytes(), "p").unwrap();
+        assert_eq!(
+            run.cases[0].message.as_deref(),
+            Some("expected x < y & z == \"ok\" '1' A B")
+        );
+        assert_eq!(run.cases[0].output.as_deref(), Some("out <tag> & more"));
+    }
+
+    #[test]
+    fn test_t02_invalid_durations_unclosed_capture_and_stray_tags() {
+        let xml = r#"<testsuite tests="3">
+            <testcase name="nan_case" classname="C" time="NaN"/>
+            <testcase name="inf_case" classname="C" time="inf">
+                <failure>unclosed failure body</testcase>
+            <testcase name="neg_case" classname="C" time="-2.5"/>
+        </testsuite>"#;
+        let run = parse_junit_xml(xml.as_bytes(), "p").unwrap();
+        assert!(!run.complete);
+        assert!(run.summary.duration_sec.is_finite());
+        assert_eq!(run.summary.duration_sec, 0.0);
+        assert_eq!(
+            run.cases[1].message.as_deref(),
+            Some("unclosed failure body")
+        );
+        assert_eq!(run.cases[2].status, TestStatus::Passed);
+        assert!(run.cases[2].message.is_none());
+
+        // Stray closing tags on a truncated XML must not fool open_depth into complete = true.
+        let stray_xml = r#"<testsuite tests="1"><testcase name="t1" classname="C"/></extra>"#;
+        let stray_run = parse_junit_xml(stray_xml.as_bytes(), "p").unwrap();
+        assert!(!stray_run.complete);
+    }
+
+    #[test]
+    fn test_t02_duplicate_identity_preserves_failure() {
+        let base_xml = r#"<testsuite tests="1">
+            <testcase name="flaky" classname="C" time="0.1"/>
+        </testsuite>"#;
+        // Attempt 1 failed, attempt 2 passed: candidate must not silently overwrite failure with pass.
+        let cand_xml = r#"<testsuite tests="2">
+            <testcase name="flaky" classname="C" time="0.1">
+                <failure message="attempt 1 failed"/>
+            </testcase>
+            <testcase name="flaky" classname="C" time="0.1"/>
+        </testsuite>"#;
+        let base = parse_junit_xml(base_xml.as_bytes(), "p").unwrap();
+        let cand = parse_junit_xml(cand_xml.as_bytes(), "p").unwrap();
+        let diff = diff_test_runs(&base, &cand);
+        assert_eq!(diff.regressions.len(), 1);
+        assert_eq!(diff.regressions[0].id, "C::flaky");
+        assert_eq!(
+            diff.regressions[0].message.as_deref(),
+            Some("attempt 1 failed")
+        );
+        assert!(diff.diagnostics.iter().any(|d| d.contains("duplicate")));
+    }
 }

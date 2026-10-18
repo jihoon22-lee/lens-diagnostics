@@ -63,9 +63,6 @@ fn capacity_check(mount: &Path, name: &str) -> DoctorCheck {
     if res == 0 && stat.f_blocks > 0 && stat.f_frsize > 0 {
         let total_bytes = stat.f_blocks as u64 * stat.f_frsize as u64;
         let avail_bytes = stat.f_bavail as u64 * stat.f_frsize as u64;
-        let free_pct = (avail_bytes as f64 / total_bytes as f64) * 100.0;
-        let avail_gb = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-
         // Inode exhaustion fills a filesystem just as surely as bytes.
         // Some filesystems (9p, network fs) report f_favail > f_files —
         // clamp so the display stays sane.
@@ -76,66 +73,7 @@ fn capacity_check(mount: &Path, name: &str) -> DoctorCheck {
         } else {
             None
         };
-
-        let space_status = if free_pct < 5.0 || avail_gb < 1.0 {
-            HealthStatus::Fail
-        } else if free_pct < 15.0 || avail_gb < 5.0 {
-            HealthStatus::Warn
-        } else {
-            HealthStatus::Pass
-        };
-        let inode_status = match inode {
-            Some(p) if p < 5.0 => HealthStatus::Fail,
-            Some(p) if p < 15.0 => HealthStatus::Warn,
-            _ => HealthStatus::Pass,
-        };
-        let status = match (space_status, inode_status) {
-            (HealthStatus::Fail, _) | (_, HealthStatus::Fail) => HealthStatus::Fail,
-            (HealthStatus::Warn, _) | (_, HealthStatus::Warn) => HealthStatus::Warn,
-            _ => HealthStatus::Pass,
-        };
-
-        let inode_note = inode
-            .map(|p| format!(", inodes {p:.1}% free"))
-            .unwrap_or_default();
-        let (message, recommendation) = match status {
-            HealthStatus::Fail => (
-                format!(
-                    "Critically low disk space: {:.1}% free ({:.2} GB available){}",
-                    free_pct, avail_gb, inode_note
-                ),
-                Some(
-                    "Clean up disk immediately using 'lens disk scan' and trash old files."
-                        .to_string(),
-                ),
-            ),
-            HealthStatus::Warn => (
-                format!(
-                    "Low disk space warning: {:.1}% free ({:.2} GB available){}",
-                    free_pct, avail_gb, inode_note
-                ),
-                Some("Consider pruning large unused logs or artifacts.".to_string()),
-            ),
-            _ => (
-                format!(
-                    "Adequate disk space: {:.1}% free ({:.2} GB available){}",
-                    free_pct, avail_gb, inode_note
-                ),
-                None,
-            ),
-        };
-        DoctorCheck {
-            category: "Storage".to_string(),
-            name: name.to_string(),
-            status,
-            message,
-            next_command: if status == HealthStatus::Pass {
-                None
-            } else {
-                Some(next)
-            },
-            recommendation,
-        }
+        evaluate_capacity(total_bytes, avail_bytes, inode, mount, name)
     } else {
         DoctorCheck {
             category: "Storage".to_string(),
@@ -145,6 +83,107 @@ fn capacity_check(mount: &Path, name: &str) -> DoctorCheck {
             next_command: Some(next),
             recommendation: None,
         }
+    }
+}
+
+pub(crate) fn evaluate_capacity(
+    total_bytes: u64,
+    avail_bytes: u64,
+    inode: Option<f64>,
+    mount: &Path,
+    name: &str,
+) -> DoctorCheck {
+    let next = format!("lens disk scan {} --top 20", mount.display());
+    let total_gb = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let free_pct = (avail_bytes as f64 / total_bytes as f64) * 100.0;
+    let avail_gb = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    // Small partitions (e.g. 256MB-1GB /boot/efi) naturally have < 1 GB free
+    // even when 90% empty; only apply absolute GB thresholds on larger volumes.
+    let space_status = if free_pct < 5.0 || (total_gb >= 10.0 && avail_gb < 1.0) {
+        HealthStatus::Fail
+    } else if free_pct < 15.0 || (total_gb >= 32.0 && avail_gb < 5.0) {
+        HealthStatus::Warn
+    } else {
+        HealthStatus::Pass
+    };
+    let inode_status = match inode {
+        Some(p) if p < 5.0 => HealthStatus::Fail,
+        Some(p) if p < 15.0 => HealthStatus::Warn,
+        _ => HealthStatus::Pass,
+    };
+    let status = match (space_status, inode_status) {
+        (HealthStatus::Fail, _) | (_, HealthStatus::Fail) => HealthStatus::Fail,
+        (HealthStatus::Warn, _) | (_, HealthStatus::Warn) => HealthStatus::Warn,
+        _ => HealthStatus::Pass,
+    };
+
+    let inode_note = inode
+        .map(|p| format!(", inodes {p:.1}% free"))
+        .unwrap_or_default();
+    // Inode-only branches must report the inode percentage, not the space one.
+    let inode_pct = inode.unwrap_or(100.0);
+    let (message, recommendation) = match status {
+        HealthStatus::Fail
+            if inode_status == HealthStatus::Fail && space_status != HealthStatus::Fail =>
+        {
+            (
+                format!(
+                    "Critically low free inodes: {:.1}% free ({:.2} GB space available){}",
+                    inode_pct, avail_gb, inode_note
+                ),
+                Some(
+                    "Clean up directories with excessive small files using 'lens disk scan'."
+                        .to_string(),
+                ),
+            )
+        }
+        HealthStatus::Fail => (
+            format!(
+                "Critically low disk space: {:.1}% free ({:.2} GB available){}",
+                free_pct, avail_gb, inode_note
+            ),
+            Some(
+                "Clean up disk immediately using 'lens disk scan' and trash old files.".to_string(),
+            ),
+        ),
+        HealthStatus::Warn
+            if inode_status == HealthStatus::Warn && space_status == HealthStatus::Pass =>
+        {
+            (
+                format!(
+                    "Low free inodes warning: {:.1}% free ({:.2} GB space available){}",
+                    inode_pct, avail_gb, inode_note
+                ),
+                Some("Consider pruning directories with many small files.".to_string()),
+            )
+        }
+        HealthStatus::Warn => (
+            format!(
+                "Low disk space warning: {:.1}% free ({:.2} GB available){}",
+                free_pct, avail_gb, inode_note
+            ),
+            Some("Consider pruning large unused logs or artifacts.".to_string()),
+        ),
+        _ => (
+            format!(
+                "Adequate disk space: {:.1}% free ({:.2} GB available){}",
+                free_pct, avail_gb, inode_note
+            ),
+            None,
+        ),
+    };
+    DoctorCheck {
+        category: "Storage".to_string(),
+        name: name.to_string(),
+        status,
+        message,
+        next_command: if status == HealthStatus::Pass {
+            None
+        } else {
+            Some(next)
+        },
+        recommendation,
     }
 }
 
@@ -182,9 +221,10 @@ const PSEUDO_FSTYPES: &[&str] = &[
 ];
 
 /// Parse `/proc/self/mounts` content into `(mount_point, fstype)` pairs
-/// of real filesystems — pseudo filesystems are dropped, and an `overlay`
-/// mount counts only when it backs `/` (container roots). Field-2 octal
-/// escapes (`\040` space, `\134` backslash, …) are decoded.
+/// of real writable filesystems — pseudo filesystems and read-only (`ro`)
+/// mounts are dropped, and an `overlay` mount counts only when it backs `/`
+/// (container roots). Field-2 octal escapes (`\040` space, `\134` backslash, …)
+/// are decoded.
 pub fn parse_mounts(content: &str) -> Vec<(String, String)> {
     let decode = |s: &str| -> String {
         let b = s.as_bytes();
@@ -218,7 +258,11 @@ pub fn parse_mounts(content: &str) -> Vec<(String, String)> {
             let _device = f.next()?;
             let point = decode(f.next()?);
             let fstype = f.next()?.to_string();
+            let opts = f.next().unwrap_or("");
             if PSEUDO_FSTYPES.contains(&fstype.as_str()) {
+                return None;
+            }
+            if opts.split(',').any(|o| o == "ro") {
                 return None;
             }
             if fstype == "overlay" && point != "/" {
@@ -549,32 +593,51 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
         .unwrap_or_else(|| PathBuf::from("/etc/ld.so.preload"));
     let preload_label = preload.display().to_string();
     if preload.exists() {
-        let content = lens_core::read_policy::read_to_string(&preload).unwrap_or_default();
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            checks.push(DoctorCheck {
-                category: "Security".to_string(),
-                name: "ld.so.preload Verification".to_string(),
-                status: HealthStatus::Warn,
-                message: format!("{preload_label} is present with entries: {trimmed}"),
-                next_command: Some(format!(
-                    "lens abi inspect {}",
-                    trimmed.lines().next().unwrap_or_default().trim()
-                )),
-                recommendation: Some(
-                    "Verify that preloaded shared libraries are intentional and trusted."
-                        .to_string(),
-                ),
-            });
-        } else {
-            checks.push(DoctorCheck {
-                category: "Security".to_string(),
-                name: "ld.so.preload Verification".to_string(),
-                status: HealthStatus::Pass,
-                message: format!("{preload_label} is empty"),
-                next_command: None,
-                recommendation: None,
-            });
+        match lens_core::read_policy::read_to_string(&preload) {
+            Ok(content) => {
+                let entries: Vec<&str> = content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect();
+                if !entries.is_empty() {
+                    checks.push(DoctorCheck {
+                        category: "Security".to_string(),
+                        name: "ld.so.preload Verification".to_string(),
+                        status: HealthStatus::Warn,
+                        message: format!(
+                            "{preload_label} is present with entries: {}",
+                            entries.join(", ")
+                        ),
+                        next_command: Some(format!("lens abi inspect {}", entries[0])),
+                        recommendation: Some(
+                            "Verify that preloaded shared libraries are intentional and trusted."
+                                .to_string(),
+                        ),
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        category: "Security".to_string(),
+                        name: "ld.so.preload Verification".to_string(),
+                        status: HealthStatus::Pass,
+                        message: format!("{preload_label} is empty"),
+                        next_command: None,
+                        recommendation: None,
+                    });
+                }
+            }
+            Err(e) => {
+                checks.push(DoctorCheck {
+                    category: "Security".to_string(),
+                    name: "ld.so.preload Verification".to_string(),
+                    status: HealthStatus::Warn,
+                    message: format!("Could not read {preload_label}: {e}"),
+                    next_command: None,
+                    recommendation: Some(
+                        "Inspect /etc/ld.so.preload with elevated permissions.".to_string(),
+                    ),
+                });
+            }
         }
     } else {
         checks.push(DoctorCheck {
@@ -606,7 +669,7 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
     checks
 }
 
-/// Grade a `PATH` value: a `.` or empty entry means the current
+/// Grade a `PATH` value: a `.` or empty or relative entry means the current
 /// directory shadows the search path (spoofing risk), and an existing
 /// directory that is world-writable (`mode & 0o002`) lets any user
 /// plant binaries — both Warn. Factored out so the rule is testable
@@ -617,6 +680,8 @@ pub fn check_path_value(path_var: &str) -> DoctorCheck {
     for p in path_var.split(':') {
         if p.is_empty() || p == "." {
             suspicious.push("Current directory '.' or empty entry in PATH".to_string());
+        } else if !p.starts_with('/') {
+            suspicious.push(format!("Relative directory '{p}' in PATH"));
         } else if let Ok(meta) = fs::metadata(p) {
             if meta.permissions().mode() & 0o002 != 0 {
                 suspicious.push(format!("World-writable directory {p} in PATH"));
@@ -893,6 +958,21 @@ pub fn diff_reports(base: &DoctorReport, cand: &DoctorReport) -> Report<DoctorDi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inode_only_failure_reports_inode_percentage() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        // 80% of space free, only 2% of inodes free.
+        let c = evaluate_capacity(100 * GB, 80 * GB, Some(2.0), Path::new("/data"), "Data");
+        assert_eq!(c.status, HealthStatus::Fail);
+        assert!(
+            c.message
+                .starts_with("Critically low free inodes: 2.0% free"),
+            "{}",
+            c.message
+        );
+        assert!(!c.message.contains("80.0% free ("), "{}", c.message);
+    }
 
     #[test]
     fn test_doctor_storage_check() {

@@ -70,5 +70,11 @@ mod tests {
         assert!(!filter.matches(&rec1));
         assert!(filter.matches(&rec2));
         assert!(!filter.matches(&rec3));
+
+        // L02: --source filter must reject records with empty source and match extracted source
+        let src_filter = LogFilter::new().with_source("sshd");
+        assert!(!src_filter.matches(&rec2)); // rec2 has empty source
+        let ssh_rec = parse_line("Oct  9 12:00:00 host sshd[99]: Connection closed", 5);
+        assert!(src_filter.matches(&ssh_rec));
     }
 }

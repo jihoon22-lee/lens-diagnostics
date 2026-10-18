@@ -3,33 +3,110 @@
 //! no character classes, no alternation).
 
 /// Match `name` against a glob `pattern` where `*` spans any run of
-/// characters and `?` matches exactly one. Whole-string match — there is
-/// no implicit anchoring issue: `*.log` matches `app.log`, not `app.logs`.
+/// characters, `?` matches exactly one character, and `[abc]` / `[!a-z]`
+/// matches character classes. Operates directly on UTF-8 slices with zero
+/// heap allocations.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
     let (mut pi, mut ni) = (0usize, 0usize);
-    let (mut star, mut star_next) = (usize::MAX, 0usize);
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+    let (mut star_pi, mut star_ni) = (usize::MAX, 0usize);
+
+    while ni < name.len() {
+        let p_rest = &pattern[pi..];
+        let n_ch = name[ni..].chars().next().unwrap();
+
+        if p_rest.starts_with('*') {
+            star_ni = ni;
+            while pattern[pi..].starts_with('*') {
+                pi += 1;
+            }
+            star_pi = pi - 1;
+        } else if p_rest.starts_with('?') {
             pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = pi;
-            star_next = ni;
-            pi += 1;
-        } else if star != usize::MAX {
-            pi = star + 1;
-            star_next += 1;
-            ni = star_next;
+            ni += n_ch.len_utf8();
+        } else if p_rest.starts_with('[') {
+            if let Some((matched, class_len)) = match_char_class(p_rest, n_ch) {
+                if matched {
+                    pi += class_len;
+                    ni += n_ch.len_utf8();
+                    continue;
+                }
+            } else if n_ch == '[' {
+                pi += 1;
+                ni += 1;
+                continue;
+            }
+            if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                let skip_ch = name[star_ni..].chars().next().unwrap();
+                star_ni += skip_ch.len_utf8();
+                ni = star_ni;
+            } else {
+                return false;
+            }
+        } else if let Some(p_ch) = p_rest.chars().next() {
+            if p_ch == n_ch {
+                pi += p_ch.len_utf8();
+                ni += n_ch.len_utf8();
+            } else if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                let skip_ch = name[star_ni..].chars().next().unwrap();
+                star_ni += skip_ch.len_utf8();
+                ni = star_ni;
+            } else {
+                return false;
+            }
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            let skip_ch = name[star_ni..].chars().next().unwrap();
+            star_ni += skip_ch.len_utf8();
+            ni = star_ni;
         } else {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '*' {
+
+    while pattern[pi..].starts_with('*') {
         pi += 1;
     }
-    pi == p.len()
+    pi == pattern.len()
+}
+
+fn match_char_class(p_rest: &str, target: char) -> Option<(bool, usize)> {
+    let inner = p_rest.strip_prefix('[')?;
+    let (negated, inner, prefix_len) =
+        if let Some(rest) = inner.strip_prefix('!').or_else(|| inner.strip_prefix('^')) {
+            (true, rest, 2usize)
+        } else {
+            (false, inner, 1usize)
+        };
+    let mut chars = inner.char_indices().peekable();
+    let mut matched = false;
+    let mut first = true;
+    while let Some((idx, ch)) = chars.next() {
+        if ch == ']' && !first {
+            let total_len = prefix_len + idx + 1;
+            return Some((if negated { !matched } else { matched }, total_len));
+        }
+        first = false;
+        if let Some(&(_, '-')) = chars.peek() {
+            let mut lookahead = chars.clone();
+            lookahead.next(); // consume '-'
+            if let Some((_, end_ch)) = lookahead.next() {
+                if end_ch != ']' {
+                    chars.next(); // '-'
+                    chars.next(); // end_ch
+                    if target >= ch && target <= end_ch {
+                        matched = true;
+                    }
+                    continue;
+                }
+            }
+        }
+        if target == ch {
+            matched = true;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -52,5 +129,9 @@ mod tests {
         // so this is NOT path-segment-aware globbing.
         assert!(glob_match("a/*/c", "a/b/d/c"));
         assert!(glob_match("*test*", "contest"));
+        assert!(glob_match("file[0-9].txt", "file3.txt"));
+        assert!(!glob_match("file[!0-9].txt", "file3.txt"));
+        assert!(glob_match("file[!0-9].txt", "fileA.txt"));
+        assert!(glob_match("한글*.log", "한글테스트.log"));
     }
 }

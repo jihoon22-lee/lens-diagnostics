@@ -6,7 +6,7 @@ use lens_core::{LensError, Result};
 
 pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> {
     let mut reader = Reader::from_reader(xml_bytes);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     // Best-effort: a single mismatched end tag must not discard the report.
     reader.config_mut().check_end_names = false;
 
@@ -30,8 +30,10 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
     let mut in_properties = false;
     // Enclosing <testsuite> names — cases get the innermost one.
     let mut suite_stack: Vec<String> = Vec::new();
-    // Depth of unclosed elements; a truncated document leaves this > 0 at EOF.
-    let mut open_depth = 0usize;
+    // Stack of open element tag names; a truncated or mismatched document
+    // leaves this non-empty or sets `malformed` at EOF.
+    let mut tag_stack: Vec<Vec<u8>> = Vec::new();
+    let mut malformed = false;
     // The first element must be the JUnit root — a document without one is
     // not a test report and must not parse to an empty "complete" run.
     let mut saw_root = false;
@@ -48,7 +50,7 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 check_root(e.name().as_ref(), &mut saw_root)?;
-                open_depth += 1;
+                tag_stack.push(e.name().as_ref().to_vec());
                 match e.name().as_ref() {
                     b"testsuite" => {
                         let mut suite_name = String::new();
@@ -60,6 +62,9 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
                         suite_stack.push(suite_name);
                     }
                     b"testcase" => {
+                        if in_testcase {
+                            malformed = true;
+                        }
                         in_testcase = true;
                         current_status = TestStatus::Passed;
                         current_message = None;
@@ -76,7 +81,11 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
                                 b"classname" => current_classname = decode_attr(&attr),
                                 b"time" => {
                                     if let Ok(s) = std::str::from_utf8(&attr.value) {
-                                        current_time = s.parse::<f64>().unwrap_or(0.0);
+                                        current_time = s
+                                            .parse::<f64>()
+                                            .ok()
+                                            .filter(|v| v.is_finite() && *v >= 0.0)
+                                            .unwrap_or(0.0);
                                     }
                                 }
                                 _ => {}
@@ -157,7 +166,11 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
                             b"classname" => classname = decode_attr(&attr),
                             b"time" => {
                                 if let Ok(s) = std::str::from_utf8(&attr.value) {
-                                    time = s.parse::<f64>().unwrap_or(0.0);
+                                    time = s
+                                        .parse::<f64>()
+                                        .ok()
+                                        .filter(|v| v.is_finite() && *v >= 0.0)
+                                        .unwrap_or(0.0);
                                 }
                             }
                             _ => {}
@@ -240,6 +253,30 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
                     current_body.push_str(&text);
                 }
             }
+            Ok(Event::GeneralRef(ref e)) => {
+                if capture.is_some() {
+                    if let Ok(Some(ch)) = e.resolve_char_ref() {
+                        current_body.push(ch);
+                    } else {
+                        let raw = decoder
+                            .decode(e.as_ref())
+                            .map(|c| c.into_owned())
+                            .unwrap_or_else(|_| String::from_utf8_lossy(e.as_ref()).into_owned());
+                        match raw.as_str() {
+                            "lt" => current_body.push('<'),
+                            "gt" => current_body.push('>'),
+                            "amp" => current_body.push('&'),
+                            "apos" => current_body.push('\''),
+                            "quot" => current_body.push('"'),
+                            other => {
+                                current_body.push('&');
+                                current_body.push_str(other);
+                                current_body.push(';');
+                            }
+                        }
+                    }
+                }
+            }
             Ok(Event::CData(ref e)) => {
                 if capture.is_some() {
                     let text = decoder
@@ -250,21 +287,41 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
                 }
             }
             Ok(Event::End(ref e)) => {
-                open_depth = open_depth.saturating_sub(1);
                 // Flush captured character data when a tracked element closes.
                 let name = e.name();
                 let name = name.as_ref();
-                if let Some(kind) = capture.take_if(|k| {
-                    matches!(
-                        (*k, name),
-                        ("failure", b"failure")
-                            | ("error", b"error")
-                            | ("skipped", b"skipped")
-                            | ("system", b"system-out")
-                            | ("system", b"system-err")
-                    )
-                }) {
+                if tag_stack.last().map(|t| t.as_slice()) == Some(name) {
+                    tag_stack.pop();
+                } else {
+                    malformed = true;
+                    if let Some(pos) = tag_stack.iter().rposition(|t| t.as_slice() == name) {
+                        tag_stack.truncate(pos);
+                    }
+                }
+
+                let flushed_kind = capture
+                    .take_if(|k| {
+                        matches!(
+                            (*k, name),
+                            ("failure", b"failure")
+                                | ("error", b"error")
+                                | ("skipped", b"skipped")
+                                | ("system", b"system-out")
+                                | ("system", b"system-err")
+                        )
+                    })
+                    .or_else(|| {
+                        if name == b"testcase" && in_testcase && capture.is_some() {
+                            malformed = true;
+                            capture.take()
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some(kind) = flushed_kind {
                     let body = current_body.trim().to_string();
+                    current_body.clear();
                     match kind {
                         "system" if capture_in_case => {
                             if !body.is_empty() {
@@ -296,6 +353,11 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
                     in_properties = false;
                 }
                 if name == b"testsuite" {
+                    if in_testcase {
+                        in_testcase = false;
+                        capture = None;
+                        malformed = true;
+                    }
                     suite_stack.pop();
                 }
                 if name == b"testcase" && in_testcase {
@@ -370,7 +432,7 @@ pub fn parse_junit_xml(xml_bytes: &[u8], project_name: &str) -> Result<TestRun> 
         run_id,
         project: project_name.to_string(),
         collected_at: lens_core::time::utc_now_iso(),
-        complete: open_depth == 0,
+        complete: tag_stack.is_empty() && !malformed,
         summary,
         cases,
         properties,

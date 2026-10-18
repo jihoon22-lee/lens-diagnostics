@@ -9,13 +9,31 @@ static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 static DENIAL: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_roots(roots: Vec<PathBuf>) -> Result<(), &'static str> {
+    let canonical_roots = roots
+        .into_iter()
+        .map(|r| std::fs::canonicalize(&r).unwrap_or(r))
+        .collect();
     ROOTS
-        .set(roots)
+        .set(canonical_roots)
         .map_err(|_| "read roots already configured")
 }
 
 pub fn take_denial() -> Option<String> {
     DENIAL.lock().unwrap().take()
+}
+
+/// Verify that `path` (or its nearest resolvable ancestor, following dangling
+/// symlinks) falls within the configured allowed roots. Unlike [`canonicalize`],
+/// a non-existent path inside an allowed root returns `Ok(())`.
+pub fn check_boundary(path: impl AsRef<Path>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let Some(roots) = ROOTS.get().filter(|r| !r.is_empty()) else {
+        return Ok(());
+    };
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => validate_resolved(path, &canonical, roots),
+        Err(_) => check_ancestor(path, roots, 0, path),
+    }
 }
 
 fn checked(path: &Path) -> std::io::Result<PathBuf> {
@@ -63,18 +81,27 @@ fn check_ancestor(
     }
     let mut candidate = path.to_path_buf();
     loop {
-        if let Ok(canonical) = std::fs::canonicalize(&candidate) {
+        let probe = if candidate.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            candidate.as_path()
+        };
+        if let Ok(canonical) = std::fs::canonicalize(probe) {
             return validate_resolved(origin, &canonical, roots);
         }
-        if let Ok(target) = std::fs::read_link(&candidate) {
+        if let Ok(target) = std::fs::read_link(probe) {
+            let base = probe
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
             let target = if target.is_absolute() {
                 target
             } else {
-                candidate.parent().unwrap_or(Path::new(".")).join(target)
+                base.join(target)
             };
             return check_ancestor(&target, roots, depth + 1, origin);
         }
-        if !candidate.pop() {
+        if candidate.as_os_str().is_empty() || !candidate.pop() {
             return Err(std::io::Error::other("cannot resolve read boundary"));
         }
     }
@@ -91,6 +118,10 @@ pub fn canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
 
 pub fn metadata(path: impl AsRef<Path>) -> std::io::Result<std::fs::Metadata> {
     std::fs::metadata(checked(path.as_ref())?)
+}
+
+pub fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(checked(path.as_ref())?)
 }
 
 pub fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {

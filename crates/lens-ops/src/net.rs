@@ -17,6 +17,8 @@ pub fn inspect(proc_dir: Option<&Path>, no_unix: bool) -> Result<Report<NetRepor
                 lens_net::SocketKind::UnixStream | lens_net::SocketKind::UnixDgram
             )
         });
+        net.summary.total_sockets = net.sockets.len();
+        net.summary.unix_domain_sockets = 0;
     }
     let mut report = Report::new(net);
     if report.data.summary.orphan_sockets > 0 {

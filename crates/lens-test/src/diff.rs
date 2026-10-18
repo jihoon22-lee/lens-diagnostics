@@ -77,24 +77,55 @@ fn change(
     }
 }
 
+fn status_severity(status: TestStatus) -> u8 {
+    match status {
+        TestStatus::Skipped => 0,
+        TestStatus::Passed => 1,
+        TestStatus::Failed => 2,
+        TestStatus::Error => 3,
+    }
+}
+
+fn should_replace_duplicate(existing: &TestCase, incoming: &TestCase) -> bool {
+    let e_sev = status_severity(existing.status);
+    let i_sev = status_severity(incoming.status);
+    i_sev > e_sev || (i_sev == e_sev && existing.message.is_none() && incoming.message.is_some())
+}
+
 pub fn diff_test_runs(baseline: &TestRun, candidate: &TestRun) -> TestDiff {
     let mut diagnostics = Vec::new();
     let mut baseline_map: HashMap<&str, &TestCase> = HashMap::new();
     let mut candidate_map: HashMap<&str, &TestCase> = HashMap::new();
     for c in &baseline.cases {
-        if baseline_map.insert(c.identity.as_str(), c).is_some() {
-            diagnostics.push(format!(
-                "duplicate case identity in baseline: {}",
-                c.identity
-            ));
+        match baseline_map.get_mut(c.identity.as_str()) {
+            Some(existing) => {
+                diagnostics.push(format!(
+                    "duplicate case identity in baseline: {}",
+                    c.identity
+                ));
+                if should_replace_duplicate(existing, c) {
+                    *existing = c;
+                }
+            }
+            None => {
+                baseline_map.insert(c.identity.as_str(), c);
+            }
         }
     }
     for c in &candidate.cases {
-        if candidate_map.insert(c.identity.as_str(), c).is_some() {
-            diagnostics.push(format!(
-                "duplicate case identity in candidate: {}",
-                c.identity
-            ));
+        match candidate_map.get_mut(c.identity.as_str()) {
+            Some(existing) => {
+                diagnostics.push(format!(
+                    "duplicate case identity in candidate: {}",
+                    c.identity
+                ));
+                if should_replace_duplicate(existing, c) {
+                    *existing = c;
+                }
+            }
+            None => {
+                candidate_map.insert(c.identity.as_str(), c);
+            }
         }
     }
 

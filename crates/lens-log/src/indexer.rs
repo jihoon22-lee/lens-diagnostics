@@ -51,6 +51,14 @@ impl LogIndexer {
             return Self::from_reader(decoder, &path.to_string_lossy());
         }
         let safe_input = SafeInput::open(path)?;
+        if safe_input
+            .file
+            .metadata()
+            .map(|m| m.len() == 0)
+            .unwrap_or(false)
+        {
+            return Ok(Self::from_backing(Backing::Owned(Vec::new())));
+        }
         let mmap = safe_input.mmap()?;
         Ok(Self::from_backing(Backing::Mapped(mmap)))
     }
@@ -246,5 +254,18 @@ mod tests {
         let idx = LogIndexer::from_reader(&b"x\ny\n"[..], "-").unwrap();
         assert_eq!(idx.len(), 2);
         assert_eq!(idx.get_line(0), Some("x"));
+    }
+
+    #[test]
+    fn test_l01_open_empty_file_returns_empty_indexer() {
+        let dir = tempfile::Builder::new()
+            .prefix("lenslog-empty-")
+            .tempdir()
+            .unwrap();
+        let empty_path = dir.path().join("empty.log");
+        std::fs::File::create(&empty_path).unwrap();
+        let idx = LogIndexer::open(&empty_path).unwrap();
+        assert_eq!(idx.len(), 0);
+        assert!(idx.is_empty());
     }
 }

@@ -21,12 +21,13 @@ pub mod hash;
 pub mod identity;
 pub mod json;
 pub mod read_policy;
+pub mod redact;
 pub mod time;
 
 pub use bundle::{
-    create_bundle_archive, extract_bundle, inspect_bundle, normalize_entry_name, read_bundle_entry,
-    verify_bundle_archive, BundleArtifact, BundleInspection, BundleManifest,
-    BundleVerificationReport, BUNDLE_SCHEMA_V2,
+    create_bundle_archive, create_bundle_archive_with_redaction, extract_bundle, inspect_bundle,
+    normalize_entry_name, read_bundle_entry, verify_bundle_archive, BundleArtifact,
+    BundleInspection, BundleManifest, BundleVerificationReport, BUNDLE_SCHEMA_V2,
 };
 pub use diff::{Compatibility, SetDiff};
 pub use error::{LensError, Result};
@@ -34,3 +35,4 @@ pub use evidence::{BoundedCollector, Diagnostic, Evidence, Source};
 pub use hash::{digest_bytes, digest_file, digest_reader, IncrementalHasher};
 pub use identity::{FileIdentity, SafeInput};
 pub use json::{to_deterministic_pretty, to_deterministic_string};
+pub use redact::{redact_bytes, redact_str};

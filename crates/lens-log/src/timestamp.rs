@@ -7,9 +7,10 @@ use jiff::tz::TimeZone;
 
 /// Year assumed for year-less syslog timestamps (`Oct  9 12:00:00`)
 /// when the caller did not pass `--year`. Defaults to the current
-/// UTC year.
+/// UTC year, cached once per process to avoid per-line clock syscalls.
 pub fn default_syslog_year() -> i32 {
-    jiff::Timestamp::now().to_zoned(TimeZone::UTC).year().into()
+    static CACHED_YEAR: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *CACHED_YEAR.get_or_init(|| jiff::Timestamp::now().to_zoned(TimeZone::UTC).year().into())
 }
 
 /// Epoch milliseconds → RFC 3339 UTC string (`2026-10-09T12:00:00Z`).
@@ -57,9 +58,10 @@ fn civil_ms(dt: DateTime) -> Option<i64> {
 /// Extract a timestamp from a log line. Checked in order:
 ///   * JSONL object: `ts`/`time`/`timestamp` field — a number is epoch
 ///     milliseconds (the existing `timestamp_ms` contract), a string is
-///     parsed with the `parse_bound` forms;
+///     parsed with the `parse_bound` forms; or journald
+///     `__REALTIME_TIMESTAMP` (epoch microseconds as string or integer);
 ///   * leading ISO/RFC3339 date-time or date prefix (`2026-10-09T…`,
-///     `2026-10-09 …`);
+///     `2026-10-09 …`), optionally preceded by a syslog `<PRI>` header;
 ///   * leading syslog `Mmm DD HH:MM:SS` (`Oct  9 12:00:00`) — yearless,
 ///     so `syslog_year` supplies the year.
 ///
@@ -70,6 +72,7 @@ pub fn extract_timestamp_ms(raw: &str, syslog_year: i32) -> Option<i64> {
         if let Ok(serde_json::Value::Object(map)) =
             serde_json::from_str::<serde_json::Value>(trimmed)
         {
+            let mut realtime_usec: Option<i64> = None;
             for (k, v) in &map {
                 if k.eq_ignore_ascii_case("ts")
                     || k.eq_ignore_ascii_case("time")
@@ -85,15 +88,47 @@ pub fn extract_timestamp_ms(raw: &str, syslog_year: i32) -> Option<i64> {
                         return parse_bound(s);
                     }
                     return None;
+                } else if k.eq_ignore_ascii_case("__REALTIME_TIMESTAMP") {
+                    if let Some(n) = v
+                        .as_u64()
+                        .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    {
+                        realtime_usec = Some((n / 1000) as i64);
+                    }
                 }
             }
-            return None;
+            return realtime_usec;
         }
     }
     text_prefix_ms(trimmed, syslog_year)
 }
 
+/// Strip an optional leading syslog `<PRI>` (or RFC 5424 `<PRI>1 `) prefix.
+pub(crate) fn strip_syslog_pri_prefix(s: &str) -> &str {
+    if let Some(inner) = s.strip_prefix('<') {
+        if let Some(end) = inner.find('>') {
+            let digits = &inner[..end];
+            if !digits.is_empty() && digits.len() <= 3 && digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                let after = &inner[end + 1..];
+                let after_bytes = after.as_bytes();
+                // RFC 5424 `<PRI>VERSION SP` (e.g. `<13>1 2026-10-09T...`)
+                if after_bytes.len() >= 2
+                    && after_bytes[0].is_ascii_digit()
+                    && after_bytes[1].is_ascii_whitespace()
+                {
+                    return after[2..].trim_start();
+                }
+                return after.trim_start();
+            }
+        }
+    }
+    s
+}
+
 fn text_prefix_ms(s: &str, syslog_year: i32) -> Option<i64> {
+    let s = strip_syslog_pri_prefix(s);
     let b = s.as_bytes();
     // ISO/RFC3339 family: YYYY-MM-DD prefix.
     if b.len() >= 10
@@ -115,21 +150,20 @@ fn text_prefix_ms(s: &str, syslog_year: i32) -> Option<i64> {
             }
             return None;
         }
-        // ` ` form: "YYYY-MM-DD HH:MM:SS[.frac]" — naive, read as UTC.
+        // ` ` form: "YYYY-MM-DD HH:MM:SS[.frac][Z|+HH:MM]"
         if b.get(10) == Some(&b' ') && looks_like_hhmmss(&b[11..]) {
-            let mut end = 19;
-            if b.get(end) == Some(&b'.') {
-                let mut e = end + 1;
-                while b.get(e).is_some_and(u8::is_ascii_digit) {
-                    e += 1;
-                }
-                if e > end + 1 {
-                    end = e;
-                }
+            let time_end = s[11..]
+                .find(|c: char| c.is_ascii_whitespace())
+                .map(|idx| 11 + idx)
+                .unwrap_or(s.len());
+            let token = &s[..time_end];
+            if let Ok(ts) = token.parse::<jiff::Timestamp>() {
+                return Some(ts.as_millisecond());
             }
-            if let Ok(dt) = s[..end].parse::<DateTime>() {
+            if let Ok(dt) = token.parse::<DateTime>() {
                 return civil_ms(dt);
             }
+            return None;
         }
         // Bare date prefix — next char must end the token.
         if matches!(b.get(10), None | Some(&b' ') | Some(&b'\t')) {
@@ -291,5 +325,33 @@ mod tests {
         assert_eq!(extract_timestamp_ms(r#"{"msg":"x"}"#, y), None);
         assert_eq!(extract_timestamp_ms("just a line", y), None);
         assert_eq!(extract_timestamp_ms("pid 1234 started", y), None);
+    }
+
+    #[test]
+    fn test_l04_space_separated_iso_offset_syslog_pri_and_realtime_timestamp() {
+        let y = 2026;
+        // Space-separated ISO with timezone offset (+09:00)
+        assert_eq!(
+            extract_timestamp_ms("2026-10-09 12:00:00+09:00 INFO hello", y),
+            Some(ms(2026, 10, 9, 3, 0, 0))
+        );
+        // Leading <PRI> on syslog line
+        assert_eq!(
+            extract_timestamp_ms("<134>Oct  9 12:00:00 host app: msg", 2026),
+            Some(ms(2026, 10, 9, 12, 0, 0))
+        );
+        // Leading <PRI>1 on RFC5424 ISO line
+        assert_eq!(
+            extract_timestamp_ms("<13>1 2026-10-09T12:00:00Z host app - - - msg", 2026),
+            Some(ms(2026, 10, 9, 12, 0, 0))
+        );
+        // journald __REALTIME_TIMESTAMP in microseconds
+        assert_eq!(
+            extract_timestamp_ms(
+                r#"{"__REALTIME_TIMESTAMP":"1791547200000000","MESSAGE":"hi"}"#,
+                y
+            ),
+            Some(ms(2026, 10, 9, 12, 0, 0))
+        );
     }
 }

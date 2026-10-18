@@ -1,5 +1,4 @@
 use sha2::{Digest, Sha256};
-use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
@@ -25,7 +24,7 @@ pub fn digest_reader<R: Read>(mut reader: R) -> std::io::Result<String> {
 }
 
 pub fn digest_file<P: AsRef<Path>>(path: P) -> Result<String> {
-    let file = File::open(path.as_ref()).map_err(|e| LensError::Io {
+    let file = crate::read_policy::open(path.as_ref()).map_err(|e| LensError::Io {
         path: path.as_ref().to_path_buf(),
         source: e,
     })?;

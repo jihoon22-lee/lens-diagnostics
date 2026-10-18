@@ -217,7 +217,7 @@ impl LogFilter {
 
     fn passes_rest(&self, record: &LogRecordView) -> bool {
         if let Some(src) = &self.source {
-            if !record.source.is_empty() && record.source != src.as_str() {
+            if record.source != src.as_str() {
                 return false;
             }
         }
