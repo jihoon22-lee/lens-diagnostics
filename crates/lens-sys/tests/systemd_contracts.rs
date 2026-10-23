@@ -193,3 +193,45 @@ fn graph_node_limit_accepts_boundary_and_rejects_one_more() {
         Err(lens_core::LensError::LimitExceeded { .. })
     ));
 }
+
+#[test]
+fn cloned_dropin_paths_cannot_bypass_the_metadata_limit() {
+    let mut template = parse_unit_content("[Unit]\n", "worker@.service", None);
+    template.drop_ins = (0..2048)
+        .map(|index| format!("/units/{}/worker@.service.d/{index}.conf", "d".repeat(128)))
+        .collect();
+    let dependencies = (0..300)
+        .map(|index| format!("worker@{index}.service"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let root = parse_unit_content(
+        &format!("[Unit]\nWants={dependencies}\n"),
+        "root.target",
+        None,
+    );
+    let mut units = BTreeMap::from([(template.name.clone(), template), (root.name.clone(), root)]);
+    let error = OrderingGraph::build(&units).unwrap_err();
+    assert!(matches!(error, lens_core::LensError::LimitExceeded { .. }));
+    assert!(error.to_string().contains("metadata"));
+    units.get_mut("worker@.service").unwrap().drop_ins.clear();
+    assert_eq!(OrderingGraph::build(&units).unwrap().all_nodes.len(), 301);
+}
+
+#[test]
+fn ordering_reference_limit_counts_provenance_only_once() {
+    for count in [50_001, 100_000, 100_001] {
+        let content = format!("[Unit]\nBefore={}\n", "target.service ".repeat(count));
+        let unit = parse_unit_content(&content, "root.target", None);
+        assert_eq!(unit.ordering_edges.len(), count);
+        let units = BTreeMap::from([(unit.name.clone(), unit)]);
+        let result = OrderingGraph::build(&units);
+        if count <= 100_000 {
+            assert_eq!(result.unwrap().constraints.len(), count);
+        } else {
+            assert!(matches!(
+                result,
+                Err(lens_core::LensError::LimitExceeded { .. })
+            ));
+        }
+    }
+}

@@ -40,9 +40,7 @@ impl OrderingGraph {
     }
 
     pub fn build(units: &BTreeMap<String, SystemdUnit>) -> lens_core::Result<Self> {
-        if units.len() > crate::resolve::MAX_UNITS {
-            return Err(crate::resolve::limit("unit count exceeds 10000"));
-        }
+        crate::resolve::validate_units(units)?;
         let mut resolved = units.clone();
         crate::resolve::expand_instances(&mut resolved, |template, name| {
             Ok(instantiate_template(template, name))
