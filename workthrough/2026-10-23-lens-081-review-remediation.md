@@ -33,13 +33,19 @@
 인스턴스 확장 결과가 유지되도록 했다. 인스턴스 전용 drop-in은 기존 MCP
 `--allow-root` 읽기 정책을 그대로 통과해야 한다.
 
+후속 PR 리뷰에서 확인한 R03의 두 경계 조건도 보완했다. 메타데이터 예산은
+복제되는 drop-in 경로, 별칭, 명령, 진단과 컨테이너 저장 공간을 모두 포함하고
+그래프 복제 전에 검사한다. 순서 참조는 provenance와 평탄화 목록에서 중복
+집계하지 않는다. 대량 drop-in 경로의 확장 거부와 정상 대조군, 순서 참조
+50,001개·100,000개 허용 및 100,001개 거부를 회귀 테스트로 추가했다.
+
 ## 검증 결과
 
 | 검증 | 결과 |
 |---|---|
 | `cargo fmt --all -- --check` | 통과 |
 | `cargo clippy --workspace --all-targets --locked --jobs 2 -- -D warnings` | 경고 없이 통과 |
-| `cargo test --workspace --locked --jobs 2 --no-fail-fast` | 394 통과, 0 실패, 0 ignored |
+| `cargo test --workspace --locked --jobs 2 --no-fail-fast` | 396 통과, 0 실패, 0 ignored |
 | `cargo build --release --workspace --locked --jobs 2` | 통과 |
 | `python3 .github/scripts/check_docs.py` | 문서 링크·버전 정합 통과 |
 | `python3 .github/scripts/test_release_flow.py` | 6개 통과 |

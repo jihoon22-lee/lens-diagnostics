@@ -126,6 +126,9 @@ lens-tui ──> (도메인 크레이트 직접 소비) ──> lens-core
 - `resolve.rs`: 작업 큐로 참조된 템플릿 인스턴스를 한 번씩 확장한다.
   유닛 10,000개, 의존 참조 100,000개, 확장 깊이 32, 합성 이름 255바이트,
   확장 메타데이터 64 MiB를 상한으로 두며 초과 시 `LimitExceeded`를 반환한다.
+  메타데이터 예산은 drop-in·진단 경로 등 모든 소유 필드와 컨테이너 저장 공간을
+  포함하고, 그래프 복제 전에 입력을 검사한다. 순서 참조는 provenance가 있으면
+  이를 사용하고 평탄화 목록을 중복 집계하지 않는다.
   파일 로더와 `OrderingGraph::build`는 `Result`를 반환하고, 번들 수집은
   실패한 항목을 진단과 `complete=false`로 기록한다.
 - `dag.rs`: Before/After로 순서 그래프 + Tarjan SCC.
