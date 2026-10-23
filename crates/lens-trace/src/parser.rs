@@ -474,7 +474,7 @@ fn table_for(
 
 /// Parse `close_range` arguments: `first, last[, flags]` where `last`
 /// may be `~0U`/`UINT_MAX` for "all higher fds", and `flags` may include
-/// `CLOSE_RANGE_UNSHARE` (`0x1`) and/or `CLOSE_RANGE_CLOEXEC` (`0x2`).
+/// `CLOSE_RANGE_UNSHARE` (`0x2`) and/or `CLOSE_RANGE_CLOEXEC` (`0x4`).
 fn parse_close_range(arguments: &str) -> Option<(u64, u64, bool, bool)> {
     let mut parts = arguments.split(',');
     let first = parts.next()?.trim().parse::<u64>().ok()?;
@@ -488,8 +488,12 @@ fn parse_close_range(arguments: &str) -> Option<(u64, u64, bool, bool)> {
             .or_else(|| last_raw.parse::<u64>().ok())?,
     };
     let flags_raw = parts.next().map(str::trim).unwrap_or("0");
-    let mut unshare = flags_raw.contains("CLOSE_RANGE_UNSHARE");
-    let mut cloexec = flags_raw.contains("CLOSE_RANGE_CLOEXEC");
+    let mut unshare = flags_raw
+        .split('|')
+        .any(|flag| flag.trim() == "CLOSE_RANGE_UNSHARE");
+    let mut cloexec = flags_raw
+        .split('|')
+        .any(|flag| flag.trim() == "CLOSE_RANGE_CLOEXEC");
     for tok in flags_raw.split('|').map(str::trim) {
         let num = tok
             .strip_prefix("0x")
@@ -497,10 +501,10 @@ fn parse_close_range(arguments: &str) -> Option<(u64, u64, bool, bool)> {
             .and_then(|h| u64::from_str_radix(h, 16).ok())
             .or_else(|| tok.parse::<u64>().ok());
         if let Some(bits) = num {
-            if (bits & 0x1) != 0 {
+            if (bits & 0x2) != 0 {
                 unshare = true;
             }
-            if (bits & 0x2) != 0 {
+            if (bits & 0x4) != 0 {
                 cloexec = true;
             }
         }
@@ -938,6 +942,48 @@ mod tests {
         ];
         let snapshot = TraceAnalyzer::new().analyze_lines(lines);
         assert_eq!(snapshot.fd_leaks_by_process["100"], vec![7]);
+    }
+
+    #[test]
+    fn close_range_numeric_and_symbolic_flags_have_identical_effects() {
+        for (symbolic, decimal, hex, expected_child) in [
+            ("CLOSE_RANGE_UNSHARE", "2", "0x2", vec![]),
+            ("CLOSE_RANGE_CLOEXEC", "4", "0x4", vec![3]),
+            (
+                "CLOSE_RANGE_UNSHARE|CLOSE_RANGE_CLOEXEC",
+                "6",
+                "0x6",
+                vec![3],
+            ),
+        ] {
+            for flag in [symbolic, decimal, hex] {
+                let lines = [
+                    "100 openat(AT_FDCWD, \"/tmp/x\", O_RDONLY) = 3".to_string(),
+                    "100 clone(child_stack=NULL, flags=CLONE_FILES) = 101".to_string(),
+                    format!("101 close_range(3, 3, {flag}) = 0"),
+                ];
+                let snapshot = TraceAnalyzer::new().analyze_lines(lines.iter().map(String::as_str));
+                assert_eq!(
+                    snapshot
+                        .fd_leaks_by_process
+                        .get("101")
+                        .cloned()
+                        .unwrap_or_default(),
+                    expected_child,
+                    "{flag}"
+                );
+                assert_eq!(snapshot.fd_leaks_by_process["100"], [3], "{flag}");
+            }
+        }
+        for flag in ["CLOSE_RANGE_CLOEXEC", "4", "0x4"] {
+            let call = format!("100 close_range(3, 3, {flag}) = 0");
+            let snapshot = TraceAnalyzer::new().analyze_lines([
+                "100 openat(AT_FDCWD, \"/tmp/x\", O_RDONLY) = 3",
+                &call,
+                "100 execve(\"/bin/true\", [], []) = 0",
+            ]);
+            assert!(snapshot.fd_leaks.is_empty(), "{flag}");
+        }
     }
 
     #[test]

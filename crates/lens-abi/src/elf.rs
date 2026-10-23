@@ -691,7 +691,7 @@ mod tests {
             .write_all(code.as_bytes())
             .ok()?;
         let status = Command::new("cc")
-            .args(["-shared", "-fPIC", "-o"])
+            .args(["-shared", "-fPIC", "-g", "-o"])
             .arg(&so)
             .arg(&src)
             .status()
@@ -731,6 +731,23 @@ mod tests {
             .expect("imported_fn in evidence");
         assert!(!imp.defined);
         assert_eq!(imp.binding, "global");
+    }
+
+    #[test]
+    fn private_dwarf_layout_is_uncertain_even_when_export_name_contains_type_name() {
+        let Some((_left_dir, left)) = compile_so(
+            "struct State { int a; }; static struct State state; int get_state_count(void) { state.a = 7; return state.a; }"
+        ) else { return };
+        let Some((_right_dir, right)) = compile_so(
+            "struct State { int a; int b; }; static struct State state; int get_state_count(void) { state.a = 7; return state.a; }"
+        ) else { return };
+        let before = inspect_elf(&left, &std::fs::read(&left).unwrap());
+        let after = inspect_elf(&right, &std::fs::read(&right).unwrap());
+        assert!(before.abi.types.iter().any(|t| t == "State (size=4)"));
+        assert!(after.abi.types.iter().any(|t| t == "State (size=8)"));
+        let diff = crate::diff_reports(&before, &after);
+        assert_eq!(diff.compatibility, lens_core::Compatibility::Uncertain);
+        assert!(diff.symbols.added.is_empty() && diff.symbols.removed.is_empty());
     }
 
     #[test]

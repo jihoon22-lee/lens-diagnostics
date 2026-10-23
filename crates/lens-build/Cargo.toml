@@ -11,4 +11,5 @@ lens-core = { path = "../lens-core" }
 serde = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = "3.17"

@@ -52,6 +52,12 @@ pub struct BuildSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncludeOrderChange {
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnitDiff {
     pub file: String,
     pub added_flags: Vec<String>,
@@ -60,6 +66,9 @@ pub struct UnitDiff {
     pub removed_defines: Vec<String>,
     pub added_includes: Vec<String>,
     pub removed_includes: Vec<String>,
+    /// Ordered forced includes; absent in older buildscope.diff/v1 reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_include_order: Option<IncludeOrderChange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

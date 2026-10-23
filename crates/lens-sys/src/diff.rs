@@ -22,10 +22,19 @@ pub fn diff_systemd(baseline: &SystemdSnapshot, candidate: &SystemdSnapshot) -> 
                 removed_units.push(name);
             }
             (Some(b), Some(c)) => {
-                // Compare the full section/key matrix — this covers the
-                // derived fields (wants/requires/before/after/exec_start)
-                // and also keys they do not surface, like `User=`.
+                // Effective dependencies also include .wants/.requires links,
+                // which do not appear in the section/key matrix.
                 let mut details = Vec::new();
+                for (key, before, after) in [
+                    ("Wants", &b.wants, &c.wants),
+                    ("Requires", &b.requires, &c.requires),
+                ] {
+                    let before: BTreeSet<_> = before.iter().collect();
+                    let after: BTreeSet<_> = after.iter().collect();
+                    if before != after {
+                        details.push(format!("[Effective] {key}: {before:?} -> {after:?}"));
+                    }
+                }
 
                 if b.masked != c.masked {
                     details.push(format!("[Meta] Masked: {:?} -> {:?}", b.masked, c.masked));

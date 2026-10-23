@@ -59,9 +59,21 @@ pub struct BundleArtifact {
 
 impl BundleArtifact {
     pub fn json<T: Serialize>(name: &str, value: &T) -> Result<Self> {
+        Self::json_with_redaction(name, value, false)
+    }
+
+    /// Redact decoded values before serialization; never edit JSON escape bytes.
+    pub fn json_with_redaction<T: Serialize>(name: &str, value: &T, redact: bool) -> Result<Self> {
+        let data = if redact {
+            let mut value = serde_json::to_value(value)?;
+            crate::redact::redact_json_value(&mut value);
+            serde_json::to_vec_pretty(&value)?
+        } else {
+            crate::json::to_deterministic_pretty(value)?.into_bytes()
+        };
         Ok(Self {
             name: name.to_string(),
-            data: crate::json::to_deterministic_pretty(value)?.into_bytes(),
+            data,
         })
     }
 }
@@ -388,6 +400,9 @@ where
             return Err(err);
         }
     }
+    // tar stops at its end marker before gzip necessarily consumes its CRC
+    // trailer. Finish decoding through the same cap before trusting any entry.
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink()).map_err(map_io)?;
     Ok(())
 }
 
@@ -934,6 +949,38 @@ fn normalize_path_str(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn damaged_gzip_trailers_fail_every_bundle_reader_before_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let healthy = dir.path().join("healthy.lens");
+        create_bundle_archive(&healthy, "test", &sample_artifacts(), vec![], false).unwrap();
+        let original = std::fs::read(&healthy).unwrap();
+        assert!(verify_bundle_archive(&healthy).unwrap().is_valid);
+        for truncate in [false, true] {
+            let path = dir.path().join(if truncate {
+                "truncated.lens"
+            } else {
+                "bad-crc.lens"
+            });
+            let mut bytes = original.clone();
+            if truncate {
+                bytes.truncate(bytes.len() - 4);
+            } else {
+                let crc = bytes.len() - 8;
+                bytes[crc] ^= 0xff;
+            }
+            std::fs::write(&path, bytes).unwrap();
+            assert!(verify_bundle_archive(&path).is_err());
+            assert!(inspect_bundle(&path).is_err());
+            assert!(read_bundle_entry(&path, MANIFEST_ENTRY).is_err());
+            let dest = dir
+                .path()
+                .join(if truncate { "out-truncated" } else { "out-crc" });
+            assert!(extract_bundle(&path, &dest, false).is_err());
+            assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn oversized_manifest_is_rejected_before_parsing() {
         let dir = tempfile::tempdir().unwrap();

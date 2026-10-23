@@ -78,6 +78,8 @@ lens-tui ──> (도메인 크레이트 직접 소비) ──> lens-core
 - `diff.rs`: 심볼/버전 요구사항 SetDiff + `Compatibility` 판정. 정의된
   심볼만 제거 검사 대상이며 미정의 import는 `imports` SetDiff로 별도
   비교(import만의 변경은 compatible), weak 심볼은 `binding="weak"`.
+  DWARF 타입 크기 변화는 공개 ABI 노출 관계를 입증하지 못하면
+  `uncertain`으로 보고하며, 타입명과 심볼명의 부분일치를 근거로 삼지 않는다.
 
 ### lens-log
 - `indexer.rs`: memmap2 라인 인덱스 + memchr 오프셋 계산. `.gz`와
@@ -105,22 +107,32 @@ lens-tui ──> (도메인 크레이트 직접 소비) ──> lens-core
   `fd_leaks_by_process`로 귀속, tid 재사용은 새 세대.
 
 ### lens-sys
-- `parser.rs`: 할당 순서 보존 파싱 → `Key=` 빈 값 리셋 의미론,
-  specifier(`%u`/`%h`/`%i` 등) 확장. `=` 없는 라인(`SYNTAX_GARBAGE_LINE`)과
+- `parser.rs`: 할당 순서 보존 파싱. `ExecStart=` 등의 빈 값은 리셋하지만
+  `After=`/`Before=`/`Wants=`/`Requires=` 같은 의존성은 삭제하지 않는다.
+  시스템 매니저의 `%u`/`%h`는 `User=`와 무관하게 `root`/`/root`이며,
+  템플릿의 `%i` 등은 인스턴스 이름이 정해진 뒤 확장한다. 사용자 매니저는
+  현재 지원 범위에 포함하지 않는다. `=` 없는 라인(`SYNTAX_GARBAGE_LINE`)과
   닫히지 않은 `[Section` 헤더(`SYNTAX_SECTION_HEADER`)를 진단으로 수집.
 - `loader.rs`: 파일/디렉터리 로딩, `.d/` drop-in 스캔(템플릿 포함),
   후순위 override. `/dev/null` masked 유닛과 alias는 엣지 대상에서 정리.
   `load_units_merged`는 `SYSTEMD_SEARCH_DIRS`(/etc→/run→/usr/lib→/lib,
   높은 우선순위 순)를 병합 — 상위 디렉터리의 유닛 파일·mask·alias가
-  하위를 가리고, drop-in은 모든 디렉터리에서 수집해 낮은 우선순위부터
-  적용. drop-in만 존재하는 유닛은 스텁으로 합성. doctor/TUI/`sys`의
+  하위를 가린다. drop-in은 같은 파일명끼리 우선순위를 적용한 뒤 전체를
+  파일명순으로 병합한다. 합성 인스턴스에도 인스턴스 전용 drop-in을 적용하고,
+  템플릿이 없는 drop-in 전용 유닛은 스텁으로 보존한다. doctor/TUI/`sys`의
   기본 경로가 이 단일 구현을 공유. 로드된 유닛·alias·mask·템플릿
   인스턴스·생성형 suffix에 매칭되지 않는 의존 대상은 `UNIT_REF_MISSING`
   진단이 되고 CLI가 스냅샷 상위 `diagnostics`로 집계한다.
-- `dag.rs`: Wants/Requires/Before/After로 유향 그래프 + Tarjan SCC.
+- `resolve.rs`: 작업 큐로 참조된 템플릿 인스턴스를 한 번씩 확장한다.
+  유닛 10,000개, 의존 참조 100,000개, 확장 깊이 32, 합성 이름 255바이트,
+  확장 메타데이터 64 MiB를 상한으로 두며 초과 시 `LimitExceeded`를 반환한다.
+  파일 로더와 `OrderingGraph::build`는 `Result`를 반환하고, 번들 수집은
+  실패한 항목을 진단과 `complete=false`로 기록한다.
+- `dag.rs`: Before/After로 순서 그래프 + Tarjan SCC.
   사이클은 SCC 멤버 정렬이 아니라 실제 방향 경로로 재구성하고 각 엣지의
   기원(유닛 파일:라인 + 디렉티브)을 함께 보고.
-- `diff.rs`: 유닛의 모든 섹션·키를 비교(`User=` 추가 등 표면화).
+- `diff.rs`: 유닛의 모든 섹션·키 및 `.wants`/`.requires` 링크를 포함한
+  유효 의존성을 비교한다. 지원 의미론은 `systemd-255-subset-v2`다.
   `sys diff`는 스냅샷 JSON 외에 유닛 디렉터리도 입력으로 받는다.
 
 ### lens-build

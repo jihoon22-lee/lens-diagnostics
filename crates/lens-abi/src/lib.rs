@@ -245,12 +245,12 @@ mod tests {
     }
 
     #[test]
-    fn test_e01_dwarf_struct_size_change_is_incompatible() {
+    fn test_type_name_substrings_do_not_prove_abi_exposure() {
         let fake = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0\x01\0\0\0\0\0\0\0\0\0\0\0";
         let mut a = inspect_elf("lib_v1.so", fake);
         a.status = InputStatus::Valid;
         a.abi.types = vec!["MyStruct (size=16)".to_string()];
-        // Expose MyStruct through public/defined ABI symbol
+        // A symbol name alone does not expose the similarly named type.
         a.abi.symbols = vec!["create_mystruct".to_string()];
 
         let mut b = a.clone();
@@ -258,11 +258,11 @@ mod tests {
 
         let diff = diff_reports(&a, &b);
         assert!(diff.changed);
-        assert_eq!(diff.compatibility, lens_core::Compatibility::Incompatible);
+        assert_eq!(diff.compatibility, lens_core::Compatibility::Uncertain);
         assert!(diff
             .diagnostics
             .iter()
-            .any(|d| d.contains("ABI-exposed DWARF type layout changed: MyStruct")));
+            .any(|d| d.contains("Unclassified DWARF type layout changed: MyStruct")));
     }
 
     #[test]

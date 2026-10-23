@@ -121,16 +121,20 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   `<unit>.d/*.conf`를 이름순으로 병합. 읽기 실패는 진단 스텁으로 보존.
 - `load_units_merged(dirs)` + `SYSTEMD_SEARCH_DIRS`: `/etc` → `/run` →
   `/usr/lib` → `/lib` 우선순위 병합 — 상위 디렉터리의 유닛(또는 mask/
-  alias)이 하위를 가리고, drop-in은 모든 디렉터리에서 수집해 낮은
-  우선순위부터 적용. doctor/TUI/`sys` 기본 경로가 이 로더를 공유한다.
+  alias)이 하위를 가린다. drop-in은 같은 파일명의 우선순위를 정한 뒤
+  파일명순으로 병합하며, 합성 인스턴스 전용 drop-in도 포함한다.
+  doctor/TUI/`sys` 기본 경로가 이 로더를 공유한다.
 - 파서는 할당 순서를 유지해 `ExecStart=` 등 빈 할당 리셋 의미론을 지원하고
-  `%u`/`%h` 등 specifier를 `User=` 기준으로 확장.
+  의존성 지시어의 빈 할당은 무시한다. `%u`/`%h`는 시스템 매니저 기준
+  `root`/`/root`로 확장하며 `User=`의 영향을 받지 않는다.
 - `OrderingGraph`: Before/After DAG + Tarjan SCC 사이클 탐지 — 사이클은
   실제 방향 경로 + 엣지 기원(파일:라인, 디렉티브)으로 보고.
 - 파서/로더는 `SYNTAX_GARBAGE_LINE`, `SYNTAX_SECTION_HEADER`,
   `UNIT_REF_MISSING` 진단을 유닛에 붙이고 스냅샷 `diagnostics`에 집계된다.
 - 스키마: `servicelens.snapshot/v1`, `servicelens.diff/v1`.
-- 지원 범위는 `systemd-255-subset-v1`로 명시 — 전체 systemd 의미론의 부분 집합.
+- 확장은 유닛 10,000개·의존 참조 100,000개·깊이 32·메타데이터 64 MiB로
+  제한한다. 로더와 그래프 생성은 상한 초과를 `Result::Err`로 전파한다.
+- 지원 범위는 `systemd-255-subset-v2`로 명시 — 시스템 매니저의 부분 집합.
 
 ## lens-build — 빌드 영향도
 
@@ -143,6 +147,8 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   `unresolved_includes`로 집계된다. `compute_impact`는 역방향 BFS로
   영향받는 TU를 반환(`ImpactReport`는 `scan_truncated`/`hint` 포함).
 - 스키마: `buildscope.snapshot/v4`, `buildscope.diff/v1`, `buildscope.impact/v1`.
+  순서가 바뀐 강제 include는 선택적 `forced_include_order.before/after`로
+  보존하며, 이 필드가 없는 기존 diff도 읽는다.
 
 ## lens-env — Python 환경 감사
 
@@ -153,6 +159,8 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
   `extra` 등, `and`/`or`/괄호, 버전 비교). 거짓 마커 요구는 스킵,
   `extra`는 `--extras`로 활성화한 것만 적용, 범위 불일치는
   `version_conflicts`, 평가 불가는 `unevaluated`.
+  PEP 440 파싱·정규화·버전 순서는 `pep440_rs`를 사용하고, 복합 pre/post/dev,
+  epoch, local, wildcard 비교는 PyPA 기준 fixture로 검증한다.
 - 섀도잉은 프로젝트 루트/`src/` 1레벨의 `.py`와 `__init__.py` 패키지
   디렉터리만 후보로 하고, 설치 패키지는 `top_level.txt`/`RECORD`의
   모듈명으로 비교한다(dist 이름이 아니라 import 이름 기준).

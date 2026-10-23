@@ -347,52 +347,66 @@ pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
 
     sort_sockets(&mut sockets);
 
-    let mut summary = NetSummary::default();
-    let mut listening = Vec::new();
-
-    for s in &sockets {
-        summary.total_sockets += 1;
-        // UDP has no LISTEN state: a bound UDP socket shows st=07 (CLOSE) with
-        // a wildcard remote endpoint, so detect listeners by remote == *:0.
-        let udp_listening = matches!(s.kind, SocketKind::Udp | SocketKind::Udp6)
-            && s.remote_port == 0
-            && s.local_port != 0
-            && (s.remote_address.is_empty()
-                || s.remote_address == "0.0.0.0"
-                || s.remote_address == "::");
-        match s.state {
-            TcpState::Listen => {
-                summary.listening_ports += 1;
-                listening.push(s.clone());
-            }
-            _ if udp_listening => {
-                summary.listening_ports += 1;
-                listening.push(s.clone());
-            }
-            TcpState::Established => summary.established_connections += 1,
-            TcpState::TimeWait => summary.time_wait_sockets += 1,
-            _ => {}
-        }
-        if s.kind == SocketKind::UnixStream || s.kind == SocketKind::UnixDgram {
-            summary.unix_domain_sockets += 1;
-        }
-        // inode 0 sockets are kernel-owned (e.g. TIME_WAIT) — not orphans.
-        if s.process.is_none() {
-            match s.owner_state {
-                Some(OwnerState::Orphan) => summary.orphan_sockets += 1,
-                Some(OwnerState::OwnerUnknown) => summary.owner_unknown_sockets += 1,
-                None => {}
-            }
-        }
-    }
-    summary.uninspectable_processes = proc_scan.uninspectable_count;
-
-    Ok(NetReport {
+    let mut report = NetReport {
         schema_version: crate::model::REPORT_SCHEMA_V1.to_string(),
-        summary,
+        summary: NetSummary {
+            uninspectable_processes: proc_scan.uninspectable_count,
+            ..Default::default()
+        },
         sockets,
-        listening,
-    })
+        listening: Vec::new(),
+    };
+    report.refresh_summary();
+    Ok(report)
+}
+
+impl NetReport {
+    /// Recompute every socket-derived count and listener from the current set.
+    /// Process inspection coverage is independent of the socket filter.
+    pub fn refresh_summary(&mut self) {
+        let mut summary = NetSummary {
+            uninspectable_processes: self.summary.uninspectable_processes,
+            ..Default::default()
+        };
+        let mut listening = Vec::new();
+        for s in &self.sockets {
+            summary.total_sockets += 1;
+            // UDP has no LISTEN state: a bound UDP socket shows st=07 (CLOSE) with
+            // a wildcard remote endpoint, so detect listeners by remote == *:0.
+            let udp_listening = matches!(s.kind, SocketKind::Udp | SocketKind::Udp6)
+                && s.remote_port == 0
+                && s.local_port != 0
+                && (s.remote_address.is_empty()
+                    || s.remote_address == "0.0.0.0"
+                    || s.remote_address == "::");
+            match s.state {
+                TcpState::Listen => {
+                    summary.listening_ports += 1;
+                    listening.push(s.clone());
+                }
+                _ if udp_listening => {
+                    summary.listening_ports += 1;
+                    listening.push(s.clone());
+                }
+                TcpState::Established => summary.established_connections += 1,
+                TcpState::TimeWait => summary.time_wait_sockets += 1,
+                _ => {}
+            }
+            if s.kind == SocketKind::UnixStream || s.kind == SocketKind::UnixDgram {
+                summary.unix_domain_sockets += 1;
+            }
+            // inode 0 sockets are kernel-owned (e.g. TIME_WAIT) — not orphans.
+            if s.process.is_none() {
+                match s.owner_state {
+                    Some(OwnerState::Orphan) => summary.orphan_sockets += 1,
+                    Some(OwnerState::OwnerUnknown) => summary.owner_unknown_sockets += 1,
+                    None => {}
+                }
+            }
+        }
+        self.summary = summary;
+        self.listening = listening;
+    }
 }
 
 #[cfg(test)]

@@ -1,9 +1,7 @@
 use crate::model::{Diagnostic, OrderingEdge, SystemdUnit};
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-/// Specifier expansion context for a unit. `%u`/`%h` resolve against the
-/// unit's `User=` setting (default root), not unconditionally root.
+/// System-manager specifiers. `%u`/`%h` belong to the manager, not Service.User.
 #[derive(Debug, Clone)]
 struct SpecContext {
     unit_name: String,
@@ -15,37 +13,6 @@ struct SpecContext {
 }
 
 impl SpecContext {
-    fn for_unit(
-        unit_name: &str,
-        sections: &BTreeMap<String, BTreeMap<String, Vec<String>>>,
-    ) -> Self {
-        let (prefix, instance) = split_unit_name(unit_name);
-        let unit_name_without_suffix = strip_unit_suffix(unit_name).to_string();
-        let raw_user = sections
-            .get("Service")
-            .and_then(|s| s.get("User"))
-            .and_then(|v| v.last())
-            .cloned()
-            .unwrap_or_else(|| "root".to_string());
-        let mut ctx = SpecContext {
-            unit_name: unit_name.to_string(),
-            unit_name_without_suffix,
-            prefix,
-            instance,
-            user: raw_user,
-            home: String::new(),
-        };
-        // `User=` may itself contain specifiers (e.g. `User=%i`).
-        let user = expand_with(&ctx, &ctx.user.clone());
-        ctx.user = user;
-        ctx.home = if ctx.user == "root" {
-            "/root".to_string()
-        } else {
-            format!("/home/{}", ctx.user)
-        };
-        ctx
-    }
-
     fn minimal(unit_name: &str) -> Self {
         let (prefix, instance) = split_unit_name(unit_name);
         let unit_name_without_suffix = strip_unit_suffix(unit_name).to_string();
@@ -142,13 +109,6 @@ type UnitEntry = (usize, String, String, String);
 
 /// Raw entry with its source path for re-expanding across drop-in merges.
 type SourcedEntry = (usize, String, String, String, Option<String>);
-
-type RawEntryKey = (String, Option<String>, Vec<String>);
-
-thread_local! {
-    static RAW_UNIT_ENTRIES: RefCell<HashMap<RawEntryKey, Vec<SourcedEntry>>> =
-        RefCell::new(HashMap::new());
-}
 
 /// Parse physical content into ordered (line, section, key, raw_value) entries,
 /// handling line continuations and collecting syntax diagnostics.
@@ -251,8 +211,33 @@ fn unit_entries(content: &str, path: Option<&str>) -> (Vec<UnitEntry>, Vec<Diagn
     (entries, diagnostics)
 }
 
+fn is_dependency_key(key: &str) -> bool {
+    matches!(
+        key,
+        "Wants"
+            | "Requires"
+            | "Before"
+            | "After"
+            | "Requisite"
+            | "BindsTo"
+            | "PartOf"
+            | "Conflicts"
+            | "Upholds"
+    )
+}
+
+/// Keep template specifiers until an actual instance name is known. This
+/// makes template snapshots and independent parses self-contained.
+fn expand_for_unit(value: &str, name: &str) -> String {
+    if is_template_name(name) {
+        value.to_string()
+    } else {
+        expand_specifiers(value, name)
+    }
+}
+
 /// Apply one raw assignment to `sections`, honoring systemd `Key=` reset
-/// semantics: an empty value clears the key's accumulated values.
+/// semantics: empty non-dependency assignments clear accumulated values.
 fn apply_entry(
     sections: &mut BTreeMap<String, BTreeMap<String, Vec<String>>>,
     section: &str,
@@ -261,7 +246,9 @@ fn apply_entry(
 ) {
     let sec_map = sections.entry(section.to_string()).or_default();
     if value.is_empty() {
-        sec_map.remove(key);
+        if section != "Unit" || !is_dependency_key(key) {
+            sec_map.remove(key);
+        }
     } else {
         sec_map
             .entry(key.to_string())
@@ -332,8 +319,7 @@ fn expand_raw_entries(
         apply_entry(&mut raw_sections, sec, key, val);
     }
 
-    // Expand every stored value against the resolved context (including final User=).
-    let ctx = SpecContext::for_unit(unit_name, &raw_sections);
+    // Service.User does not change the system-manager expansion context.
     let mut sections: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     for sec_name in section_order {
         let raw_map = &raw_sections[&sec_name];
@@ -341,7 +327,7 @@ fn expand_raw_entries(
         for (k, vals) in raw_map {
             out_map.insert(
                 k.clone(),
-                vals.iter().map(|v| expand_with(&ctx, v)).collect(),
+                vals.iter().map(|v| expand_for_unit(v, unit_name)).collect(),
             );
         }
         sections.insert(sec_name, out_map);
@@ -352,10 +338,8 @@ fn expand_raw_entries(
         if sec != "Unit" || (key != "After" && key != "Before") {
             continue;
         }
-        let value = expand_with(&ctx, raw_val);
-        if value.is_empty() {
-            ordering_edges.retain(|e: &OrderingEdge| e.directive != *key);
-        } else {
+        let value = expand_for_unit(raw_val, unit_name);
+        if !value.is_empty() {
             for target in value.split_whitespace() {
                 ordering_edges.push(OrderingEdge {
                     directive: key.clone(),
@@ -372,56 +356,32 @@ fn expand_raw_entries(
 }
 
 pub(crate) fn instantiate_template(tpl: &SystemdUnit, instance_name: &str) -> SystemdUnit {
-    let key = (tpl.name.clone(), tpl.path.clone(), tpl.drop_ins.clone());
-    let cached_raw = RAW_UNIT_ENTRIES.with(|map| map.borrow().get(&key).cloned());
-    if let Some(sourced) = cached_raw {
-        let (sections, ordering_edges) = expand_raw_entries(instance_name, &sourced);
-        let mut inst = SystemdUnit {
-            name: instance_name.to_string(),
-            path: tpl.path.clone(),
-            sections,
-            wants: Vec::new(),
-            requires: Vec::new(),
-            before: Vec::new(),
-            after: Vec::new(),
-            exec_start: None,
-            drop_ins: tpl.drop_ins.clone(),
-            ordering_edges,
-            masked: tpl.masked,
-            alias_of: tpl.alias_of.clone(),
-            aliases: Vec::new(),
-            diagnostics: tpl.diagnostics.clone(),
-        };
-        refresh_derived(&mut inst);
-        return inst;
-    }
-
     let mut inst = tpl.clone();
     inst.name = instance_name.to_string();
-    for e in &mut inst.ordering_edges {
-        e.source = instance_name.to_string();
-        e.target = expand_specifiers(&e.target, instance_name);
+    for section in inst.sections.values_mut() {
+        for values in section.values_mut() {
+            for value in values {
+                *value = expand_specifiers(value, instance_name);
+            }
+        }
     }
-    inst.before = inst
-        .before
-        .iter()
-        .map(|t| expand_specifiers(t, instance_name))
-        .collect();
-    inst.after = inst
-        .after
-        .iter()
-        .map(|t| expand_specifiers(t, instance_name))
-        .collect();
-    inst.wants = inst
-        .wants
-        .iter()
-        .map(|t| expand_specifiers(t, instance_name))
-        .collect();
-    inst.requires = inst
-        .requires
-        .iter()
-        .map(|t| expand_specifiers(t, instance_name))
-        .collect();
+    for edge in &mut inst.ordering_edges {
+        edge.source = instance_name.to_string();
+        edge.target = expand_specifiers(&edge.target, instance_name);
+    }
+    for dependencies in [
+        &mut inst.before,
+        &mut inst.after,
+        &mut inst.wants,
+        &mut inst.requires,
+    ] {
+        for target in dependencies {
+            *target = expand_specifiers(target, instance_name);
+        }
+    }
+    inst.exec_start = inst
+        .exec_start
+        .map(|s| expand_specifiers(&s, instance_name));
     inst
 }
 
@@ -433,13 +393,6 @@ pub fn parse_unit_content(content: &str, unit_name: &str, path: Option<&str>) ->
         .collect();
 
     let (sections, ordering_edges) = expand_raw_entries(unit_name, &sourced);
-
-    RAW_UNIT_ENTRIES.with(|map| {
-        map.borrow_mut().insert(
-            (unit_name.to_string(), path.map(String::from), Vec::new()),
-            sourced,
-        );
-    });
 
     let mut unit = SystemdUnit {
         name: unit_name.to_string(),
@@ -461,80 +414,26 @@ pub fn parse_unit_content(content: &str, unit_name: &str, path: Option<&str>) ->
     unit
 }
 
-/// Merge a drop-in fragment into `base`, honoring positional `Key=` resets:
-/// an empty assignment clears the base's accumulated values for that key.
-/// When a drop-in overrides `User=`, `%u` and `%h` specifiers across the
-/// unit are re-expanded against the effective `User=`.
+/// Merge a drop-in fragment. Non-dependency settings support empty resets;
+/// dependencies are additive, including empty Before=/After= assignments.
 pub fn apply_drop_in(base: &mut SystemdUnit, drop_in_content: &str, drop_in_path: &str) {
-    let prev_key = (base.name.clone(), base.path.clone(), base.drop_ins.clone());
     base.drop_ins.push(drop_in_path.to_string());
-
     let (entries, diagnostics) = unit_entries(drop_in_content, Some(drop_in_path));
     base.diagnostics.extend(diagnostics);
-
-    let cached_raw = RAW_UNIT_ENTRIES.with(|map| map.borrow().get(&prev_key).cloned());
-    if let Some(mut sourced) = cached_raw.or_else(|| {
-        if base.sections.is_empty() && prev_key.2.is_empty() {
-            Some(Vec::new())
-        } else {
-            None
-        }
-    }) {
-        sourced.extend(
-            entries
-                .into_iter()
-                .map(|(line, sec, key, val)| (line, sec, key, val, Some(drop_in_path.to_string()))),
-        );
-        let (sections, ordering_edges) = expand_raw_entries(&base.name, &sourced);
-        base.sections = sections;
-        base.ordering_edges = ordering_edges;
-        refresh_derived(base);
-
-        let next_key = (base.name.clone(), base.path.clone(), base.drop_ins.clone());
-        RAW_UNIT_ENTRIES.with(|map| {
-            map.borrow_mut().insert(next_key, sourced);
-        });
-        return;
-    }
-
-    // Fallback for hand-constructed SystemdUnit instances not created via parse_unit_content.
-    let mut ctx = SpecContext::for_unit(&base.name, &base.sections);
-    for (_, sec, key, raw_val) in &entries {
-        if sec == "Service" && key == "User" {
-            let expanded = expand_with(&ctx, raw_val);
-            let effective = if expanded.is_empty() {
-                "root".to_string()
-            } else {
-                expanded
-            };
-            ctx.user = effective.clone();
-            ctx.home = if effective == "root" {
-                "/root".to_string()
-            } else {
-                format!("/home/{}", effective)
-            };
-        }
-    }
-
     for (line, sec, key, raw_val) in entries {
-        let value = expand_with(&ctx, &raw_val);
+        let value = expand_for_unit(&raw_val, &base.name);
         if sec == "Unit" && (key == "After" || key == "Before") {
-            if value.is_empty() {
-                base.ordering_edges.retain(|e| e.directive != key);
-            } else {
-                for target in value.split_whitespace() {
-                    base.ordering_edges.push(OrderingEdge {
-                        directive: key.clone(),
-                        source: base.name.clone(),
-                        target: target.to_string(),
-                        path: Some(drop_in_path.to_string()),
-                        line: Some(line),
-                    });
-                }
+            for target in value.split_whitespace() {
+                base.ordering_edges.push(OrderingEdge {
+                    directive: key.clone(),
+                    source: base.name.clone(),
+                    target: target.to_string(),
+                    path: Some(drop_in_path.to_string()),
+                    line: Some(line),
+                });
             }
         }
         apply_entry(&mut base.sections, &sec, &key, &value);
     }
-
     refresh_derived(base);
 }

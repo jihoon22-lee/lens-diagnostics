@@ -12,42 +12,6 @@ fn status_string(status: &InputStatus) -> String {
         .unwrap_or_else(|| format!("{:?}", status).to_lowercase())
 }
 
-/// Check whether a DWARF type name appears in any ABI-reachable / exported symbol
-/// surface (defined non-hidden symbol identity, demangled signature, or vtable).
-fn is_type_abi_exposed(type_name: &str, report: &ElfReport) -> bool {
-    let lower_type = type_name.to_lowercase();
-    let in_evidence = report
-        .evidence
-        .iter()
-        .filter(|s| s.defined && s.visibility != "HIDDEN" && s.visibility != "INTERNAL")
-        .any(|s| {
-            s.identity.to_lowercase().contains(&lower_type)
-                || s.demangled
-                    .as_ref()
-                    .is_some_and(|d| d.to_lowercase().contains(&lower_type))
-        });
-    if in_evidence {
-        return true;
-    }
-    if report
-        .abi
-        .symbols
-        .iter()
-        .any(|sym| sym.to_lowercase().contains(&lower_type))
-    {
-        return true;
-    }
-    if report
-        .abi
-        .vtables
-        .iter()
-        .any(|vt| vt.to_lowercase().contains(&lower_type))
-    {
-        return true;
-    }
-    false
-}
-
 pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
     let mut header_changes = Vec::new();
 
@@ -177,26 +141,19 @@ pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
         .iter()
         .filter_map(|t| parse_type_size(t))
         .collect();
-    let mut breaking_type_layout = false;
     let mut unclassified_type_layout = false;
     let mut type_layout_diags = Vec::new();
     for r_type in &right.abi.types {
         if let Some((name, r_sz)) = parse_type_size(r_type) {
             if let Some(&l_sz) = left_type_sizes.get(name) {
                 if l_sz != r_sz {
-                    if is_type_abi_exposed(name, left) || is_type_abi_exposed(name, right) {
-                        breaking_type_layout = true;
-                        type_layout_diags.push(format!(
-                            "ABI-exposed DWARF type layout changed: {} ({} -> {} bytes)",
-                            name, l_sz, r_sz
-                        ));
-                    } else {
-                        unclassified_type_layout = true;
-                        type_layout_diags.push(format!(
-                            "Unclassified DWARF type layout changed: {} ({} -> {} bytes)",
-                            name, l_sz, r_sz
-                        ));
-                    }
+                    // Names and byte sizes do not establish ABI reachability.
+                    // Private types can share substrings with exported C symbols.
+                    unclassified_type_layout = true;
+                    type_layout_diags.push(format!(
+                        "Unclassified DWARF type layout changed: {} ({} -> {} bytes)",
+                        name, l_sz, r_sz
+                    ));
                 }
             }
         }
@@ -232,7 +189,7 @@ pub fn diff_reports(left: &ElfReport, right: &ElfReport) -> DiffReport {
                 vtables_diff.removed.len()
             ));
         }
-        if breaking_attribute || breaking_type_layout {
+        if breaking_attribute {
             incompatible = true;
         }
         if unclassified_type_layout {

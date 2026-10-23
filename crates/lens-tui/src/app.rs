@@ -79,6 +79,7 @@ pub struct TuiApp {
     pub net_report: Option<NetReport>,
     pub net_selected: usize,
     pub sys_units: Vec<SystemdUnit>,
+    pub sys_error: Option<String>,
     pub sys_selected: usize,
     pub log_path: Option<PathBuf>,
     /// Explicit `--log` argument — beats the auto-detected candidates.
@@ -127,6 +128,7 @@ impl TuiApp {
             net_report: None,
             net_selected: 0,
             sys_units: Vec::new(),
+            sys_error: None,
             sys_selected: 0,
             log_path: None,
             log_override: log,
@@ -285,7 +287,16 @@ impl TuiApp {
             .iter()
             .map(PathBuf::from)
             .collect();
-        self.sys_units = lens_sys::load_units_merged(&dirs).into_values().collect();
+        match lens_sys::load_units_merged(&dirs) {
+            Ok(units) => {
+                self.sys_units = units.into_values().collect();
+                self.sys_error = None;
+            }
+            Err(error) => {
+                self.sys_units.clear();
+                self.sys_error = Some(error.to_string());
+            }
+        }
         if self.sys_selected >= self.sys_units.len() {
             self.sys_selected = 0;
         }

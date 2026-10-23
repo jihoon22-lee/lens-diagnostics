@@ -3,6 +3,7 @@ pub mod diff;
 pub mod loader;
 pub mod model;
 pub mod parser;
+mod resolve;
 
 pub use dag::{CyclePath, OrderingConstraint, OrderingGraph};
 pub use diff::diff_systemd;
@@ -87,7 +88,7 @@ ExecStart=/usr/bin/new-daemon --fast
         units.insert("b.service".to_string(), u2);
         units.insert("c.service".to_string(), u3);
 
-        let graph = OrderingGraph::build(&units);
+        let graph = OrderingGraph::build(&units).unwrap();
         let cycles = graph.find_cycles();
 
         assert_eq!(cycles.len(), 1);
@@ -123,7 +124,7 @@ ExecStart=/usr/bin/new-daemon --fast
             ),
         );
 
-        let graph = OrderingGraph::build(&units);
+        let graph = OrderingGraph::build(&units).unwrap();
         let paths = graph.find_cycle_paths();
         assert_eq!(paths.len(), 1);
         let edges = &paths[0].edges;
@@ -192,7 +193,7 @@ ExecStart=/usr/bin/new-daemon --fast
             parse_unit_content("[Unit]\nAfter=dbus-org.c.service\n", "d.service", None),
         );
 
-        let graph = OrderingGraph::build(&units);
+        let graph = OrderingGraph::build(&units).unwrap();
         assert!(!graph.all_nodes.contains("b.service"));
         assert!(!graph.all_nodes.contains("tpl@.service"));
         assert!(!graph.all_nodes.contains("dbus-org.c.service"));
@@ -316,7 +317,7 @@ ExecStart=/usr/bin/new-daemon --fast
     }
 
     #[test]
-    fn test_s02_specifiers_dropin_user_reexpansion_and_template_graph() {
+    fn test_manager_specifiers_ignore_service_user_and_template_graph() {
         let base_content = "[Unit]\nDescription=%n vs %N\n[Service]\nExecStart=/bin/run --user=%u --home=%h --base=%N --full=%n\n";
         let mut unit = parse_unit_content(base_content, "foo@bar.service", None);
         assert_eq!(
@@ -324,11 +325,11 @@ ExecStart=/usr/bin/new-daemon --fast
             Some("/bin/run --user=root --home=/root --base=foo@bar --full=foo@bar.service")
         );
 
-        // Drop-in overriding User= must re-expand %u and %h in base unit directives.
+        // Service.User must not change the system-manager %u/%h specifiers.
         apply_drop_in(&mut unit, "[Service]\nUser=daemon_user\n", "/etc/foo.conf");
         assert_eq!(
             unit.exec_start.as_deref(),
-            Some("/bin/run --user=daemon_user --home=/home/daemon_user --base=foo@bar --full=foo@bar.service")
+            Some("/bin/run --user=root --home=/root --base=foo@bar --full=foo@bar.service")
         );
 
         // Template instance referenced in ordering graph resolves via foo@.service template.
@@ -342,7 +343,7 @@ ExecStart=/usr/bin/new-daemon --fast
             parse_unit_content("[Unit]\nBefore=app.service\n", "worker@.service", None),
         );
 
-        let graph = OrderingGraph::build(&units);
+        let graph = OrderingGraph::build(&units).unwrap();
         let cycles = graph.find_cycles();
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0], vec!["app.service", "worker@1.service"]);
@@ -366,7 +367,7 @@ ExecStart=/usr/bin/new-daemon --fast
             "b@.service".to_string(),
             parse_unit_content("[Unit]\nBefore=app.service\n", "b@.service", None),
         );
-        let cycles = OrderingGraph::build(&units).find_cycles();
+        let cycles = OrderingGraph::build(&units).unwrap().find_cycles();
         assert_eq!(
             cycles.len(),
             1,
@@ -381,7 +382,7 @@ ExecStart=/usr/bin/new-daemon --fast
     #[test]
     fn test_growing_template_instances_terminate() {
         // a@.service -> a@%i-x.service never reaches a fixpoint on its own;
-        // the round cap must bound it instead of looping forever.
+        // expansion must report its limit instead of silently returning a partial graph.
         let mut units = BTreeMap::new();
         units.insert(
             "app.service".to_string(),
@@ -391,7 +392,9 @@ ExecStart=/usr/bin/new-daemon --fast
             "a@.service".to_string(),
             parse_unit_content("[Unit]\nBefore=a@%i-x.service\n", "a@.service", None),
         );
-        let graph = OrderingGraph::build(&units);
-        assert!(graph.all_nodes.len() < 200);
+        assert!(matches!(
+            OrderingGraph::build(&units),
+            Err(lens_core::LensError::LimitExceeded { .. })
+        ));
     }
 }

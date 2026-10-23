@@ -1,4 +1,4 @@
-use crate::model::{BuildDiff, ParsedUnit, UnitDiff, DIFF_SCHEMA_V1};
+use crate::model::{BuildDiff, IncludeOrderChange, ParsedUnit, UnitDiff, DIFF_SCHEMA_V1};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn diff_compilations(baseline: &[ParsedUnit], candidate: &[ParsedUnit]) -> BuildDiff {
@@ -39,7 +39,12 @@ pub fn diff_compilations(baseline: &[ParsedUnit], candidate: &[ParsedUnit]) -> B
                     }
                 }
 
-                if b.forced_includes != c.forced_includes {
+                let forced_include_order =
+                    (b.forced_includes != c.forced_includes).then(|| IncludeOrderChange {
+                        before: b.forced_includes.clone(),
+                        after: c.forced_includes.clone(),
+                    });
+                if forced_include_order.is_some() {
                     for fi in &b.forced_includes {
                         base_flags.insert(format!("-include {fi}"));
                     }
@@ -83,6 +88,7 @@ pub fn diff_compilations(baseline: &[ParsedUnit], candidate: &[ParsedUnit]) -> B
                     || !removed_defines.is_empty()
                     || !added_includes.is_empty()
                     || !removed_includes.is_empty()
+                    || forced_include_order.is_some()
                 {
                     modified_units.push(UnitDiff {
                         file: file.to_string(),
@@ -92,6 +98,7 @@ pub fn diff_compilations(baseline: &[ParsedUnit], candidate: &[ParsedUnit]) -> B
                         removed_defines,
                         added_includes,
                         removed_includes,
+                        forced_include_order,
                     });
                 }
             }
@@ -110,6 +117,44 @@ pub fn diff_compilations(baseline: &[ParsedUnit], candidate: &[ParsedUnit]) -> B
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_include_reordering_survives_parsing_and_json_roundtrip() {
+        let parsed = |headers: &[&str]| {
+            let mut arguments = vec!["cc".to_string(), "-c".into(), "main.c".into()];
+            for header in headers {
+                arguments.extend(["-include".to_string(), header.to_string()]);
+            }
+            crate::parse_command_entry(&crate::CompileCommandEntry {
+                directory: "/project".into(),
+                file: "main.c".into(),
+                command: None,
+                arguments: Some(arguments),
+                output: None,
+            })
+        };
+        let before = parsed(&["a.h", "b.h"]);
+        let after = parsed(&["b.h", "a.h"]);
+        let diff = diff_compilations(std::slice::from_ref(&before), &[after]);
+        assert_eq!(diff.modified_units.len(), 1);
+        let change = &diff.modified_units[0];
+        assert!(change.added_flags.is_empty());
+        assert!(change.removed_flags.is_empty());
+        let order = change.forced_include_order.as_ref().unwrap();
+        assert_eq!(order.before, ["a.h", "b.h"]);
+        assert_eq!(order.after, ["b.h", "a.h"]);
+        assert!(
+            diff_compilations(std::slice::from_ref(&before), std::slice::from_ref(&before))
+                .modified_units
+                .is_empty()
+        );
+        let mut json = serde_json::to_value(change).unwrap();
+        let restored: UnitDiff = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(&restored, change);
+        json.as_object_mut().unwrap().remove("forced_include_order");
+        let legacy: UnitDiff = serde_json::from_value(json).unwrap();
+        assert!(legacy.forced_include_order.is_none());
+    }
 
     #[test]
     fn test_diff_detects_standard_compiler_and_forced_includes() {

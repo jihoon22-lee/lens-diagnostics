@@ -44,6 +44,116 @@ fn ping_returns_empty_result() {
 }
 
 #[test]
+fn invalid_utf8_request_is_a_parse_error_and_next_ping_succeeds() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lens-mcp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"bad\":\"\xff\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["error"]["code"], -32700);
+    assert_eq!(responses[1]["id"], 2);
+    assert_eq!(responses[1]["result"], serde_json::json!({}));
+}
+
+#[test]
+fn template_expansion_limit_is_a_tool_error_and_server_stays_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("app.service"),
+        "[Unit]\nWants=a@x.service\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("a@.service"),
+        "[Unit]\nAfter=a@%i-x.service\n",
+    )
+    .unwrap();
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "lens_sys_cycles", "arguments": {"dir": dir.path()}}
+    })
+    .to_string();
+    let responses = roundtrip(&[&call, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#]);
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["result"]["isError"], true);
+    assert!(responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Resource limit exceeded"));
+    assert_eq!(responses[1]["result"], serde_json::json!({}));
+}
+
+#[test]
+#[cfg(unix)]
+fn synthesized_instance_dropins_obey_allow_root() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("app.service"),
+        "[Unit]\nWants=a@x.service\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("a@.service"),
+        "[Unit]\nDescription=template\n",
+    )
+    .unwrap();
+    std::fs::create_dir(root.path().join("a@x.service.d")).unwrap();
+    let external = outside.path().join("outside.conf");
+    std::fs::write(&external, "[Unit]\nDescription=must-not-be-read\n").unwrap();
+    std::os::unix::fs::symlink(external, root.path().join("a@x.service.d/override.conf")).unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"lens_sys_cycles","arguments":{"dir":root.path()}}})
+    .to_string();
+    let responses = roundtrip_with_args(&[&call], &["--allow-root", root.path().to_str().unwrap()]);
+    assert_eq!(responses[0]["result"]["isError"], true);
+    assert!(!responses[0].to_string().contains("must-not-be-read"));
+}
+
+#[test]
+fn request_byte_limit_recovers_after_split_utf8_and_complete_oversized_lines() {
+    const MAX: usize = 8 * 1024 * 1024;
+    let prefix = r#"{"jsonrpc":"2.0","id":1,"method":"ping","padding":""#;
+    let ping = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+    for suffix in ["가", "🚀"] {
+        let oversized = format!("{prefix}{}{suffix}\"}}", "x".repeat(MAX - prefix.len()));
+        let responses = roundtrip(&[&oversized, ping]);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], -32600);
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[1]["result"], serde_json::json!({}));
+    }
+    // The request including newline is MAX bytes; MAX+1 must also be rejected
+    // when the newline is the very last byte read by the capped reader.
+    for extra in [0, 1] {
+        let request = format!("{prefix}{}\"}}", "x".repeat(MAX - prefix.len() - 3 + extra));
+        let responses = roundtrip(&[&request, ping]);
+        assert_eq!(responses.len(), 2);
+        if extra == 0 {
+            assert_eq!(responses[0]["id"], 1);
+            assert!(responses[0].get("error").is_none());
+        } else {
+            assert_eq!(responses[0]["error"]["code"], -32600);
+        }
+        assert_eq!(responses[1]["id"], 2);
+    }
+}
+
+#[test]
 fn tool_failure_is_an_iserror_result() {
     // lens_disk_scan without the required "path" argument fails inside the
     // tool — the failure must come back as result.isError, not a JSON-RPC
