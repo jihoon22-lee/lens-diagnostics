@@ -861,7 +861,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lens-abi"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "cpp_demangle",
  "gimli",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "lens-build"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lens-core",
  "serde",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "lens-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "lens-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "flate2",
  "jiff",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "lens-disk"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lens-core",
  "libc",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "lens-env"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lens-core",
  "pep440_rs",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "lens-log"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "flate2",
  "jiff",
@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "lens-mcp"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lens-core",
  "lens-disk",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "lens-net"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lens-core",
  "serde",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "lens-ops"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "flate2",
  "lens-abi",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "lens-sys"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lens-core",
  "serde",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "lens-test"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lens-core",
  "quick-xml",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "lens-trace"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "lens-tui"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "clap",
  "crossterm",
