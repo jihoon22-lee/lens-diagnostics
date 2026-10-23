@@ -29,29 +29,29 @@ pub fn load_units(path: Option<&Path>) -> Result<BTreeMap<String, SystemdUnit>> 
                 .iter()
                 .map(PathBuf::from)
                 .collect();
-            Ok(lens_sys::load_units_merged(&dirs))
+            lens_sys::load_units_merged(&dirs)
         }
     }
 }
 
 /// Build a snapshot from units already loaded (units + cycles +
 /// flattened diagnostics).
-pub fn snapshot_from_units(units: BTreeMap<String, SystemdUnit>) -> SystemdSnapshot {
-    let graph = OrderingGraph::build(&units);
+pub fn snapshot_from_units(units: BTreeMap<String, SystemdUnit>) -> Result<SystemdSnapshot> {
+    let graph = OrderingGraph::build(&units)?;
     let diagnostics = unit_diagnostics(&units);
-    SystemdSnapshot {
+    Ok(SystemdSnapshot {
         schema: lens_sys::SNAPSHOT_SCHEMA_V1.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        semantics: "systemd-255-subset-v1".to_string(),
+        semantics: "systemd-255-subset-v2".to_string(),
         units,
         cycles: graph.find_cycles(),
         diagnostics,
-    }
+    })
 }
 
 /// Snapshot the systemd search path or an explicit unit directory.
 pub fn snapshot(path: Option<&Path>) -> Result<SystemdSnapshot> {
-    Ok(snapshot_from_units(load_units(path)?))
+    snapshot_from_units(load_units(path)?)
 }
 
 /// `sys diff` accepts either a saved snapshot JSON (schema-checked) or
@@ -59,7 +59,7 @@ pub fn snapshot(path: Option<&Path>) -> Result<SystemdSnapshot> {
 /// equivalent snapshot.
 pub fn snapshot_from(path: &Path) -> Result<SystemdSnapshot> {
     if path.is_dir() || crate::detect::has_unit_extension(path) {
-        return Ok(snapshot_from_units(lens_sys::load_units(path)?));
+        return snapshot_from_units(lens_sys::load_units(path)?);
     }
     json::read_json_schema(path, "schema", lens_sys::SNAPSHOT_SCHEMA_V1)
 }
@@ -100,7 +100,7 @@ pub struct CyclesResult {
 pub fn cycles(dir: Option<&Path>) -> Result<Report<CyclesResult>> {
     let units = load_units(dir)?;
     let diagnostics = unit_diagnostics(&units);
-    let graph = OrderingGraph::build(&units);
+    let graph = OrderingGraph::build(&units)?;
     let cycles = graph.find_cycle_paths();
     let cycle_msgs: Vec<String> = cycles.iter().map(|c| c.members.join(" -> ")).collect();
     let mut report = Report::new(CyclesResult {
@@ -154,6 +154,40 @@ pub fn diff_snapshots(s1: &SystemdSnapshot, s2: &SystemdSnapshot) -> Report<Syst
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expansion_failures_propagate_to_inspect_doctor_and_bundle_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        std::fs::write(units.join("app.service"), "[Unit]\nWants=a@x.service\n").unwrap();
+        std::fs::write(units.join("a@.service"), "[Unit]\nAfter=a@%i-x.service\n").unwrap();
+        assert!(matches!(
+            super::inspect(Some(&units)),
+            Err(lens_core::LensError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            crate::doctor::run(Some(dir.path()), None, Some(&units)),
+            Err(lens_core::LensError::LimitExceeded { .. })
+        ));
+        let log = dir.path().join("input.log");
+        std::fs::write(&log, "INFO fixture\n").unwrap();
+        let path = dir.path().join("partial.lens");
+        let report = crate::bundle::create(&crate::bundle::BundleRequest {
+            output: path.clone(),
+            sys: Some(units),
+            log: Some(log),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!report.complete);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("Resource limit exceeded")));
+        assert!(lens_core::verify_bundle_archive(&path).unwrap().is_valid);
+        assert!(lens_core::read_bundle_entry(&path, "reports/sys_snapshot.json").is_err());
+    }
+
     #[test]
     fn followup_all_supported_unit_suffixes_compare() {
         let dir = tempfile::tempdir().unwrap();

@@ -167,6 +167,8 @@ lens abi diff <baseline> <candidate> [--format text|json]
   미정의 import는 `imports`에 의존성 정보로 별도 집계(import만 바뀌면
   compatible), weak 심볼은 binding=`weak`로 표기. 버전 요구사항 변경,
   `Compatibility`(compatible/incompatible/uncertain) 3상태 판정.
+- DWARF 타입 크기만 달라지고 공개 ABI와의 연결을 입증하지 못하면
+  `uncertain`으로 보고한다. 타입명과 심볼명의 유사성만으로 비호환을 확정하지 않는다.
 
 ### 3. log — 로그 인덱싱·필터
 
@@ -272,17 +274,23 @@ lens sys diff <baseline> <candidate>   # 스냅샷 JSON 또는 유닛 디렉터�
 ```
 
 - `.d/` drop-in 병합(인스턴스 유닛은 템플릿 `foo@.service.d/`도 병합),
-  `Key=` 빈 값 리셋 의미론, `%u`/`%h` 등 specifier 확장.
+  합성 인스턴스 전용 drop-in도 적용. 같은 파일명은 우선순위로 선택하고
+  나머지는 파일명순으로 병합한다. `ExecStart=` 등 빈 값 리셋을 지원하되,
+  빈 `After=`/`Before=`/`Wants=`/`Requires=`는 의존성을 삭제하지 않는다.
+  `%u`/`%h`는 `User=`와 무관한 시스템 매니저의 `root`/`/root`다.
 - 전 suffix 지원(.service/.target/.socket/.timer/.mount/...).
 - Tarjan SCC로 순환 의존 탐지. 사이클은 실제 방향 경로로 보고하고 각
   엣지의 기원(`--Wants(a.service:12)-->`)을 표시. `/dev/null` masked
   유닛은 엣지 대상에서 제외, alias/템플릿 이름도 해석.
-- `diff`는 섹션의 모든 키를 비교(`User=` 추가 등). `servicelens.snapshot|
-  diff/v1` 출력.
+- `diff`는 섹션의 모든 키와 `.wants`/`.requires` 링크의 유효 의존성을 비교.
+  `servicelens.snapshot/v1`, `servicelens.diff/v1` 출력.
 - `inspect`/`cycles`의 경로를 생략하면 systemd 검색 경로를 우선순위
   병합해 로드한다(`/etc` → `/run` → `/usr/lib` → `/lib`, 상위가 하위를
   가리고 drop-in은 전 디렉터리에서 수집). 같은 병합 로더를 doctor와
   TUI Services 탭도 공유한다. 명시한 경로가 없으면 오류(exit 2).
+- 분석 상한(유닛 10,000개, 의존 참조 100,000개, 확장 깊이 32,
+  메타데이터 64 MiB) 초과는 명시적 오류로 반환한다. 번들에서는 해당
+  수집 항목을 생략하고 불완전 수집 진단을 남긴다.
 
 ### 7. build — 컴파일 데이터베이스 분석
 
@@ -298,6 +306,8 @@ lens build diff <baseline.json> <candidate.json> [--format text|json]
 - `-I`/`-isystem`/`-iquote`/`-idirafter` 순서 보존(첫 일치 우선),
   `-include`/`-imacros` 강제 인클루드, 주석 내 `#include` 무시,
   `..`/`./` 경로 정규화.
+- `diff`는 `-include` 순서만 바뀌어도 변경으로 보고하고,
+  `forced_include_order.before/after`에 원래 순서를 보존한다.
 - `impact`는 헤더의 전이 의존자(재컴파일 대상)를 계산. 상대 `--header`
   는 compile database 디렉터리와 각 엔트리의 `directory` 기준으로 해석돼
   어느 cwd에서도 동작한다. 그래프에 없는 헤더는 basename 유사 후보와
@@ -322,6 +332,8 @@ lens env diff <baseline> <candidate> [--format text|json]
   `--extras`로 활성화한 extra에서만 적용, 설치됐지만 범위를 벗어난
   버전은 `version_conflicts`로 보고, 평가 불가 마커는 `unevaluated`로
   missing과 구분해 보고. uv venv의 `version_info` 키도 인식.
+- PEP 440 복합 버전(`1.0rc1.dev1`, `1.0.post1.dev1`)도 구별하며,
+  해석할 수 없는 버전은 의존성 충족으로 처리하지 않는다.
 - `--project`: 로컬 소스가 site-packages 모듈을 가리는 import 섀도잉 탐지.
 
 ### 9. net — 소켓/포트 포렌식
@@ -333,7 +345,7 @@ lens net diff <baseline.json> <candidate.json> [--format text|json]
 
 - `/proc/net/{tcp,tcp6,udp,udp6,unix}` 파싱 + `/proc/*/fd` inode→PID 상관.
 - UDP 바인드 소켓도 리스너로 집계. unix 소켓은 Type/St 의미론 분리.
-  `--no-unix`는 unix 소켓을 출력에서 제외.
+  `--no-unix`는 unix 소켓을 제외하고 관련 요약·findings도 다시 계산한다.
 - 소유자 없는 소켓은 `owner_state`로 구분: `orphan`(inode를 검사했으나
   보유 프로세스 없음) vs `owner_unknown`(`/proc/<pid>/fd` 접근 거부로
   확인 불가 — 텍스트에서 `<owner unknown>`으로 표시, sudo 권장).
@@ -357,8 +369,11 @@ lens bundle extract incident.lens out/ [--force]
   수집 진단(diagnostics) 보존. 최소 1개 소스 필수.
 - `--log`는 요약 JSON 외에 원본 로그 내용을 `logs/<name>` 엔트리로
   포함한다(8 MiB 꼬리 상한, 절단 시 diagnostics에 기록).
+- `--redact`는 JSON 구조를 유지하며 디코딩된 값을 마스킹한다. 마스킹할
+  로그가 유효한 UTF-8이 아니면 원문을 포함하지 않고 수집 진단을 기록한다.
 - `verify`: 정확 경로의 매니페스트만 신뢰(중첩 스푸핑 차단), 중복/미등재
-  엔트리 거부, 해제 바이트 상한 적용. 매니페스트는 서명되지 않으므로
+  엔트리 거부, gzip CRC·트레일러 확인, 해제 바이트 상한 적용.
+  매니페스트는 서명되지 않으므로
   **무결성 확인이지 출처 인증이 아닙니다**. 무결성 불일치는 findings로
   exit 1(읽기 불가/손상 파일은 exit 2).
 - `show`는 `tar` 없이 개별 엔트리 내용을 출력. `extract`는 검증을

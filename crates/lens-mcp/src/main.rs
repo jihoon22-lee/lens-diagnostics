@@ -51,22 +51,24 @@ fn main() -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut reader = stdin.lock();
-    let mut line = String::new();
+    let mut line = Vec::new();
     const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
 
     loop {
         line.clear();
         let bytes_read = match (&mut reader)
             .take((MAX_REQUEST_LINE_BYTES + 1) as u64)
-            .read_line(&mut line)
+            .read_until(b'\n', &mut line)
         {
             Ok(0) => break,
             Ok(n) => n,
-            Err(_) => break,
+            Err(error) => return Err(error),
         };
-        if bytes_read > MAX_REQUEST_LINE_BYTES && !line.ends_with('\n') {
+        if bytes_read > MAX_REQUEST_LINE_BYTES {
             // Drain the rest of the oversized line so framing recovers without unbounded heap allocations.
-            let _ = drain_until_newline(&mut reader);
+            if !line.ends_with(b"\n") {
+                drain_until_newline(&mut reader)?;
+            }
             let err_resp = JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id: None,
@@ -83,12 +85,11 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
 
-        let parsed: Value = match serde_json::from_str(trimmed) {
+        let parsed: Value = match serde_json::from_slice(&line) {
             Ok(v) => v,
             Err(e) => {
                 let err_resp = JsonRpcResponse {

@@ -1,4 +1,4 @@
-//! PEP 508 environment-marker evaluation and PEP 440-ish version
+//! PEP 508 environment-marker evaluation and PEP 440 version
 //! specifier matching for `Requires-Dist` lines.
 //!
 //! Evaluation is three-state: a marker that references a variable we
@@ -418,20 +418,12 @@ fn compare_value(actual: &str, op: &str, expected: &str, version: bool) -> TriSt
         _ => {}
     }
 
-    if version && matches!(op, "==" | "===" | "!=") && expected.ends_with(".*") {
-        let prefix = &expected[..expected.len() - 2];
-        let is_match = actual == prefix || actual.starts_with(&format!("{}.", prefix));
-        return tri(if op == "!=" { !is_match } else { is_match });
+    if version || op == "~=" {
+        return version_satisfies(actual, &format!("{op}{expected}"))
+            .map(tri)
+            .unwrap_or(TriState::Unknown);
     }
-
-    let ord = if version {
-        match (version_key(actual), version_key(expected)) {
-            (Some(a), Some(b)) => compare_key(&a, &b),
-            _ => return TriState::Unknown,
-        }
-    } else {
-        actual.cmp(expected)
-    };
+    let ord = actual.cmp(expected);
     match op {
         "==" | "===" => tri(ord == Ordering::Equal),
         "!=" => tri(ord != Ordering::Equal),
@@ -439,18 +431,6 @@ fn compare_value(actual: &str, op: &str, expected: &str, version: bool) -> TriSt
         "<=" => tri(ord != Ordering::Greater),
         ">" => tri(ord == Ordering::Greater),
         ">=" => tri(ord != Ordering::Less),
-        "~=" => {
-            let Some(rel) = compatible_upper(expected) else {
-                return TriState::Unknown;
-            };
-            let upper_ok = match version_key(&rel) {
-                Some(u) => {
-                    compare_key(&version_key(actual).unwrap_or_default(), &u) == Ordering::Less
-                }
-                None => return TriState::Unknown,
-            };
-            tri(ord != Ordering::Less && upper_ok)
-        }
         _ => TriState::Unknown,
     }
 }
@@ -460,128 +440,6 @@ fn tri(b: bool) -> TriState {
         TriState::True
     } else {
         TriState::False
-    }
-}
-
-// --- version comparison (PEP 440: epoch, release segments, pre/dev/post suffixes) ---
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct VersionKey {
-    epoch: u64,
-    release: Vec<u64>,
-    /// Ordering within the same `(epoch, release)`:
-    /// -4 = dev, -3 = alpha (a), -2 = beta (b), -1 = rc/pre/c, 0 = final, 1 = post/rev/r
-    pre_rank: i8,
-    pre_num: u64,
-}
-
-fn parse_pre_suffix(s: &str) -> (i8, u64) {
-    let s = s.trim_start_matches(['.', '-', '_']).to_ascii_lowercase();
-    if s.is_empty() {
-        return (0, 0);
-    }
-    let prefixes: &[(&str, i8)] = &[
-        ("preview", -1),
-        ("alpha", -3),
-        ("beta", -2),
-        ("post", 1),
-        ("dev", -4),
-        ("pre", -1),
-        ("rev", 1),
-        ("rc", -1),
-        ("a", -3),
-        ("b", -2),
-        ("c", -1),
-        ("r", 1),
-    ];
-    for &(p, rank) in prefixes {
-        if let Some(rest) = s.strip_prefix(p) {
-            let rest = rest.trim_start_matches(['.', '-', '_']);
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            let num = digits.parse::<u64>().unwrap_or(0);
-            return (rank, num);
-        }
-    }
-    (0, 0)
-}
-
-/// Parse a PEP 440 version into `(epoch, release, pre_rank, pre_num)`.
-fn version_key(v: &str) -> Option<VersionKey> {
-    let v = v.trim().split('+').next()?;
-    let (epoch, rest) = if let Some((ep, r)) = v.split_once('!') {
-        (ep.trim().parse::<u64>().ok()?, r.trim())
-    } else {
-        (0, v)
-    };
-    let mut release = Vec::new();
-    let mut suffix_str = String::new();
-    let segments: Vec<&str> = rest.split('.').collect();
-    for (idx, seg) in segments.iter().enumerate() {
-        let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            if release.is_empty() {
-                return None;
-            }
-            suffix_str = segments[idx..].join(".");
-            break;
-        }
-        release.push(digits.parse::<u64>().ok()?);
-        let tail = &seg[digits.len()..];
-        if !tail.is_empty() {
-            if idx + 1 < segments.len() {
-                suffix_str = format!("{}.{}", tail, segments[idx + 1..].join("."));
-            } else {
-                suffix_str = tail.to_string();
-            }
-            break;
-        }
-    }
-    if release.is_empty() {
-        return None;
-    }
-    let (pre_rank, pre_num) = parse_pre_suffix(&suffix_str);
-    Some(VersionKey {
-        epoch,
-        release,
-        pre_rank,
-        pre_num,
-    })
-}
-
-fn compare_key(a: &VersionKey, b: &VersionKey) -> Ordering {
-    match a.epoch.cmp(&b.epoch) {
-        Ordering::Equal => {}
-        o => return o,
-    }
-    for i in 0..a.release.len().max(b.release.len()) {
-        let x = a.release.get(i).copied().unwrap_or(0);
-        let y = b.release.get(i).copied().unwrap_or(0);
-        match x.cmp(&y) {
-            Ordering::Equal => continue,
-            o => return o,
-        }
-    }
-    (a.pre_rank, a.pre_num).cmp(&(b.pre_rank, b.pre_num))
-}
-
-/// `~=V` upper bound: drop the last release segment and bump the
-/// previous one (`~=3.1.2` -> `<3.2`, `~=3.1` -> `<4`).
-fn compatible_upper(v: &str) -> Option<String> {
-    let key = version_key(v)?;
-    if key.release.len() < 2 {
-        return None;
-    }
-    let mut up = key.release[..key.release.len() - 1].to_vec();
-    *up.last_mut()? += 1;
-    let rel = up
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(".");
-    if key.epoch > 0 {
-        Some(format!("{}!{}", key.epoch, rel))
-    } else {
-        Some(rel)
     }
 }
 
@@ -689,61 +547,71 @@ pub fn version_satisfies(installed: &str, spec: &str) -> Option<bool> {
     if spec.is_empty() {
         return Some(true);
     }
+    let version = installed.parse::<pep440_rs::Version>().ok();
+    let mut matched = true;
     for clause in spec.split(',') {
-        let clause = clause.trim();
-        if clause.is_empty() {
-            continue;
+        let (op, expected) = split_op(clause.trim())?;
+        if expected.is_empty() {
+            return None;
         }
-        let (op, ver) = split_op(clause)?;
-        let ok = match op {
-            "===" => Some(installed == ver),
-            "==" => Some(version_eq(installed, ver)),
-            "!=" => Some(!version_eq(installed, ver)),
-            "~=" => {
-                let upper = compatible_upper(ver)?;
-                match (
-                    version_key(installed),
-                    version_key(ver),
-                    version_key(&upper),
-                ) {
-                    (Some(i), Some(v), Some(u)) => Some(
-                        compare_key(&i, &v) != Ordering::Less
-                            && compare_key(&i, &u) == Ordering::Less,
-                    ),
-                    _ => None,
-                }
-            }
-            ">=" | "<=" | ">" | "<" => match (version_key(installed), version_key(ver)) {
-                (Some(i), Some(v)) => {
-                    let ord = compare_key(&i, &v);
-                    Some(match op {
-                        ">=" => ord != Ordering::Less,
-                        "<=" => ord != Ordering::Greater,
-                        ">" => ord == Ordering::Greater,
-                        _ => ord == Ordering::Less,
-                    })
-                }
-                _ => None,
-            },
-            _ => return None,
+        let satisfies = if op == "===" {
+            // Arbitrary equality must also support non-PEP-440 vendor strings.
+            installed.eq_ignore_ascii_case(expected)
+        } else {
+            let specifier = format!("{op}{expected}")
+                .parse::<pep440_rs::VersionSpecifier>()
+                .ok()?;
+            matches_specifier(version.as_ref()?, &specifier)
         };
-        match ok {
-            Some(true) => {}
-            Some(false) => return Some(false),
-            None => return None,
-        }
+        // Validate every clause even after one mismatches: malformed evidence
+        // must not masquerade as a known version conflict.
+        matched &= satisfies;
     }
-    Some(true)
+    Some(matched)
 }
 
-fn version_eq(a: &str, b: &str) -> bool {
-    if let Some(prefix) = b.strip_suffix(".*") {
-        a == prefix || a.starts_with(&format!("{}.", prefix))
-    } else {
-        match (version_key(a), version_key(b)) {
-            (Some(x), Some(y)) => compare_key(&x, &y) == Ordering::Equal,
-            _ => a == b,
+/// Use the library's complete version parser and ordering, with PEP 440's
+/// specifier rules applied explicitly. In pep440_rs 0.7.3, `contains` rejects
+/// same-release prereleases even for prerelease `<` bounds, and wildcard
+/// matching does not zero-pad short candidate release segments.
+fn matches_specifier(version: &pep440_rs::Version, spec: &pep440_rs::VersionSpecifier) -> bool {
+    use pep440_rs::Operator;
+
+    let bound = spec.version();
+    let public = version.clone().without_local();
+    let candidate = if bound.is_local() { version } else { &public };
+    let prefix_matches = |prefix: &[u64]| {
+        version.epoch() == bound.epoch()
+            && prefix
+                .iter()
+                .enumerate()
+                .all(|(i, part)| version.release().get(i).copied().unwrap_or(0) == *part)
+    };
+    let same_base = version.epoch() == bound.epoch()
+        && (0..version.release().len().max(bound.release().len())).all(|i| {
+            version.release().get(i).copied().unwrap_or(0)
+                == bound.release().get(i).copied().unwrap_or(0)
+        });
+    match spec.operator() {
+        Operator::Equal => candidate == bound,
+        Operator::NotEqual => candidate != bound,
+        Operator::EqualStar => prefix_matches(bound.release()),
+        Operator::NotEqualStar => !prefix_matches(bound.release()),
+        Operator::TildeEqual => {
+            candidate >= bound && prefix_matches(&bound.release()[..bound.release().len() - 1])
         }
+        Operator::LessThan => {
+            candidate < bound && !(!bound.any_prerelease() && version.any_prerelease() && same_base)
+        }
+        Operator::GreaterThan => {
+            candidate > bound
+                && !(!bound.is_post() && version.is_post() && same_base)
+                && !(version.is_local() && same_base)
+        }
+        Operator::LessThanEqual => candidate <= bound,
+        Operator::GreaterThanEqual => candidate >= bound,
+        #[allow(deprecated)]
+        Operator::ExactEqual => unreachable!("arbitrary equality uses the original strings"),
     }
 }
 
@@ -775,6 +643,64 @@ fn split_op(clause: &str) -> Option<(&'static str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pep440_matches_pypa_reference_matrix() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/pep440-reference.json")).unwrap();
+        let versions = fixture["versions"].as_array().unwrap();
+        let specifiers = fixture["specifiers"].as_array().unwrap();
+        let matches = fixture["matches"].as_array().unwrap();
+        assert_eq!(versions.len(), matches.len());
+        for (version, expected) in versions.iter().zip(matches) {
+            let version = version.as_str().unwrap();
+            let expected = expected.as_str().unwrap();
+            assert_eq!(specifiers.len(), expected.len());
+            for (spec, expected) in specifiers.iter().zip(expected.bytes()) {
+                let spec = spec.as_str().unwrap();
+                assert_eq!(
+                    version_satisfies(version, spec),
+                    Some(expected == b'1'),
+                    "{version} {spec}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compound_versions_match_installed_version_specifier_semantics() {
+        // Expected results cross-checked against Python packaging with
+        // prereleases=True: these are installed versions, not index candidates.
+        for (installed, spec, expected) in [
+            ("1.0rc1.dev1", "==1.0rc1", false),
+            ("1.0rc1.dev1", "<1.0rc1", true),
+            ("1.0rc1", "==1.0rc1", true),
+            ("1.0.post1.dev1", "==1.0.post1", false),
+            ("1.0.post1.dev1", "<1.0.post1", false),
+            ("1.0.post1.dev1", "<=1.0.post1", true),
+            ("1.0rc1", "<1.0", false),
+            ("1.0rc1", "<2.0", true),
+            ("1!0.2", ">=1!0.1,<1!1.0", true),
+            ("1.0+local", "==1.0", true),
+            ("1.0+local", "==1.0+other", false),
+            ("1.0rc1", "==1.*", true),
+            ("vendor-build", "===vendor-build", true),
+        ] {
+            assert_eq!(
+                version_satisfies(installed, spec),
+                Some(expected),
+                "{installed} {spec}"
+            );
+        }
+        assert_eq!(version_satisfies("1.0rc1.nonsense", "==1.0rc1"), None);
+        assert_eq!(version_satisfies("1.0", "<0.5,not-a-specifier"), None);
+        assert_eq!(version_satisfies("1.0", "=="), None);
+        let env = MarkerEnv::for_venv("3.14.0rc1.dev1", &[]);
+        assert_eq!(
+            evaluate_marker("python_full_version == '3.14.0rc1'", &env),
+            TriState::False
+        );
+    }
 
     fn env() -> MarkerEnv {
         MarkerEnv::for_venv("3.14.4", &[])
@@ -964,7 +890,8 @@ mod tests {
         assert_eq!(version_satisfies("1.0.0.dev1", "<1.0.0a1"), Some(true));
         assert_eq!(version_satisfies("1.0.0a1", "<1.0.0b1"), Some(true));
         assert_eq!(version_satisfies("1.0.0b1", "<1.0.0rc1"), Some(true));
-        assert_eq!(version_satisfies("1.0.0rc1", "<1.0.0"), Some(true));
+        // Exclusive final-release bounds exclude prereleases of that release.
+        assert_eq!(version_satisfies("1.0.0rc1", "<1.0.0"), Some(false));
         assert_eq!(version_satisfies("1.0.0", "<1.0.0.post1"), Some(true));
     }
 

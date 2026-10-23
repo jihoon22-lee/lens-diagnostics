@@ -17,8 +17,7 @@ pub fn inspect(proc_dir: Option<&Path>, no_unix: bool) -> Result<Report<NetRepor
                 lens_net::SocketKind::UnixStream | lens_net::SocketKind::UnixDgram
             )
         });
-        net.summary.total_sockets = net.sockets.len();
-        net.summary.unix_domain_sockets = 0;
+        net.refresh_summary();
     }
     let mut report = Report::new(net);
     if report.data.summary.orphan_sockets > 0 {
@@ -77,4 +76,36 @@ pub fn diff_values(b: &NetReport, c: &NetReport) -> Report<NetDiffReport> {
         );
     }
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluding_unix_sockets_also_excludes_their_findings_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = dir.path().join("net");
+        std::fs::create_dir(&net).unwrap();
+        std::fs::write(net.join("tcp"), "header\n").unwrap();
+        std::fs::write(net.join("unix"), "Num RefCount Protocol Flags Type St Inode Path\n0000000000000000: 00000002 00000000 00010000 0001 01 123456 /tmp/test.sock\n").unwrap();
+        let unfiltered = inspect(Some(dir.path()), false).unwrap();
+        assert_eq!(unfiltered.data.summary.orphan_sockets, 1);
+        assert!(unfiltered.is_actionable(Severity::Warn));
+        let filtered = inspect(Some(dir.path()), true).unwrap();
+        assert!(filtered.data.sockets.is_empty());
+        assert!(filtered.data.listening.is_empty());
+        assert_eq!(filtered.data.summary.total_sockets, 0);
+        assert_eq!(filtered.data.summary.unix_domain_sockets, 0);
+        assert_eq!(filtered.data.summary.orphan_sockets, 0);
+        assert_eq!(filtered.data.summary.owner_unknown_sockets, 0);
+        assert!(!filtered.is_actionable(Severity::Warn));
+
+        let mut report = unfiltered.data;
+        report.summary.uninspectable_processes = 3;
+        report.sockets.clear();
+        report.refresh_summary();
+        assert_eq!(report.summary.uninspectable_processes, 3);
+        assert_eq!(report.summary.orphan_sockets, 0);
+    }
 }

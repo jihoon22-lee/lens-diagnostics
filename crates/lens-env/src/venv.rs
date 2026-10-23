@@ -238,6 +238,29 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[test]
+    fn installed_development_release_does_not_satisfy_exact_rc_requirement() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("pyvenv.cfg"), "version = 3.11.0\n").unwrap();
+        let site = root.path().join("lib/python3.11/site-packages");
+        for (name, version, extra) in [
+            ("app", "1.0", "Requires-Dist: dep ==1.0rc1\n"),
+            ("dep", "1.0rc1.dev1", ""),
+        ] {
+            let info = site.join(format!("{name}-{version}.dist-info"));
+            fs::create_dir_all(&info).unwrap();
+            fs::write(
+                info.join("METADATA"),
+                format!("Name: {name}\nVersion: {version}\n{extra}"),
+            )
+            .unwrap();
+        }
+        let venv = inspect_venv(root.path(), &[]).unwrap();
+        assert_eq!(venv.version_conflicts.len(), 1);
+        assert!(venv.version_conflicts[0].contains("1.0rc1.dev1"));
+        assert!(venv.unevaluated_dependencies.is_empty());
+    }
+
     /// Build a minimal venv fixture: pyvenv.cfg + one dist-info per
     /// (name, version, requires) tuple.
     fn make_venv(cfg: &str, dists: &[(&str, &str, &[&str])]) -> tempfile::TempDir {

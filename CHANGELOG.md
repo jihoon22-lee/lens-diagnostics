@@ -4,6 +4,19 @@ Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.
 
 ## Unreleased
 
+### 수정
+
+- 번들 JSON을 디코딩된 값 기준으로 마스킹해 이스케이프된 비밀값 유출과 JSON 손상을 막는다. UTF-8이 잘못된 로그는 마스킹 번들에서 생략하고 불완전 수집으로 보고한다.
+- tar 종료 후에도 gzip 디코더를 상한 내에서 끝까지 읽어 CRC 손상과 잘린 트레일러를 거부한다.
+- systemd 템플릿 확장에 유닛·참조·깊이·이름·메타데이터 상한을 적용하고 CLI/doctor/MCP/TUI/번들에 오류를 전파한다. 합성 인스턴스에도 전용 drop-in과 검색 경로 우선순위를 적용한다.
+- systemd 의존성의 빈 할당이 기존 관계를 지우지 않도록 수정하고, `%u`/`%h`를 `User=`와 무관한 시스템 매니저 기준으로 확장한다. `.wants`/`.requires` 링크 변경도 diff에 반영한다(`systemd-255-subset-v2`).
+- MCP 요청 한도를 바이트 단위로 판정해 한글·이모지 경계의 초과 요청과 잘못된 UTF-8 요청 이후에도 다음 요청을 처리한다.
+- Linux `close_range`의 UNSHARE=2/CLOEXEC=4 플래그를 숫자·기호 표기에서 동일하게 해석한다.
+- PEP 440의 복합 pre/post/dev 버전과 epoch/local/wildcard 비교를 수정한다. PyPA 기준 2,376개 비교 fixture를 추가한다.
+- 이름 부분일치만으로 DWARF 타입의 공개 ABI 노출을 확정하지 않는다. 노출 관계를 입증하지 못한 크기 변경은 `uncertain`으로 보고한다.
+- 강제 include의 순서 변경을 선택적 `forced_include_order.before/after`로 보고한다. `--no-unix` 필터 후에는 소켓 요약과 findings를 다시 계산한다.
+- 스냅샷 회귀 테스트에 명시적 로그 fixture를 사용해 호스트 로그 크기에 따른 실패를 제거한다.
+
 ## 0.8.0
 
 전수 코드 리뷰 결함 수정·리팩토링 및 포렌식 플랫폼 기능 고도화 릴리스: 제로-클론 결정론적 JSON 직렬화, 제로-할당 UTF-8 글로브 엔진, FIFO/심볼릭링크 샌드박스 보안 강화, PII/시크릿 마스킹 엔진(`--redact`), 도메인 분석기(test, trace, sys, build, env, net) 전수 결함 수정 및 CLI/TUI/MCP 사용성 개선.

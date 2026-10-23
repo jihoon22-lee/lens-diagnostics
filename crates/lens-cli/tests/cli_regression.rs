@@ -2578,11 +2578,15 @@ fn snapshot_collects_host_net_sys_doctor_and_verifies() {
     let dir = tmp_dir("snapshot");
     let units = unit_dir("snapshot-units", false);
     let out_path = dir.join("s.lens");
+    let log = dir.join("fixture.log");
+    std::fs::write(&log, "INFO snapshot fixture\n").unwrap();
 
     let out = lens(&[
         "snapshot",
         "-o",
         out_path.to_str().unwrap(),
+        "--log",
+        log.to_str().unwrap(),
         "--procfs",
         "/proc",
         "--systemd-dir",

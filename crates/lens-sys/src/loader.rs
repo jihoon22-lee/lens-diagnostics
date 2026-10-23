@@ -5,7 +5,7 @@
 //! lexicographic filename order (later files override earlier ones).
 
 use crate::model::{Diagnostic, SystemdUnit};
-use crate::parser::{apply_drop_in, parse_unit_content};
+use crate::parser::{apply_drop_in, instantiate_template, parse_unit_content, template_name_of};
 use lens_core::{LensError, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,50 +38,36 @@ pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
         .and_then(|n| n.to_str())
         .unwrap_or("unit")
         .to_string();
-    let content = lens_core::read_policy::read_to_string(path).map_err(|e| LensError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let mut unit = parse_unit_content(&content, &name, Some(&path.to_string_lossy()));
+    load_named_unit(path, &name, &[path.parent().unwrap_or(Path::new("."))])
+}
 
-    // systemd precedence: for an instance `foo@bar.service`, template-level
-    // `foo@.service.d/*.conf` merges first, then `foo@bar.service.d/*.conf`.
-    for drop_dir in drop_in_dirs(path, &name) {
-        if !lens_core::read_policy::metadata(&drop_dir).is_ok_and(|m| m.is_dir()) {
-            continue;
-        }
-        let mut confs: Vec<PathBuf> = match lens_core::read_policy::read_dir(&drop_dir) {
-            Ok(rd) => rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().map(|x| x == "conf").unwrap_or(false))
-                .collect(),
-            Err(e) => {
-                unit.diagnostics.push(Diagnostic {
-                    code: "DROPIN_UNREADABLE".to_string(),
-                    severity: "warning".to_string(),
-                    message: format!("cannot list {}: {}", drop_dir.display(), e),
-                    path: Some(drop_dir.to_string_lossy().into_owned()),
-                    line: None,
-                });
-                Vec::new()
-            }
-        };
-        confs.sort();
-        for conf in confs {
-            match lens_core::read_policy::read_to_string(&conf) {
-                Ok(c) => apply_drop_in(&mut unit, &c, &conf.to_string_lossy()),
-                Err(e) => unit.diagnostics.push(Diagnostic {
-                    code: "DROPIN_UNREADABLE".to_string(),
-                    severity: "warning".to_string(),
-                    message: format!("cannot read {}: {}", conf.display(), e),
-                    path: Some(conf.to_string_lossy().into_owned()),
-                    line: None,
-                }),
-            }
-        }
-    }
+fn load_named_unit(path: &Path, name: &str, dirs: &[impl AsRef<Path>]) -> Result<SystemdUnit> {
+    let content = lens_core::read_policy::read_to_string(path).map_err(|source| LensError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut unit = parse_unit_content(&content, name, Some(&path.to_string_lossy()));
+    apply_merged_drop_ins(&mut unit, dirs, name);
     Ok(unit)
+}
+
+fn resolve_loaded_instances(
+    units: &mut BTreeMap<String, SystemdUnit>,
+    dirs: &[impl AsRef<Path>],
+) -> Result<()> {
+    crate::resolve::expand_instances(units, |template, name| {
+        let mut instance = if let Some(path) = &template.path {
+            load_named_unit(Path::new(path), name, dirs)?
+        } else {
+            let mut instance = instantiate_template(template, name);
+            apply_merged_drop_ins(&mut instance, dirs, name);
+            instance
+        };
+        for dir in dirs.iter().rev() {
+            apply_unit_dep_dirs(dir.as_ref(), &mut instance);
+        }
+        Ok(instance)
+    })
 }
 
 /// Load every unit under `path` — either a single file or a directory of
@@ -234,6 +220,12 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
             target.aliases.push(alias_name);
         }
     }
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(Path::new("."))
+    };
+    resolve_loaded_instances(&mut units, &[dir])?;
     flag_missing_references(&mut units);
     Ok(units)
 }
@@ -322,7 +314,9 @@ fn drop_in_dirs(unit_path: &Path, unit_name: &str) -> Vec<PathBuf> {
         if let Some(dot) = unit_name.rfind('.') {
             if at < dot {
                 let template = format!("{}@{}.d", &unit_name[..at], &unit_name[dot..]);
-                dirs.push(parent.join(template));
+                if template != format!("{unit_name}.d") {
+                    dirs.push(parent.join(template));
+                }
             }
         }
     }
@@ -351,7 +345,7 @@ fn unit_name_of(path: &Path) -> Option<String> {
 
 /// Load all drop-in `*.conf` for `unit_name` from `dir` (template level
 /// first, instance level last), returning them sorted by filename.
-fn drop_in_confs(dir: &Path, unit_name: &str) -> Vec<PathBuf> {
+fn drop_in_confs(dir: &Path, unit_name: &str, diagnostics: &mut Vec<Diagnostic>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let unit_path = dir.join(unit_name);
     for drop_dir in drop_in_dirs(&unit_path, unit_name) {
@@ -364,7 +358,16 @@ fn drop_in_confs(dir: &Path, unit_name: &str) -> Vec<PathBuf> {
                 .map(|e| e.path())
                 .filter(|p| p.extension().map(|x| x == "conf").unwrap_or(false))
                 .collect(),
-            Err(_) => Vec::new(),
+            Err(error) => {
+                diagnostics.push(Diagnostic {
+                    code: "DROPIN_UNREADABLE".to_string(),
+                    severity: "warning".to_string(),
+                    message: format!("cannot list {}: {error}", drop_dir.display()),
+                    path: Some(drop_dir.to_string_lossy().into_owned()),
+                    line: None,
+                });
+                Vec::new()
+            }
         };
         confs.sort();
         out.extend(confs);
@@ -377,7 +380,7 @@ fn drop_in_confs(dir: &Path, unit_name: &str) -> Vec<PathBuf> {
 /// provides it; a mask (`/dev/null` symlink) or alias there shadows lower
 /// dirs entirely. Drop-ins from **all** dirs still apply — lowest
 /// precedence first so `/etc` drop-ins win over vendor defaults.
-pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdUnit> {
+pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> Result<BTreeMap<String, SystemdUnit>> {
     let mut units = BTreeMap::new();
 
     // Collect candidate names per dir in precedence order.
@@ -413,13 +416,15 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
 
     for name in all_names {
         // Highest-precedence dir that actually provides the unit file.
-        let primary = dirs.iter().enumerate().find(|(i, d)| {
-            dir_names[*i].contains(&name) && {
-                let p = d.as_ref().join(&name);
-                p.is_file() || p.is_symlink()
-            }
-        });
-        let Some((_, primary_dir)) = primary else {
+        let find_file = |name: &str| {
+            dirs.iter().find_map(|dir| {
+                let path = dir.as_ref().join(name);
+                (path.is_file() || path.is_symlink()).then_some(path)
+            })
+        };
+        let primary =
+            find_file(&name).or_else(|| template_name_of(&name).and_then(|tpl| find_file(&tpl)));
+        let Some(p) = primary else {
             // Only drop-ins exist — systemd synthesizes a stub unit.
             let mut unit = SystemdUnit {
                 name: name.clone(),
@@ -436,7 +441,6 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
             units.insert(name, unit);
             continue;
         };
-        let p = primary_dir.as_ref().join(&name);
 
         // Masked / alias / broken symlinks are handled at the winning dir —
         // a mask in /etc shadows the vendor unit entirely.
@@ -542,13 +546,23 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> BTreeMap<String, SystemdU
             target.aliases.push(alias_name);
         }
     }
+    resolve_loaded_instances(&mut units, dirs)?;
     flag_missing_references(&mut units);
-    units
+    Ok(units)
 }
 
 fn apply_dep_dirs(dir: &Path, units: &mut BTreeMap<String, SystemdUnit>) {
-    let unit_names: Vec<String> = units.keys().cloned().collect();
-    for name in unit_names {
+    for unit in units.values_mut() {
+        apply_unit_dep_dirs(dir, unit);
+    }
+}
+
+fn apply_unit_dep_dirs(dir: &Path, unit: &mut SystemdUnit) {
+    let names: Vec<String> = template_name_of(&unit.name)
+        .into_iter()
+        .chain(std::iter::once(unit.name.clone()))
+        .collect();
+    for name in names {
         for (suffix, is_wants) in [(".wants", true), (".requires", false)] {
             let dep_dir = dir.join(format!("{name}{suffix}"));
             if !lens_core::read_policy::metadata(&dep_dir).is_ok_and(|m| m.is_dir()) {
@@ -557,22 +571,15 @@ fn apply_dep_dirs(dir: &Path, units: &mut BTreeMap<String, SystemdUnit>) {
             let Ok(rd) = lens_core::read_policy::read_dir(&dep_dir) else {
                 continue;
             };
-            let mut deps: Vec<String> = rd
-                .flatten()
-                .filter_map(|e| unit_name_of(&e.path()))
-                .collect();
-            deps.sort();
-            if let Some(unit) = units.get_mut(&name) {
-                if is_wants {
-                    unit.wants.extend(deps);
-                    unit.wants.sort();
-                    unit.wants.dedup();
-                } else {
-                    unit.requires.extend(deps);
-                    unit.requires.sort();
-                    unit.requires.dedup();
-                }
-            }
+            let deps = rd.flatten().filter_map(|entry| unit_name_of(&entry.path()));
+            let list = if is_wants {
+                &mut unit.wants
+            } else {
+                &mut unit.requires
+            };
+            list.extend(deps);
+            list.sort();
+            list.dedup();
         }
     }
 }
@@ -580,18 +587,29 @@ fn apply_dep_dirs(dir: &Path, units: &mut BTreeMap<String, SystemdUnit>) {
 /// Apply drop-ins from every search dir, lowest precedence dir first so
 /// the highest-precedence dir's conf wins per key.
 fn apply_merged_drop_ins(unit: &mut SystemdUnit, dirs: &[impl AsRef<Path>], unit_name: &str) {
+    // Same-name files override by search-path precedence; all surviving
+    // files are then applied in filename order across directories.
+    let mut chosen = BTreeMap::new();
     for dir in dirs.iter().rev() {
-        for conf in drop_in_confs(dir.as_ref(), unit_name) {
-            match lens_core::read_policy::read_to_string(&conf) {
-                Ok(c) => apply_drop_in(unit, &c, &conf.to_string_lossy()),
-                Err(e) => unit.diagnostics.push(Diagnostic {
-                    code: "DROPIN_UNREADABLE".to_string(),
-                    severity: "warning".to_string(),
-                    message: format!("cannot read {}: {}", conf.display(), e),
-                    path: Some(conf.to_string_lossy().into_owned()),
-                    line: None,
-                }),
+        for conf in drop_in_confs(dir.as_ref(), unit_name, &mut unit.diagnostics) {
+            if let Some(name) = conf.file_name() {
+                chosen.insert(name.to_os_string(), conf);
             }
+        }
+    }
+    for conf in chosen.into_values() {
+        if std::fs::read_link(&conf).is_ok_and(|target| target == Path::new("/dev/null")) {
+            continue;
+        }
+        match lens_core::read_policy::read_to_string(&conf) {
+            Ok(content) => apply_drop_in(unit, &content, &conf.to_string_lossy()),
+            Err(error) => unit.diagnostics.push(Diagnostic {
+                code: "DROPIN_UNREADABLE".to_string(),
+                severity: "warning".to_string(),
+                message: format!("cannot read {}: {}", conf.display(), error),
+                path: Some(conf.to_string_lossy().into_owned()),
+                line: None,
+            }),
         }
     }
 }
@@ -625,10 +643,10 @@ mod tests {
             unit.sections["Service"]["ExecStart"],
             vec!["/bin/new".to_string()]
         );
-        // %u/%h resolve to the unit's User=, not hardcoded root
+        // %u/%h resolve to the system manager, independently of Service.User
         assert_eq!(
             unit.sections["Service"]["ExecStartPre"],
-            vec!["/bin/pre nobody /home/nobody".to_string()]
+            vec!["/bin/pre root /root".to_string()]
         );
         assert_eq!(unit.drop_ins.len(), 1);
         assert_eq!(unit.wants, vec!["b.service".to_string()]);
@@ -730,7 +748,7 @@ mod tests {
         .unwrap();
 
         let dirs: Vec<std::path::PathBuf> = vec![etc.clone(), lib.clone()];
-        let units = load_units_merged(&dirs);
+        let units = load_units_merged(&dirs).unwrap();
 
         // /etc unit file wins; drop-ins from both dirs merged.
         let svc = &units["svc.service"];
@@ -761,7 +779,7 @@ mod tests {
         )
         .unwrap();
         let dirs: Vec<std::path::PathBuf> = vec![etc];
-        let units = load_units_merged(&dirs);
+        let units = load_units_merged(&dirs).unwrap();
         let ghost = &units["ghost.service"];
         assert_eq!(ghost.sections["Service"]["Environment"], vec!["X=1"]);
     }

@@ -41,11 +41,51 @@ pub fn redact_str(input: &str) -> String {
     out
 }
 
-/// Scrub UTF-8 bytes in place if valid UTF-8, or lossily convert and scrub.
+/// Scrub bytes, replacing invalid UTF-8 with U+FFFD before redacting.
+/// Evidence collectors that must preserve encoding use [`try_redact_bytes`].
 pub fn redact_bytes(data: &[u8]) -> Vec<u8> {
-    match std::str::from_utf8(data) {
-        Ok(s) => redact_str(s).into_bytes(),
-        Err(_) => data.to_vec(),
+    redact_str(&String::from_utf8_lossy(data)).into_bytes()
+}
+
+/// Refuse evidence whose encoding cannot be safely preserved during redaction.
+pub fn try_redact_bytes(data: &[u8]) -> crate::Result<Vec<u8>> {
+    let text = std::str::from_utf8(data).map_err(|_| crate::LensError::InvalidInput {
+        message: "redaction requires valid UTF-8; artifact omitted".to_string(),
+    })?;
+    Ok(redact_str(text).into_bytes())
+}
+
+/// Redact decoded JSON values so escaping and non-secret field types survive.
+pub fn redact_json_value(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if SECRET_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k)) {
+                    redact_secret_value(value);
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_json_value),
+        Value::String(s) => *s = redact_str(s),
+        _ => {}
+    }
+}
+
+fn redact_secret_value(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Null => {}
+        Value::Array(items) => items.iter_mut().for_each(redact_secret_value),
+        Value::Object(map) => map.values_mut().for_each(redact_secret_value),
+        Value::String(secret) => {
+            if !secret.is_empty() && !secret.starts_with("<REDACTED:") {
+                *secret = token_for(secret);
+            }
+        }
+        other => *other = Value::String(token_for(&other.to_string())),
     }
 }
 
@@ -277,6 +317,40 @@ fn redact_kv_assignments(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_redaction_preserves_escaping_and_structure() {
+        let mut value = serde_json::json!({
+            "Environment": ["PASSWORD=\"synthetic-credential-123\"", "USER=alice"],
+            "nested": {"password": "quote\"slash\\and\nnewline", "count": 7, "enabled": true},
+            "api_key": 123456,
+            "Password": ["array-secret-one", "array-secret-two"],
+        });
+        redact_json_value(&mut value);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("synthetic-credential-123"));
+        assert!(!text.contains("quote"));
+        assert!(!text.contains("123456"));
+        assert!(!text.contains("array-secret"));
+        assert_eq!(decoded["Password"].as_array().unwrap().len(), 2);
+        assert_eq!(decoded["nested"]["count"], 7);
+        assert_eq!(decoded["nested"]["enabled"], true);
+        assert_eq!(decoded["Environment"][1], "USER=alice");
+        let once = value.clone();
+        redact_json_value(&mut value);
+        assert_eq!(value, once);
+    }
+
+    #[test]
+    fn invalid_utf8_never_returns_an_unredacted_secret() {
+        let bytes = b"bad byte: \xff\npassword=synthetic-password-789\n";
+        assert!(try_redact_bytes(bytes).is_err());
+        let scrubbed = String::from_utf8(redact_bytes(bytes)).unwrap();
+        assert!(!scrubbed.contains("synthetic-password-789"));
+        assert!(scrubbed.contains('\u{fffd}'));
+    }
 
     #[test]
     fn test_redact_bearer_and_api_keys_deterministically() {

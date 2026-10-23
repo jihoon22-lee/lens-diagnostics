@@ -335,10 +335,10 @@ where
                     let list = List::new(list_items).block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(format!(
-                                " Systemd Units ({}) ",
-                                app.sys_units.len()
-                            )),
+                            .title(match &app.sys_error {
+                                Some(error) => format!(" Systemd unavailable: {error} "),
+                                None => format!(" Systemd Units ({}) ", app.sys_units.len()),
+                            }),
                     );
                     let mut state = ListState::default();
                     state.select(Some(app.sys_selected));

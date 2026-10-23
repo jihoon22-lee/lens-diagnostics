@@ -167,7 +167,9 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
         ($name:literal, $entry:literal, $produce:expr) => {{
             #[allow(unused_mut)]
             let mut produce = || $produce;
-            match produce().and_then(|v| BundleArtifact::json($entry, &v)) {
+            match produce()
+                .and_then(|v| BundleArtifact::json_with_redaction($entry, &v, req.redact))
+            {
                 Ok(artifact) => artifacts.push(artifact),
                 Err(e) => diagnostics.push(format!("{}: {}", $name, e)),
             }
@@ -187,13 +189,14 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
         // and stdin (`-`) inputs therefore embed correctly too.
         match log::open(l) {
             Ok(indexer) => {
-                match BundleArtifact::json(
+                match BundleArtifact::json_with_redaction(
                     "reports/log_summary.json",
                     &serde_json::json!({
                         "path": l.to_string_lossy(),
                         "total_lines": indexer.len(),
                         "lossy_lines": indexer.lossy_lines(),
                     }),
+                    req.redact,
                 ) {
                     Ok(artifact) => artifacts.push(artifact),
                     Err(e) => diagnostics.push(format!("log: {}", e)),
@@ -206,10 +209,18 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
                         BUNDLE_LOG_TAIL_BYTES
                     ));
                 }
-                artifacts.push(BundleArtifact {
-                    name: format!("logs/{}", log_entry_name(l)),
-                    data: tail.to_vec(),
-                });
+                let data = if req.redact {
+                    lens_core::try_redact_bytes(tail)
+                } else {
+                    Ok(tail.to_vec())
+                };
+                match data {
+                    Ok(data) => artifacts.push(BundleArtifact {
+                        name: format!("logs/{}", log_entry_name(l)),
+                        data,
+                    }),
+                    Err(e) => diagnostics.push(format!("log: {e}")),
+                }
             }
             Err(e) => diagnostics.push(format!("log: {}", e)),
         }
@@ -287,9 +298,9 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
     }
 
     if req.redact {
-        for artifact in &mut artifacts {
-            artifact.data = lens_core::redact_bytes(&artifact.data);
-        }
+        diagnostics
+            .iter_mut()
+            .for_each(|d| *d = lens_core::redact_str(d));
     }
 
     let manifest = create_bundle_archive_with_redaction(
@@ -723,6 +734,65 @@ pub fn extract(bundle: &PathBuf, dest: &PathBuf, force: bool) -> Result<Report<V
 #[cfg(test)]
 mod tests {
     use lens_core::create_bundle_archive;
+
+    #[test]
+    fn redacted_service_bundle_roundtrips_without_secret_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        std::fs::write(
+            units.join("app.service"),
+            "[Service]\nEnvironment=PASSWORD=\"synthetic-credential-123\"\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        let path = dir.path().join("redacted.lens");
+        let report = create(&BundleRequest {
+            output: path.clone(),
+            sys: Some(units),
+            redact: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(report.complete);
+        assert!(report.data.redacted);
+        assert!(verify_bundle_archive(&path).unwrap().is_valid);
+        let bytes = read_bundle_entry(&path, "reports/sys_snapshot.json").unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-credential-123"));
+        let snapshot: lens_sys::SystemdSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            snapshot.units["app.service"].sections["Service"]["Environment"][0]
+                .contains("<REDACTED:sha256:")
+        );
+        assert!(diff(&path, &path).unwrap().complete);
+    }
+
+    #[test]
+    fn redacted_bundle_omits_invalid_utf8_and_reports_incomplete_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("binary.log");
+        std::fs::write(&log, b"bad: \xff\npassword=synthetic-password-789\n").unwrap();
+        let path = dir.path().join("redacted.lens");
+        let report = create(&BundleRequest {
+            output: path.clone(),
+            log: Some(log),
+            redact: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!report.complete);
+        assert!(report.data.redacted);
+        assert!(report.diagnostics.iter().any(|d| d.contains("UTF-8")));
+        assert!(verify_bundle_archive(&path).unwrap().is_valid);
+        let inspection = inspect_bundle(&path).unwrap();
+        assert!(!inspection
+            .entries
+            .iter()
+            .any(|e| e.name.starts_with("logs/")));
+        assert!(inspection
+            .entries
+            .iter()
+            .any(|e| e.name == "reports/log_summary.json"));
+    }
 
     #[test]
     fn review2_manifest_diagnostics_are_bounded_before_cloning() {

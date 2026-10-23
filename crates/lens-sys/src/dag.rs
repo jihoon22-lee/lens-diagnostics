@@ -39,7 +39,15 @@ impl OrderingGraph {
         Self::default()
     }
 
-    pub fn build(units: &BTreeMap<String, SystemdUnit>) -> Self {
+    pub fn build(units: &BTreeMap<String, SystemdUnit>) -> lens_core::Result<Self> {
+        if units.len() > crate::resolve::MAX_UNITS {
+            return Err(crate::resolve::limit("unit count exceeds 10000"));
+        }
+        let mut resolved = units.clone();
+        crate::resolve::expand_instances(&mut resolved, |template, name| {
+            Ok(instantiate_template(template, name))
+        })?;
+        let units = &resolved;
         let mut graph = OrderingGraph::new();
 
         // Symlink aliases resolve to their canonical unit; masked,
@@ -69,58 +77,14 @@ impl OrderingGraph {
             false
         };
 
-        // Collect concrete template instances (e.g. `foo@bar.service`)
-        // referenced by loaded units when `foo@bar.service` is not explicitly
-        // in `units` but its template `foo@.service` is. A synthesized instance
-        // can itself reference further instances (`a@one` -> `b@one`), so
-        // iterate to a fixpoint. The round cap bounds pathological templates
-        // whose instance name keeps growing (`a@.service` -> `a@%i-x.service`).
-        const MAX_INSTANTIATION_ROUNDS: usize = 32;
-        let mut synthesized_instances: BTreeMap<String, SystemdUnit> = BTreeMap::new();
-        for _ in 0..MAX_INSTANTIATION_ROUNDS {
-            let mut fresh: BTreeMap<String, SystemdUnit> = BTreeMap::new();
-            for (name, unit) in units.iter().chain(synthesized_instances.iter()) {
-                if excluded(name) {
-                    continue;
-                }
-                let refs = unit
-                    .before
-                    .iter()
-                    .chain(unit.after.iter())
-                    .chain(unit.wants.iter())
-                    .chain(unit.requires.iter())
-                    .chain(unit.ordering_edges.iter().map(|e| &e.target));
-                for raw_target in refs {
-                    let target = resolve(raw_target);
-                    if units.contains_key(&target)
-                        || synthesized_instances.contains_key(&target)
-                        || fresh.contains_key(&target)
-                    {
-                        continue;
-                    }
-                    if let Some(tpl_name) = template_name_of(&target) {
-                        if let Some(tpl_unit) = units.get(&tpl_name) {
-                            if !tpl_unit.masked && tpl_unit.alias_of.is_none() {
-                                fresh.insert(
-                                    target.clone(),
-                                    instantiate_template(tpl_unit, &target),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            if fresh.is_empty() {
-                break;
-            }
-            synthesized_instances.extend(fresh);
-        }
-
-        for (name, unit) in units.iter().chain(synthesized_instances.iter()) {
+        for (name, unit) in units {
             if excluded(name) {
                 continue;
             }
             graph.all_nodes.insert(name.clone());
+            if graph.all_nodes.len() > crate::resolve::MAX_UNITS {
+                return Err(crate::resolve::limit("ordering graph exceeds 10000 nodes"));
+            }
             graph.adj.entry(name.clone()).or_default();
 
             // Prefer per-line ordering edges; fall back to the flattened
@@ -149,6 +113,13 @@ impl OrderingGraph {
                     continue;
                 }
                 graph.all_nodes.insert(target.clone());
+                if graph.all_nodes.len() > crate::resolve::MAX_UNITS
+                    || graph.constraints.len() >= crate::resolve::MAX_EDGES
+                {
+                    return Err(crate::resolve::limit(
+                        "ordering graph exceeds the node or edge limit",
+                    ));
+                }
                 graph.adj.entry(target.clone()).or_default();
                 // A has Before=T => A before T => edge A -> T;
                 // A has After=T  => T before A => edge T -> A.
@@ -173,7 +144,7 @@ impl OrderingGraph {
             }
         }
 
-        graph
+        Ok(graph)
     }
 
     /// Detect cycles in the ordering graph using Tarjan's Strongly Connected Components algorithm.

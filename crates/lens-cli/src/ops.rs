@@ -1348,6 +1348,13 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     );
                     for u in &diff.modified_units {
                         outln!("  ~ {}", u.file);
+                        if let Some(order) = &u.forced_include_order {
+                            outln!(
+                                "    forced includes: {:?} -> {:?}",
+                                order.before,
+                                order.after
+                            );
+                        }
                     }
                 }
                 apply(&mut outcome, &report, threshold);

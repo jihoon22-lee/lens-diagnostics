@@ -494,45 +494,31 @@ fn services_dirs(root: Option<&Path>, systemd_dir: Option<&Path>) -> (Vec<PathBu
 pub fn load_systemd_units(
     dirs: &[PathBuf],
     explicit: bool,
-) -> std::result::Result<std::collections::BTreeMap<String, lens_sys::SystemdUnit>, String> {
+) -> Result<std::collections::BTreeMap<String, lens_sys::SystemdUnit>> {
     if explicit {
-        return lens_sys::load_units(&dirs[0]).map_err(|e| e.to_string());
+        return lens_sys::load_units(&dirs[0]);
     }
-    Ok(lens_sys::load_units_merged(dirs))
+    lens_sys::load_units_merged(dirs)
 }
 
 /// The cycle check plus, when units loaded with parser/loader
 /// diagnostics, a Warn check calling those out — malformed units are
 /// evidence about the services picture, not silent gaps.
-pub fn check_services(root: Option<&Path>, systemd_dir: Option<&Path>) -> Vec<DoctorCheck> {
+pub fn check_services(root: Option<&Path>, systemd_dir: Option<&Path>) -> Result<Vec<DoctorCheck>> {
     let (dirs, explicit) = services_dirs(root, systemd_dir);
     if !dirs.iter().any(|d| d.exists()) {
-        return vec![DoctorCheck {
+        return Ok(vec![DoctorCheck {
             category: "Services".to_string(),
             name: "Systemd Dependency Cycles".to_string(),
             status: HealthStatus::Skip,
             message: "No systemd unit directory to inspect; services check skipped".to_string(),
             next_command: None,
             recommendation: None,
-        }];
+        }]);
     }
 
-    let units = match load_systemd_units(&dirs, explicit) {
-        Ok(u) => u,
-        Err(e) => {
-            return vec![DoctorCheck {
-                category: "Services".to_string(),
-                name: "Systemd Dependency Cycles".to_string(),
-                status: HealthStatus::Warn,
-                message: format!("Failed to load systemd units: {}", e),
-                next_command: Some("lens sys inspect --format json".to_string()),
-                recommendation: Some(
-                    "Check the unit directory for unreadable or malformed files.".to_string(),
-                ),
-            }];
-        }
-    };
-    let graph = OrderingGraph::build(&units);
+    let units = load_systemd_units(&dirs, explicit)?;
+    let graph = OrderingGraph::build(&units)?;
     let cycles = graph.find_cycles();
 
     let cycle_check = if !cycles.is_empty() {
@@ -582,7 +568,7 @@ pub fn check_services(root: Option<&Path>, systemd_dir: Option<&Path>) -> Vec<Do
             ),
         });
     }
-    checks
+    Ok(checks)
 }
 
 pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
@@ -722,7 +708,7 @@ pub fn run_doctor(
     root: Option<&Path>,
     procfs: Option<&Path>,
     sys_dir: Option<&Path>,
-) -> DoctorReport {
+) -> Result<DoctorReport> {
     let mut checks = Vec::new();
 
     checks.extend(check_storage(root, procfs));
@@ -749,7 +735,7 @@ pub fn run_doctor(
         (_, p) => checks.extend(check_network(p)),
     }
 
-    checks.extend(check_services(root, sys_dir));
+    checks.extend(check_services(root, sys_dir)?);
     checks.extend(check_environment(root));
 
     let mut passed = 0;
@@ -782,12 +768,12 @@ pub fn run_doctor(
         skipped,
     };
 
-    DoctorReport {
+    Ok(DoctorReport {
         schema_version: "lens.doctor/v1".to_string(),
         overall_status,
         checks,
         summary,
-    }
+    })
 }
 
 /// Validate the explicit override paths, run all checks, and wrap the
@@ -815,7 +801,7 @@ pub fn run(
         }
     }
 
-    let data = run_doctor(root, procfs, systemd_dir);
+    let data = run_doctor(root, procfs, systemd_dir)?;
     let findings = data
         .checks
         .iter()
@@ -1028,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_run_doctor_summary() {
-        let report = run_doctor(Some(Path::new("/")), None, None);
+        let report = run_doctor(Some(Path::new("/")), None, None).unwrap();
         assert_eq!(report.schema_version, "lens.doctor/v1");
         assert!(report.summary.total >= 4);
         assert_eq!(
@@ -1049,7 +1035,7 @@ mod tests {
             .prefix("lens-doctor-fakeroot-")
             .tempdir()
             .unwrap();
-        let report = run_doctor(Some(root.path()), None, None);
+        let report = run_doctor(Some(root.path()), None, None).unwrap();
 
         let status_of = |name: &str| {
             report
@@ -1241,7 +1227,7 @@ tmpfs /run tmpfs rw 0 0
     fn next_command_only_on_actionable_checks() {
         // Every check that renders a `-> Next:` suggestion must be
         // Warn or Fail — a PASS check never prescribes a follow-up.
-        let report = run_doctor(None, None, None);
+        let report = run_doctor(None, None, None).unwrap();
         for c in &report.checks {
             if c.next_command.is_some() {
                 assert!(
