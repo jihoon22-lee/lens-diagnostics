@@ -1,4 +1,4 @@
-# Lens v0.8.1 리뷰 후속 수정 기록
+# Lens v0.9.0 리뷰 후속 수정 기록
 
 `main@02f742571d77cb11640a3c8f7cf7e24c52996a48`을 대상으로 수행한 v0.8.0
 리뷰에서 확인한 14건(P1 3건, P2 11건)을 수정했다. 별도로 발견한 호스트 로그
@@ -54,6 +54,9 @@
 | 외부 구현 대조 | systemd 인스턴스 drop-in·빈 의존성 순환이 `systemd-analyze verify`와 일치; PEP 440은 PyPA 기준 fixture와 일치 |
 
 ## 호환성과 지원 범위
+
+공개 Rust API의 반환형 변경으로 Cargo의 0.x 호환 범위가 달라져야 하므로,
+저장소의 `bump-minor-pre-major` 정책에 따라 v0.9.0으로 릴리스한다.
 
 - JSON 스키마 식별자는 유지한다. `forced_include_order`는 선택적 필드이며
   기존 diff 입력을 계속 읽는다. systemd 지원 의미론 표기는

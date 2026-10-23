@@ -2,7 +2,7 @@
 
 이 문서는 v0.8.0 당시의 실행 기록이다. 후속 리뷰에서 확인한 systemd specifier·
 의존성 리셋, 마스킹, 버전·ABI 판정 등의 정정 사항은
-[v0.8.1 수정 기록](../../workthrough/2026-10-23-lens-081-review-remediation.md)을 따른다.
+[v0.9.0 수정 기록](../../workthrough/2026-10-23-lens-090-review-remediation.md)을 따른다.
 
 - **대상 워크스페이스**: `/home/jihoon/projects/toy-projects` (`lens` v0.7.0, 14개 Rust 크레이트, ~28.4k LOC)
 - **목적**: 별도 작업 세션에서 사전 컨텍스트 없이도 **전 항목(버그 86건 + 사용성 개선 + 도메인 기능 고도화 + 아키텍처/의존성 리팩토링)**을 순차적·완결적으로 구현 및 검증할 수 있도록 코드 수준의 수정 명세와 테스트 완료 기준(DoD)을 정의한다.
