@@ -110,6 +110,8 @@ impl ImpactGraph {
                 {
                     queue.push_back(resolved);
                 }
+            } else {
+                self.unresolved_includes += 1;
             }
         }
 
@@ -136,6 +138,8 @@ impl ImpactGraph {
             let Some(includes) = includes else {
                 if current == unit.file {
                     self.missing_sources += 1;
+                } else {
+                    self.unresolved_includes += 1;
                 }
                 continue;
             };
