@@ -37,7 +37,7 @@ def assemble(destination: Path) -> None:
     consolidated = CRATES_DIR / 'README.md'
     if consolidated.is_file():
         copies[consolidated] = destination / 'crates' / 'index.md'
-    repository = os.environ.get('GITHUB_REPOSITORY', 'jihoon22-lee/toy-projects')
+    repository = os.environ.get('GITHUB_REPOSITORY', 'jihoon22-lee/lens-diagnostics')
     revision = os.environ.get('GITHUB_SHA', 'main')
     for source, target in copies.items():
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -64,7 +64,7 @@ def assemble(destination: Path) -> None:
             return match.group(0)
         text = re.sub(r'\[([^\]]*)\]\(([^\s)]+)\)', link, source.read_text())
         target.write_text(text)
-    (destination / '_config.yml').write_text('title: toy-projects\ndescription: Independent desktop and CLI products\ntheme: jekyll-theme-cayman\n')
+    (destination / '_config.yml').write_text('title: Lens Diagnostics\ndescription: Evidence-based Linux and artifact diagnostics\ntheme: jekyll-theme-cayman\n')
 
 
 if __name__ == '__main__':

@@ -94,7 +94,14 @@ pub fn inspect(file: &Path) -> Result<Report<BuildSnapshot>> {
         reverse_impact,
         transitive_impact,
     };
-    Ok(Report::new(snapshot))
+    let mut report = Report::new(snapshot);
+    graph_status(
+        &mut report,
+        graph.missing_sources,
+        graph.unresolved_includes,
+        graph.scan_truncated,
+    );
+    Ok(report)
 }
 
 /// Reverse compilation impact of `header`. A relative header resolves
@@ -154,16 +161,20 @@ pub fn impact(file: &Path, header: &str) -> Result<Report<ImpactReport>> {
     if let Some(h) = hint {
         report.push(Severity::Warn, "build.not_in_graph", h);
     }
+    graph_status(&mut report, missing, unresolved, truncated);
+    Ok(report)
+}
+
+fn graph_status<T>(report: &mut Report<T>, missing: usize, unresolved: usize, truncated: bool) {
+    report.diagnostics.push("Scope: static literal includes only; compiler builtin headers, macro expansion, conditional preprocessing and include_next search semantics are not evaluated. Empty impact does not prove that no rebuild is needed.".into());
     if missing > 0 || unresolved > 0 || truncated {
+        report.complete = false;
         report.push(
             Severity::Warn,
             "build.incomplete_graph",
-            format!(
-                "impact graph incomplete: {missing} missing source(s), {unresolved} unresolved include(s), truncated={truncated}"
-            ),
+            format!("impact graph incomplete: {missing} missing source(s), {unresolved} unresolved include(s), truncated={truncated}"),
         );
     }
-    Ok(report)
 }
 
 /// Diff two compile_commands.json databases. Deltas are Info.
@@ -187,4 +198,68 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<BuildDiff>> {
         );
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database(dir: &Path, source: Option<&str>, args: &[&str]) -> PathBuf {
+        if let Some(source) = source {
+            std::fs::write(dir.join("a.c"), source).unwrap();
+        }
+        let path = dir.join("compile_commands.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!([{
+                "directory": dir, "file": "a.c", "arguments": args
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn missing_and_unresolved_are_incomplete_for_both_operations() {
+        for source in [None, Some("#include \"missing.h\"\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = database(dir.path(), source, &["cc", "a.c"]);
+            let impact = impact(&path, "missing.h").unwrap();
+            assert!(!impact.complete);
+            assert!(impact.is_actionable(Severity::Fail));
+            assert!(!inspect(&path).unwrap().complete);
+        }
+    }
+
+    #[test]
+    fn complete_static_graph_keeps_scope_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database(dir.path(), Some("#include \"ok.h\"\n"), &["cc", "a.c"]);
+        std::fs::write(dir.path().join("ok.h"), "").unwrap();
+        let report = impact(&path, "ok.h").unwrap();
+        assert!(report.complete);
+        assert_eq!(report.data.total_impacted, 1);
+        assert!(!report.is_actionable(Severity::Fail));
+        assert!(report.diagnostics[0].contains("static literal includes"));
+    }
+
+    #[test]
+    fn truncated_graph_is_actionable_at_fail_threshold() {
+        let mut report = Report::new(());
+        graph_status(&mut report, 0, 0, true);
+        assert!(!report.complete);
+        assert!(report.is_actionable(Severity::Fail));
+    }
+
+    #[test]
+    fn missing_forced_include_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database(
+            dir.path(),
+            Some(""),
+            &["cc", "-include", "missing.h", "a.c"],
+        );
+        assert!(!impact(&path, "missing.h").unwrap().complete);
+    }
 }
