@@ -1,8 +1,15 @@
-# Lens Forensic Platform (`toy-projects`)
+# Lens Diagnostics (`lens`)
 
-리눅스 시스템 및 소프트웨어 생명주기 전 영역을 아우르는 **초고성능 통합 시스템 진단 및 포렌식 플랫폼**.
+Linux 시스템 상태와 개발 산출물을 검사·비교하고 근거를 `.lens` 번들로 공유하는 CLI 도구입니다. 파일 분석, 호스트 수집, 대화형 TUI 및 MCP 연결을 제공합니다.
 
-파편화되어 있던 기존 8개 독립 도구(`diskmap`, `abilens`, `loglens`, `testlens`, `tracelens`, `servicelens`, `buildscope`, `envlens`)의 엄격한 계약(Fail-Closed, Evidence-Bound, Schema 호환)을 온전히 계승하면서, **단일 정적 Rust 바이너리(`lens`), mmap 기반 Zero-Copy I/O, 사고 포렌식 비행기록장치(`.lens` bundle)**로 전면 재개발 및 현대화되었습니다.
+파편화되어 있던 기존 8개 독립 도구(`diskmap`, `abilens`, `loglens`, `testlens`, `tracelens`, `servicelens`, `buildscope`, `envlens`)의 엄격한 계약(Fail-Closed, Evidence-Bound, Schema 호환)을 온전히 계승하면서, **단일 Rust CLI 바이너리(`lens`), mmap 기반 Zero-Copy I/O, 사고 포렌식 비행기록장치(`.lens` bundle)**로 전면 재개발 및 현대화되었습니다.
+
+## 지원 범위
+
+- Linux 우선입니다. WSL과 컨테이너에서는 노출된 `/proc`, 파일 권한, systemd 유무에 따라 수집 범위가 달라집니다. 호스트 전체를 검사했다고 해석하지 마세요.
+- ELF, 로그, JUnit, strace, compile database, Python 환경의 파일 기반 분석을 제공합니다. macOS/native Windows의 동등 지원, PE/Mach-O 분석은 이번 릴리스 범위에 포함하지 않습니다.
+- `build impact`는 리터럴 include의 정적 근사입니다. 전처리 조건·매크로·컴파일러 내장 검색 경로를 재현하지 않으므로 컴파일러 depfile을 대체하지 않습니다. 누락·미해결·스캔 절단은 incomplete로 판정합니다.
+- 단일 실행 파일이라는 설명은 정적 링크 보장이 아닙니다. GNU target은 호환 glibc가 필요하며, 폐쇄망에서는 배포 target과 체크섬을 확인하여 전달해야 합니다.
 
 ---
 
@@ -11,7 +18,7 @@
 플랫폼은 14개의 고성능 모듈식 Rust 크레이트로 구성되어 있습니다.
 
 ```text
-toy-projects/
+lens-diagnostics/
 ├── Cargo.toml          루트 워크스페이스 정의
 ├── crates/
 │   ├── lens-core/      공통 기반 (Zero-Copy I/O, SafeInput TOCTOU 방어, SHA-256, 3상태 Diff, 번들 매니페스트 무결성 검증)
@@ -36,7 +43,7 @@ toy-projects/
 
 | 영역 | 기존 레거시 도구 | 차세대 Rust 엔진 (`lens`) |
 |---|---|---|
-| **배포 형태** | Qt6, Python, libstdc++ 런타임 종속 8개 분열 | 단일 정적 바이너리 (`lens`) |
+| **배포 형태** | Qt6, Python, libstdc++ 런타임 종속 8개 분열 | 단일 CLI 바이너리 (`lens`) |
 | **디스크 트리 저장** | 경로별 개체 분산 할당 | `u32` 인덱스 연속 아레나(`ArenaTree`), 캐시 지역성 확보 |
 | **로그 검색 핫패스** | 검색 시마다 `toLowerAscii` 힙 할당 (100만회+) | mmap 라인 인덱싱 + 무할당 슬라이딩 윈도우 필터 (`contains_insensitive`) |
 | **테스트 XML 파싱** | Python `defusedxml` | `quick-xml` 스트리밍 파서 |

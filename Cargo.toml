@@ -22,7 +22,7 @@ version = "0.9.0"
 edition = "2021"
 authors = ["Jihoon Lee"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/jihoon22-lee/toy-projects"
+repository = "https://github.com/jihoon22-lee/lens-diagnostics"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
