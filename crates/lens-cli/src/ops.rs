@@ -1410,6 +1410,14 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         outln!("  {} [{}]", u.file, u.compiler);
                     }
                 }
+                for diagnostic in &report.diagnostics {
+                    diagln!("{diagnostic}");
+                }
+                if !report.complete {
+                    for finding in &report.findings {
+                        diagln!("warning: {}", finding.message);
+                    }
+                }
                 apply(&mut outcome, &report, threshold);
             }
             BuildCommands::Impact { file, header } => {
@@ -1419,7 +1427,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     outln!("{}", render_report(impact, &report, opts)?);
                 } else {
                     outln!(
-                        "Impact of {}: {} translation unit(s) need rebuild",
+                        "Potential impact of {}: {} translation unit(s) may require rebuild",
                         impact.target_header,
                         impact.total_impacted
                     );
@@ -1427,9 +1435,11 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         outln!("  - {}", u);
                     }
                 }
-                // Evidence gaps stay visible on stderr in both modes;
-                // missing/unresolved includes and truncation are warnings,
-                // not findings (system headers often resolve nowhere).
+                // Static scope and evidence gaps stay visible in both modes.
+                // Incomplete evidence exits 1 regardless of severity threshold.
+                for diagnostic in &report.diagnostics {
+                    diagln!("{diagnostic}");
+                }
                 if let Some(hint) = &impact.hint {
                     diagln!("warning: {}", hint);
                 }
