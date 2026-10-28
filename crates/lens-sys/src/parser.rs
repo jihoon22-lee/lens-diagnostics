@@ -1,6 +1,23 @@
 use crate::model::{Diagnostic, OrderingEdge, SystemdUnit};
 use std::collections::BTreeMap;
 
+/// Identity of the service manager; never derived from Service.User.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManagerContext {
+    pub user: String,
+    pub home: String,
+    pub runtime_dir: String,
+}
+impl Default for ManagerContext {
+    fn default() -> Self {
+        Self {
+            user: "root".into(),
+            home: "/root".into(),
+            runtime_dir: "/run".into(),
+        }
+    }
+}
+
 /// System-manager specifiers. `%u`/`%h` belong to the manager, not Service.User.
 #[derive(Debug, Clone)]
 struct SpecContext {
@@ -10,10 +27,11 @@ struct SpecContext {
     instance: String,
     user: String,
     home: String,
+    runtime_dir: String,
 }
 
 impl SpecContext {
-    fn minimal(unit_name: &str) -> Self {
+    fn minimal(unit_name: &str, manager: &ManagerContext) -> Self {
         let (prefix, instance) = split_unit_name(unit_name);
         let unit_name_without_suffix = strip_unit_suffix(unit_name).to_string();
         SpecContext {
@@ -21,8 +39,9 @@ impl SpecContext {
             unit_name_without_suffix,
             prefix,
             instance,
-            user: "root".to_string(),
-            home: "/root".to_string(),
+            user: manager.user.clone(),
+            home: manager.home.clone(),
+            runtime_dir: manager.runtime_dir.clone(),
         }
     }
 }
@@ -47,7 +66,15 @@ fn split_unit_name(unit_name: &str) -> (String, String) {
 }
 
 pub fn expand_specifiers(value: &str, unit_name: &str) -> String {
-    expand_with(&SpecContext::minimal(unit_name), value)
+    expand_specifiers_with_manager(value, unit_name, &ManagerContext::default())
+}
+
+pub fn expand_specifiers_with_manager(
+    value: &str,
+    unit_name: &str,
+    manager: &ManagerContext,
+) -> String {
+    expand_with(&SpecContext::minimal(unit_name, manager), value)
 }
 
 /// `foo@.service` — a template unit declares no concrete instance and
@@ -87,6 +114,7 @@ fn expand_with(ctx: &SpecContext, value: &str) -> String {
                     'i' | 'I' => out.push_str(&ctx.instance),
                     'u' => out.push_str(&ctx.user),
                     'h' => out.push_str(&ctx.home),
+                    't' => out.push_str(&ctx.runtime_dir),
                     other => {
                         out.push('%');
                         out.push(other);
@@ -228,11 +256,11 @@ fn is_dependency_key(key: &str) -> bool {
 
 /// Keep template specifiers until an actual instance name is known. This
 /// makes template snapshots and independent parses self-contained.
-fn expand_for_unit(value: &str, name: &str) -> String {
+fn expand_for_unit(value: &str, name: &str, manager: &ManagerContext) -> String {
     if is_template_name(name) {
         value.to_string()
     } else {
-        expand_specifiers(value, name)
+        expand_specifiers_with_manager(value, name, manager)
     }
 }
 
@@ -306,6 +334,7 @@ type SectionMap = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 fn expand_raw_entries(
     unit_name: &str,
     entries: &[SourcedEntry],
+    manager: &ManagerContext,
 ) -> (SectionMap, Vec<OrderingEdge>) {
     let mut raw_sections: SectionMap = BTreeMap::new();
     let mut section_order = Vec::new();
@@ -327,7 +356,9 @@ fn expand_raw_entries(
         for (k, vals) in raw_map {
             out_map.insert(
                 k.clone(),
-                vals.iter().map(|v| expand_for_unit(v, unit_name)).collect(),
+                vals.iter()
+                    .map(|v| expand_for_unit(v, unit_name, manager))
+                    .collect(),
             );
         }
         sections.insert(sec_name, out_map);
@@ -338,7 +369,7 @@ fn expand_raw_entries(
         if sec != "Unit" || (key != "After" && key != "Before") {
             continue;
         }
-        let value = expand_for_unit(raw_val, unit_name);
+        let value = expand_for_unit(raw_val, unit_name, manager);
         if !value.is_empty() {
             for target in value.split_whitespace() {
                 ordering_edges.push(OrderingEdge {
@@ -356,18 +387,26 @@ fn expand_raw_entries(
 }
 
 pub(crate) fn instantiate_template(tpl: &SystemdUnit, instance_name: &str) -> SystemdUnit {
+    instantiate_template_with_manager(tpl, instance_name, &ManagerContext::default())
+}
+
+pub(crate) fn instantiate_template_with_manager(
+    tpl: &SystemdUnit,
+    instance_name: &str,
+    manager: &ManagerContext,
+) -> SystemdUnit {
     let mut inst = tpl.clone();
     inst.name = instance_name.to_string();
     for section in inst.sections.values_mut() {
         for values in section.values_mut() {
             for value in values {
-                *value = expand_specifiers(value, instance_name);
+                *value = expand_specifiers_with_manager(value, instance_name, manager);
             }
         }
     }
     for edge in &mut inst.ordering_edges {
         edge.source = instance_name.to_string();
-        edge.target = expand_specifiers(&edge.target, instance_name);
+        edge.target = expand_specifiers_with_manager(&edge.target, instance_name, manager);
     }
     for dependencies in [
         &mut inst.before,
@@ -376,23 +415,32 @@ pub(crate) fn instantiate_template(tpl: &SystemdUnit, instance_name: &str) -> Sy
         &mut inst.requires,
     ] {
         for target in dependencies {
-            *target = expand_specifiers(target, instance_name);
+            *target = expand_specifiers_with_manager(target, instance_name, manager);
         }
     }
     inst.exec_start = inst
         .exec_start
-        .map(|s| expand_specifiers(&s, instance_name));
+        .map(|s| expand_specifiers_with_manager(&s, instance_name, manager));
     inst
 }
 
 pub fn parse_unit_content(content: &str, unit_name: &str, path: Option<&str>) -> SystemdUnit {
+    parse_unit_content_with_manager(content, unit_name, path, &ManagerContext::default())
+}
+
+pub fn parse_unit_content_with_manager(
+    content: &str,
+    unit_name: &str,
+    path: Option<&str>,
+    manager: &ManagerContext,
+) -> SystemdUnit {
     let (entries, diagnostics) = unit_entries(content, path);
     let sourced: Vec<SourcedEntry> = entries
         .into_iter()
         .map(|(line, sec, key, val)| (line, sec, key, val, path.map(String::from)))
         .collect();
 
-    let (sections, ordering_edges) = expand_raw_entries(unit_name, &sourced);
+    let (sections, ordering_edges) = expand_raw_entries(unit_name, &sourced, manager);
 
     let mut unit = SystemdUnit {
         name: unit_name.to_string(),
@@ -417,11 +465,25 @@ pub fn parse_unit_content(content: &str, unit_name: &str, path: Option<&str>) ->
 /// Merge a drop-in fragment. Non-dependency settings support empty resets;
 /// dependencies are additive, including empty Before=/After= assignments.
 pub fn apply_drop_in(base: &mut SystemdUnit, drop_in_content: &str, drop_in_path: &str) {
+    apply_drop_in_with_manager(
+        base,
+        drop_in_content,
+        drop_in_path,
+        &ManagerContext::default(),
+    )
+}
+
+pub fn apply_drop_in_with_manager(
+    base: &mut SystemdUnit,
+    drop_in_content: &str,
+    drop_in_path: &str,
+    manager: &ManagerContext,
+) {
     base.drop_ins.push(drop_in_path.to_string());
     let (entries, diagnostics) = unit_entries(drop_in_content, Some(drop_in_path));
     base.diagnostics.extend(diagnostics);
     for (line, sec, key, raw_val) in entries {
-        let value = expand_for_unit(&raw_val, &base.name);
+        let value = expand_for_unit(&raw_val, &base.name, manager);
         if sec == "Unit" && (key == "After" || key == "Before") {
             for target in value.split_whitespace() {
                 base.ordering_edges.push(OrderingEdge {

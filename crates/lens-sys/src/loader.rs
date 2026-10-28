@@ -5,7 +5,10 @@
 //! lexicographic filename order (later files override earlier ones).
 
 use crate::model::{Diagnostic, SystemdUnit};
-use crate::parser::{apply_drop_in, instantiate_template, parse_unit_content, template_name_of};
+use crate::parser::{
+    apply_drop_in_with_manager, instantiate_template_with_manager, parse_unit_content_with_manager,
+    template_name_of, ManagerContext,
+};
 use lens_core::{LensError, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,34 +36,50 @@ fn unit_symlink_target(path: &Path) -> std::io::Result<PathBuf> {
 
 /// Load one unit file, then merge every `*.conf` in its `<name>.d/` directory.
 pub fn load_unit(path: &Path) -> Result<SystemdUnit> {
+    load_unit_with_manager(path, &ManagerContext::default())
+}
+
+pub fn load_unit_with_manager(path: &Path, manager: &ManagerContext) -> Result<SystemdUnit> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unit")
         .to_string();
-    load_named_unit(path, &name, &[path.parent().unwrap_or(Path::new("."))])
+    load_named_unit(
+        path,
+        &name,
+        &[path.parent().unwrap_or(Path::new("."))],
+        manager,
+    )
 }
 
-fn load_named_unit(path: &Path, name: &str, dirs: &[impl AsRef<Path>]) -> Result<SystemdUnit> {
+fn load_named_unit(
+    path: &Path,
+    name: &str,
+    dirs: &[impl AsRef<Path>],
+    manager: &ManagerContext,
+) -> Result<SystemdUnit> {
     let content = lens_core::read_policy::read_to_string(path).map_err(|source| LensError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut unit = parse_unit_content(&content, name, Some(&path.to_string_lossy()));
-    apply_merged_drop_ins(&mut unit, dirs, name);
+    let mut unit =
+        parse_unit_content_with_manager(&content, name, Some(&path.to_string_lossy()), manager);
+    apply_merged_drop_ins(&mut unit, dirs, name, manager);
     Ok(unit)
 }
 
 fn resolve_loaded_instances(
     units: &mut BTreeMap<String, SystemdUnit>,
     dirs: &[impl AsRef<Path>],
+    manager: &ManagerContext,
 ) -> Result<()> {
     crate::resolve::expand_instances(units, |template, name| {
         let mut instance = if let Some(path) = &template.path {
-            load_named_unit(Path::new(path), name, dirs)?
+            load_named_unit(Path::new(path), name, dirs, manager)?
         } else {
-            let mut instance = instantiate_template(template, name);
-            apply_merged_drop_ins(&mut instance, dirs, name);
+            let mut instance = instantiate_template_with_manager(template, name, manager);
+            apply_merged_drop_ins(&mut instance, dirs, name, manager);
             instance
         };
         for dir in dirs.iter().rev() {
@@ -73,6 +92,13 @@ fn resolve_loaded_instances(
 /// Load every unit under `path` — either a single file or a directory of
 /// unit files — each with its drop-ins applied.
 pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
+    load_units_with_manager(path, &ManagerContext::default())
+}
+
+pub fn load_units_with_manager(
+    path: &Path,
+    manager: &ManagerContext,
+) -> Result<BTreeMap<String, SystemdUnit>> {
     let mut units = BTreeMap::new();
     if !path.exists() && !path.is_symlink() {
         // Fail closed: a misspelled --systemd-dir must not yield a vacuous
@@ -188,7 +214,7 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
                 }
             }
         }
-        match load_unit(&p) {
+        match load_unit_with_manager(&p, manager) {
             Ok(unit) => {
                 units.insert(unit.name.clone(), unit);
             }
@@ -225,7 +251,7 @@ pub fn load_units(path: &Path) -> Result<BTreeMap<String, SystemdUnit>> {
     } else {
         path.parent().unwrap_or(Path::new("."))
     };
-    resolve_loaded_instances(&mut units, &[dir])?;
+    resolve_loaded_instances(&mut units, &[dir], manager)?;
     flag_missing_references(&mut units);
     Ok(units)
 }
@@ -381,6 +407,13 @@ fn drop_in_confs(dir: &Path, unit_name: &str, diagnostics: &mut Vec<Diagnostic>)
 /// dirs entirely. Drop-ins from **all** dirs still apply — lowest
 /// precedence first so `/etc` drop-ins win over vendor defaults.
 pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> Result<BTreeMap<String, SystemdUnit>> {
+    load_units_merged_with_manager(dirs, &ManagerContext::default())
+}
+
+pub fn load_units_merged_with_manager(
+    dirs: &[impl AsRef<Path>],
+    manager: &ManagerContext,
+) -> Result<BTreeMap<String, SystemdUnit>> {
     let mut units = BTreeMap::new();
 
     // Collect candidate names per dir in precedence order.
@@ -437,7 +470,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> Result<BTreeMap<String, S
                 path: None,
                 line: None,
             });
-            apply_merged_drop_ins(&mut unit, dirs, &name);
+            apply_merged_drop_ins(&mut unit, dirs, &name, manager);
             units.insert(name, unit);
             continue;
         };
@@ -511,7 +544,12 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> Result<BTreeMap<String, S
         }
 
         let mut unit = match lens_core::read_policy::read_to_string(&p) {
-            Ok(content) => parse_unit_content(&content, &name, Some(&p.to_string_lossy())),
+            Ok(content) => parse_unit_content_with_manager(
+                &content,
+                &name,
+                Some(&p.to_string_lossy()),
+                manager,
+            ),
             Err(e) => {
                 let mut unit = SystemdUnit {
                     name: name.clone(),
@@ -528,7 +566,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> Result<BTreeMap<String, S
                 unit
             }
         };
-        apply_merged_drop_ins(&mut unit, dirs, &name);
+        apply_merged_drop_ins(&mut unit, dirs, &name, manager);
         units.insert(name, unit);
     }
 
@@ -546,7 +584,7 @@ pub fn load_units_merged(dirs: &[impl AsRef<Path>]) -> Result<BTreeMap<String, S
             target.aliases.push(alias_name);
         }
     }
-    resolve_loaded_instances(&mut units, dirs)?;
+    resolve_loaded_instances(&mut units, dirs, manager)?;
     flag_missing_references(&mut units);
     Ok(units)
 }
@@ -586,7 +624,12 @@ fn apply_unit_dep_dirs(dir: &Path, unit: &mut SystemdUnit) {
 
 /// Apply drop-ins from every search dir, lowest precedence dir first so
 /// the highest-precedence dir's conf wins per key.
-fn apply_merged_drop_ins(unit: &mut SystemdUnit, dirs: &[impl AsRef<Path>], unit_name: &str) {
+fn apply_merged_drop_ins(
+    unit: &mut SystemdUnit,
+    dirs: &[impl AsRef<Path>],
+    unit_name: &str,
+    manager: &ManagerContext,
+) {
     // Same-name files override by search-path precedence; all surviving
     // files are then applied in filename order across directories.
     let mut chosen = BTreeMap::new();
@@ -602,7 +645,9 @@ fn apply_merged_drop_ins(unit: &mut SystemdUnit, dirs: &[impl AsRef<Path>], unit
             continue;
         }
         match lens_core::read_policy::read_to_string(&conf) {
-            Ok(content) => apply_drop_in(unit, &content, &conf.to_string_lossy()),
+            Ok(content) => {
+                apply_drop_in_with_manager(unit, &content, &conf.to_string_lossy(), manager)
+            }
             Err(error) => unit.diagnostics.push(Diagnostic {
                 code: "DROPIN_UNREADABLE".to_string(),
                 severity: "warning".to_string(),

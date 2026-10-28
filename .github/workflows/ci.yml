@@ -35,7 +35,9 @@ jobs:
       - name: Check Documentation Consistency
         run: python3 .github/scripts/check_docs.py
       - name: Test Release Flow Scripts
-        run: python3 .github/scripts/test_release_flow.py
+        run: |
+          python3 .github/scripts/test_release_flow.py
+          python3 .github/scripts/test_install.py
 
   build-release:
     name: Build Release Binaries

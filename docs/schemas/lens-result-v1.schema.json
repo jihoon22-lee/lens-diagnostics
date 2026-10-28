@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lens result envelope v1",
+  "type": "object",
+  "required": ["schema_id", "schema_version", "producer", "run_id", "execution", "source", "complete", "findings", "diagnostics", "data"],
+  "properties": {
+    "schema_id": {"const": "lens.result"},
+    "schema_version": {"const": 1},
+    "producer": {
+      "type": "object", "required": ["name", "version"],
+      "properties": {"name": {"const": "lens"}, "version": {"type": "string"}}
+    },
+    "run_id": {"type": ["string", "null"]},
+    "execution": {
+      "type": "object", "required": ["argv", "cwd", "exit_code"],
+      "properties": {
+        "argv": {"type": "array", "items": {"type": "string"}},
+        "cwd": {"type": ["string", "null"]},
+        "exit_code": {"enum": [0, 1]}
+      }
+    },
+    "source": {
+      "type": "object", "required": ["kind", "identity"],
+      "properties": {"kind": {"const": "command"}, "identity": {"type": "array", "items": {"type": "string"}}}
+    },
+    "complete": {"type": "boolean"},
+    "findings": {
+      "type": "array", "items": {
+        "type": "object", "required": ["severity", "code", "message"],
+        "properties": {"severity": {"enum": ["info", "warn", "fail"]}, "code": {"type": "string"}, "message": {"type": "string"}}
+      }
+    },
+    "diagnostics": {"type": "array", "items": {"type": "string"}},
+    "data": {}
+  }
+}

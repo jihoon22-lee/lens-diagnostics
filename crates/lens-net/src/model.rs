@@ -111,6 +111,8 @@ pub struct NetSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<lens_core::collection::CollectionScope>,
     pub schema_version: String,
     pub summary: NetSummary,
     pub sockets: Vec<SocketEntry>,

@@ -7,6 +7,7 @@
 pub mod abi;
 pub mod build;
 pub mod bundle;
+pub mod collect;
 pub mod detect;
 pub mod disk;
 pub mod doctor;
@@ -15,6 +16,7 @@ mod finding;
 pub mod json;
 pub mod log;
 pub mod net;
+pub mod platform;
 pub mod sys;
 pub mod test;
 pub mod trace;

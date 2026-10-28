@@ -20,6 +20,9 @@ pub enum HealthStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorCheck {
+    /// Whether the evidence needed for this check was successfully observed.
+    #[serde(default = "evidence_complete_default")]
+    pub evidence_complete: bool,
     pub category: String,
     pub name: String,
     pub status: HealthStatus,
@@ -49,6 +52,10 @@ pub struct DoctorReport {
     pub summary: DoctorSummary,
 }
 
+fn evidence_complete_default() -> bool {
+    true
+}
+
 /// statvfs one mount point and grade it: space free <5% (or <1 GiB) is
 /// Fail, <15% (or <5 GiB) is Warn; when inode data exists (`f_files>0`)
 /// the same thresholds apply to free-inode % and the final status is the
@@ -76,6 +83,7 @@ fn capacity_check(mount: &Path, name: &str) -> DoctorCheck {
         evaluate_capacity(total_bytes, avail_bytes, inode, mount, name)
     } else {
         DoctorCheck {
+            evidence_complete: false,
             category: "Storage".to_string(),
             name: name.to_string(),
             status: HealthStatus::Warn,
@@ -174,6 +182,7 @@ pub(crate) fn evaluate_capacity(
         ),
     };
     DoctorCheck {
+        evidence_complete: true,
         category: "Storage".to_string(),
         name: name.to_string(),
         status,
@@ -345,6 +354,7 @@ pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
         Ok(r) => r,
         Err(e) => {
             checks.push(DoctorCheck {
+                evidence_complete: false,
                 category: "Network".to_string(),
                 name: "Procfs Network Parsing".to_string(),
                 status: HealthStatus::Warn,
@@ -356,7 +366,35 @@ pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
         }
     };
 
+    if let Some(scope) = &net_report.scope {
+        for (name, capability) in &scope.capabilities {
+            use lens_core::collection::CapabilityState;
+            if capability.state != CapabilityState::Collected {
+                let failed = matches!(
+                    capability.state,
+                    CapabilityState::Denied | CapabilityState::Failed
+                );
+                checks.push(DoctorCheck {
+                    evidence_complete: !failed,
+                    category: "Network".into(),
+                    name: format!("Network Capability {name}"),
+                    status: if failed {
+                        HealthStatus::Warn
+                    } else {
+                        HealthStatus::Skip
+                    },
+                    message: capability
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| format!("{:?}", capability.state)),
+                    next_command: None,
+                    recommendation: None,
+                });
+            }
+        }
+    }
     checks.push(DoctorCheck {
+        evidence_complete: true,
         category: "Network".to_string(),
         name: "Network Sockets Overview".to_string(),
         status: HealthStatus::Pass,
@@ -397,6 +435,7 @@ pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
 
     if !exposed_sensitive.is_empty() {
         checks.push(DoctorCheck {
+            evidence_complete: true,
             category: "Network".to_string(),
             name: "Wildcard Sensitive Listeners".to_string(),
             status: HealthStatus::Warn,
@@ -411,6 +450,7 @@ pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
         });
     } else {
         checks.push(DoctorCheck {
+            evidence_complete: true,
             category: "Network".to_string(),
             name: "Wildcard Sensitive Listeners".to_string(),
             status: HealthStatus::Pass,
@@ -424,6 +464,7 @@ pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
 
     if net_report.summary.orphan_sockets > 0 {
         checks.push(DoctorCheck {
+            evidence_complete: true,
             category: "Network".to_string(),
             name: "Orphan Socket Detection".to_string(),
             status: HealthStatus::Warn,
@@ -440,9 +481,10 @@ pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
         // Permission limits are not orphans — do not warn for sockets we
         // simply could not inspect.
         checks.push(DoctorCheck {
+            evidence_complete: true,
             category: "Network".to_string(),
             name: "Orphan Socket Detection".to_string(),
-            status: HealthStatus::Pass,
+            status: HealthStatus::Skip,
             message: format!(
                 "All attributable sockets have owners; {} socket(s) could not be inspected (permission denied on /proc/<pid>/fd)",
                 net_report.summary.owner_unknown_sockets
@@ -454,6 +496,7 @@ pub fn check_network(proc_path: Option<&Path>) -> Vec<DoctorCheck> {
         });
     } else {
         checks.push(DoctorCheck {
+            evidence_complete: true,
             category: "Network".to_string(),
             name: "Orphan Socket Detection".to_string(),
             status: HealthStatus::Pass,
@@ -508,6 +551,7 @@ pub fn check_services(root: Option<&Path>, systemd_dir: Option<&Path>) -> Result
     let (dirs, explicit) = services_dirs(root, systemd_dir);
     if !dirs.iter().any(|d| d.exists()) {
         return Ok(vec![DoctorCheck {
+            evidence_complete: true,
             category: "Services".to_string(),
             name: "Systemd Dependency Cycles".to_string(),
             status: HealthStatus::Skip,
@@ -520,9 +564,14 @@ pub fn check_services(root: Option<&Path>, systemd_dir: Option<&Path>) -> Result
     let units = load_systemd_units(&dirs, explicit)?;
     let graph = OrderingGraph::build(&units)?;
     let cycles = graph.find_cycles();
+    let evidence_complete = units
+        .values()
+        .flat_map(|u| &u.diagnostics)
+        .all(|d| d.severity == "info");
 
     let cycle_check = if !cycles.is_empty() {
         DoctorCheck {
+            evidence_complete,
             category: "Services".to_string(),
             name: "Systemd Dependency Cycles".to_string(),
             status: HealthStatus::Fail,
@@ -538,6 +587,7 @@ pub fn check_services(root: Option<&Path>, systemd_dir: Option<&Path>) -> Result
         }
     } else {
         DoctorCheck {
+            evidence_complete,
             category: "Services".to_string(),
             name: "Systemd Dependency Cycles".to_string(),
             status: HealthStatus::Pass,
@@ -555,6 +605,7 @@ pub fn check_services(root: Option<&Path>, systemd_dir: Option<&Path>) -> Result
     let diag_total: usize = units.values().map(|u| u.diagnostics.len()).sum();
     if diag_total > 0 {
         checks.push(DoctorCheck {
+            evidence_complete,
             category: "Services".to_string(),
             name: "Systemd Unit Parsing".to_string(),
             status: HealthStatus::Warn,
@@ -588,6 +639,7 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
                     .collect();
                 if !entries.is_empty() {
                     checks.push(DoctorCheck {
+                        evidence_complete: true,
                         category: "Security".to_string(),
                         name: "ld.so.preload Verification".to_string(),
                         status: HealthStatus::Warn,
@@ -603,6 +655,7 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
                     });
                 } else {
                     checks.push(DoctorCheck {
+                        evidence_complete: true,
                         category: "Security".to_string(),
                         name: "ld.so.preload Verification".to_string(),
                         status: HealthStatus::Pass,
@@ -614,6 +667,7 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
             }
             Err(e) => {
                 checks.push(DoctorCheck {
+                    evidence_complete: false,
                     category: "Security".to_string(),
                     name: "ld.so.preload Verification".to_string(),
                     status: HealthStatus::Warn,
@@ -627,6 +681,7 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
         }
     } else {
         checks.push(DoctorCheck {
+            evidence_complete: true,
             category: "Security".to_string(),
             name: "ld.so.preload Verification".to_string(),
             status: HealthStatus::Pass,
@@ -641,6 +696,7 @@ pub fn check_environment(root: Option<&Path>) -> Vec<DoctorCheck> {
         // reporting it under --root would attribute host state to the
         // image.
         checks.push(DoctorCheck {
+            evidence_complete: true,
             category: "Environment".to_string(),
             name: "PATH Sanity".to_string(),
             status: HealthStatus::Skip,
@@ -676,6 +732,7 @@ pub fn check_path_value(path_var: &str) -> DoctorCheck {
     }
     if !suspicious.is_empty() {
         DoctorCheck {
+            evidence_complete: true,
             category: "Environment".to_string(),
             name: "PATH Sanity".to_string(),
             status: HealthStatus::Warn,
@@ -691,6 +748,7 @@ pub fn check_path_value(path_var: &str) -> DoctorCheck {
         }
     } else {
         DoctorCheck {
+            evidence_complete: true,
             category: "Environment".to_string(),
             name: "PATH Sanity".to_string(),
             status: HealthStatus::Pass,
@@ -723,6 +781,7 @@ pub fn run_doctor(
                 checks.extend(check_network(Some(&proc_dir)));
             } else {
                 checks.push(DoctorCheck {
+                    evidence_complete: true,
                     category: "Network".to_string(),
                     name: "Network".to_string(),
                     status: HealthStatus::Skip,
@@ -820,6 +879,15 @@ pub fn run(
         .collect();
     let mut report = Report::new(data);
     report.findings = findings;
+    report.complete = report.data.checks.iter().all(|c| c.evidence_complete);
+    for c in &report.data.checks {
+        if !c.evidence_complete {
+            report
+                .diagnostics
+                .push(format!("{}: {}", c.name, c.message));
+        }
+    }
+    report.diagnostics.push(format!("Scope: root={}, procfs={}, systemd={}; checks describe only available evidence in this namespace.", root.unwrap_or(Path::new("/")).display(), procfs.map(|p| p.display().to_string()).unwrap_or_else(|| root.map(|r| r.join("proc")).unwrap_or_else(|| PathBuf::from("/proc")).display().to_string()), systemd_dir.map(|p| p.display().to_string()).unwrap_or_else(|| "system search directories".into())));
     Ok(report)
 }
 
@@ -839,6 +907,8 @@ pub struct DoctorDiff {
     pub schema: String,
     pub regressed: Vec<DoctorCheckChange>,
     pub improved: Vec<DoctorCheckChange>,
+    /// Transitions into/out of unobserved scope are not health improvements.
+    pub scope_changed: Vec<DoctorCheckChange>,
     /// "category/name" of checks present only in the candidate.
     pub added: Vec<String>,
     /// "category/name" of checks present only in the baseline.
@@ -861,6 +931,7 @@ fn status_rank(s: HealthStatus) -> u8 {
 pub fn diff_reports(base: &DoctorReport, cand: &DoctorReport) -> Report<DoctorDiff> {
     let mut regressed = Vec::new();
     let mut improved = Vec::new();
+    let mut scope_changed = Vec::new();
     let mut added = Vec::new();
     let mut removed = Vec::new();
 
@@ -880,7 +951,11 @@ pub fn diff_reports(base: &DoctorReport, cand: &DoctorReport) -> Report<DoctorDi
                     to: c.status,
                     message: c.message.clone(),
                 };
-                if to > from {
+                if b.status != c.status
+                    && (b.status == HealthStatus::Skip || c.status == HealthStatus::Skip)
+                {
+                    scope_changed.push(change());
+                } else if to > from {
                     regressed.push(change());
                 } else if to < from {
                     improved.push(change());
@@ -903,9 +978,31 @@ pub fn diff_reports(base: &DoctorReport, cand: &DoctorReport) -> Report<DoctorDi
         schema: "lens.doctor-diff/v1".to_string(),
         regressed: regressed.clone(),
         improved: improved.clone(),
+        scope_changed: scope_changed.clone(),
         added,
         removed,
     });
+    report.complete = base
+        .checks
+        .iter()
+        .chain(&cand.checks)
+        .all(|c| c.evidence_complete);
+    if !report.complete {
+        report
+            .diagnostics
+            .push("A compared doctor report contains incomplete evidence".into());
+    }
+    for c in &scope_changed {
+        report.push(
+            match c.to {
+                HealthStatus::Fail => Severity::Fail,
+                HealthStatus::Warn => Severity::Warn,
+                _ => Severity::Info,
+            },
+            "doctor.scope_changed",
+            format!("{}: {:?} -> {:?}", c.name, c.from, c.to),
+        );
+    }
     for c in &regressed {
         report.push(
             if c.to == HealthStatus::Fail {
@@ -1070,6 +1167,7 @@ mod tests {
 
     fn check(category: &str, name: &str, status: HealthStatus) -> DoctorCheck {
         DoctorCheck {
+            evidence_complete: true,
             category: category.to_string(),
             name: name.to_string(),
             status,
@@ -1105,8 +1203,7 @@ mod tests {
                 HealthStatus::Pass,
             ),
             check("Environment", "Old Check", HealthStatus::Pass),
-            // Skip ranks as Pass — a Skip->Warn change must count as a
-            // regression, and Pass->Skip is not an improvement.
+            // Unobserved scope is not a health baseline.
             check("Services", "Skipped Before", HealthStatus::Skip),
         ]);
         let cand = report_of(vec![
@@ -1126,12 +1223,10 @@ mod tests {
         let regressed: Vec<&str> = diff.regressed.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             regressed,
-            vec![
-                "Root Disk Capacity",
-                "Wildcard Sensitive Listeners",
-                "Skipped Before"
-            ]
+            vec!["Root Disk Capacity", "Wildcard Sensitive Listeners"]
         );
+        assert_eq!(diff.scope_changed.len(), 1);
+        assert_eq!(diff.scope_changed[0].name, "Skipped Before");
         assert_eq!(diff.improved.len(), 1);
         assert_eq!(diff.improved[0].name, "Systemd Dependency Cycles");
         assert_eq!(diff.added, vec!["Environment/Brand New"]);

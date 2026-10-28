@@ -96,6 +96,14 @@ def main() -> int:
             schema_references(schema, schema, path, errors)
         except Exception as error:
             errors.append(f"{path.relative_to(ROOT)}: {error}")
+    result_schema = ROOT / "docs/schemas/lens-result-v1.schema.json"
+    result_fixture = ROOT / "docs/fixtures/lens-result-v1.json"
+    if result_schema.exists() and result_fixture.exists():
+        try:
+            schema = json.loads(result_schema.read_text())
+            validator_for(schema)(schema).validate(json.loads(result_fixture.read_text()))
+        except Exception as error:
+            errors.append(f"Lens result fixture: {error}")
     versions(errors)
     for error in errors:
         print(error, file=sys.stderr)

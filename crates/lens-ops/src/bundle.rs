@@ -82,9 +82,11 @@ fn host_snapshot(procfs: Option<&std::path::Path>) -> serde_json::Value {
     let proc_root = procfs.unwrap_or_else(|| std::path::Path::new("/proc"));
     serde_json::json!({
         "schema": "lens.host/v1",
-        "hostname": hostname(proc_root),
+        "hostname": if procfs.is_some() { read_trimmed(&proc_root.join("sys/kernel/hostname")) } else { hostname(proc_root) },
         "kernel_release": read_trimmed(&proc_root.join("sys/kernel/osrelease")),
-        "os_pretty_name": os_pretty_name(),
+        "os_pretty_name": if procfs.is_some() { None } else { os_pretty_name() },
+        "source": {"procfs": proc_root, "kind": if procfs.is_some() {"explicit_procfs"} else {"live_namespace"}},
+        "collector": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH},
         "lens_version": env!("CARGO_PKG_VERSION"),
         "collected_at": lens_core::time::utc_now_iso(),
     })
@@ -273,7 +275,11 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
 
     if req.net {
         collect!("net", "reports/net_report.json", {
-            lens_net::inspect_network(req.procfs.as_deref())
+            let report = crate::net::inspect(req.procfs.as_deref(), false)?;
+            if !report.complete {
+                diagnostics.extend(report.diagnostics);
+            }
+            Ok(report.data)
         });
     }
 
@@ -281,8 +287,12 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
         // Only the report data is embedded — doctor findings describe
         // the host's health, not the snapshot's completeness.
         collect!("doctor", "reports/doctor_report.json", {
-            crate::doctor::run(None, req.procfs.as_deref(), req.systemd_dir.as_deref())
-                .map(|r| r.data)
+            let report =
+                crate::doctor::run(None, req.procfs.as_deref(), req.systemd_dir.as_deref())?;
+            if !report.complete {
+                diagnostics.extend(report.diagnostics);
+            }
+            Ok(report.data)
         });
     }
 
@@ -296,6 +306,51 @@ pub fn create(req: &BundleRequest) -> Result<Report<BundleManifest>> {
             ),
         });
     }
+
+    // Record selected inputs explicitly: an omitted collector is not a
+    // successful zero-result observation. This metadata is hashed with the data.
+    let mut selected = std::collections::BTreeMap::<String, String>::new();
+    for (name, path) in [
+        ("disk", &req.disk),
+        ("log", &req.log),
+        ("trace", &req.trace),
+        ("test", &req.test),
+        ("sys", &req.sys),
+        ("env", &req.env),
+    ] {
+        if let Some(path) = path {
+            selected.insert(name.into(), path.to_string_lossy().into_owned());
+        }
+    }
+    for (name, enabled) in [("net", req.net), ("host", req.host), ("doctor", req.doctor)] {
+        if enabled {
+            selected.insert(
+                name.into(),
+                req.procfs
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("/proc"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    if req.sys_merged {
+        selected.insert("sys".into(), "system manager search directories".into());
+    }
+    if let Some(path) = &req.systemd_dir {
+        selected.insert("doctor_systemd".into(), path.to_string_lossy().into_owned());
+    }
+    let collected_entries: Vec<&str> = artifacts.iter().map(|a| a.name.as_str()).collect();
+    artifacts.push(BundleArtifact::json_with_redaction(
+        "reports/collection_scope.json",
+        &serde_json::json!({
+            "schema": "lens.collection-scope/v1", "requested": selected,
+            "collected_entries": collected_entries, "diagnostics": diagnostics,
+            "collector": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH},
+            "scope": "selected paths and current namespace; omitted sources were not checked"
+        }),
+        req.redact,
+    )?);
 
     if req.redact {
         diagnostics

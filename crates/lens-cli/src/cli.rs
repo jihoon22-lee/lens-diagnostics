@@ -17,6 +17,7 @@ pub enum OutputFormat {
     Text,
     Json,
     Jsonl,
+    Envelope,
 }
 
 /// Global flags, resolved once and passed to `dispatch` — they live on
@@ -33,9 +34,9 @@ pub struct GlobalOpts {
 #[derive(Parser)]
 #[command(name = "lens")]
 #[command(version)]
-#[command(about = "Unified Systems Diagnostics and Forensic Platform", long_about = None)]
+#[command(about = "Lens Diagnostics — system and artifact inspection", long_about = None)]
 pub struct Cli {
-    /// Output format: text, json, or jsonl (log filter only). Each
+    /// Output format: text, json, envelope, or jsonl (log filter only). Each
     /// command keeps its historical default when the flag is absent.
     #[arg(long, value_enum, global = true)]
     pub format: Option<OutputFormat>,
@@ -81,6 +82,29 @@ pub enum AsKind {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Capture a selected journal unit or container into a .lens evidence bundle
+    Collect {
+        #[arg(value_enum)]
+        source: CollectSource,
+        /// Unit or container name; no automatic discovery
+        target: String,
+        #[arg(long)]
+        output: PathBuf,
+        /// User journal manager (journal source only)
+        #[arg(long)]
+        user: bool,
+        /// Source-native time bound (passed as one argument)
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = 1000)]
+        lines: usize,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        redact: bool,
+    },
     /// Filesystem footprint analysis, duplicate detection, and safe cleanup
     Disk {
         #[command(subcommand)]
@@ -318,6 +342,13 @@ pub enum AbiCommands {
 
 #[derive(Subcommand)]
 pub enum LogCommands {
+    /// Compare aggregate log severity counts and observed time windows
+    Diff {
+        /// Older/reference log
+        baseline: PathBuf,
+        /// Newer log
+        candidate: PathBuf,
+    },
     /// Inspect log file metrics and line counts.
     /// Each PATH may be `-` for stdin, a `.gz` file, or a `*`/`?`
     /// filename glob (expanded against its parent directory).
@@ -452,12 +483,18 @@ pub enum SysCommands {
     Inspect {
         /// Unit file or directory; omit to merge the systemd search path
         path: Option<PathBuf>,
+        /// Inspect the current user's manager (XDG paths, account %u/%h)
+        #[arg(long)]
+        user: bool,
     },
     /// Detect ordering cycles in systemd units; with no dir, merges the
     /// systemd search path (/etc, /run, /usr/lib, /lib)
     Cycles {
         /// Unit directory; omit to merge the systemd search path
         dir: Option<PathBuf>,
+        /// Inspect the current user's manager
+        #[arg(long)]
+        user: bool,
     },
     /// Compare two systemd snapshots
     Diff {
@@ -612,4 +649,11 @@ pub enum BundleCommands {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CollectSource {
+    Journal,
+    Docker,
+    Podman,
 }

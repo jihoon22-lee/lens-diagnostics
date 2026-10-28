@@ -246,10 +246,20 @@ mod tests {
 
     #[test]
     fn truncated_graph_is_actionable_at_fail_threshold() {
-        let mut report = Report::new(());
-        graph_status(&mut report, 0, 0, true);
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = String::new();
+        for i in 0..4100 {
+            let name = format!("h{i}.h");
+            std::fs::write(dir.path().join(&name), "").unwrap();
+            source.push_str(&format!("#include \"{name}\"\n"));
+        }
+        let path = database(dir.path(), Some(&source), &["cc", "a.c"]);
+        let report = impact(&path, "h0.h").unwrap();
+        assert!(report.data.scan_truncated);
         assert!(!report.complete);
         assert!(report.is_actionable(Severity::Fail));
+        assert_eq!(report.data.total_impacted, 1);
+        assert!(!inspect(&path).unwrap().complete);
     }
 
     #[test]

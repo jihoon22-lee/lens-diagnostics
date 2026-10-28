@@ -11,6 +11,9 @@ pub use loader::{load_unit, load_units, load_units_merged, SYSTEMD_SEARCH_DIRS};
 pub use model::*;
 pub use parser::{apply_drop_in, expand_specifiers, is_template_name, parse_unit_content};
 
+pub use loader::{load_units_merged_with_manager, load_units_with_manager};
+pub use parser::ManagerContext;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +207,7 @@ ExecStart=/usr/bin/new-daemon --fast
     #[test]
     fn test_diff_systemd_reports_user_and_section_changes() {
         let make_snap = |unit: SystemdUnit| SystemdSnapshot {
+            manager: None,
             schema: SNAPSHOT_SCHEMA_V1.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             semantics: "systemd-255-subset-v1".to_string(),
@@ -240,6 +244,7 @@ ExecStart=/usr/bin/new-daemon --fast
     #[test]
     fn test_diff_systemd() {
         let snap1 = SystemdSnapshot {
+            manager: None,
             schema: SNAPSHOT_SCHEMA_V1.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             semantics: "systemd-255-subset-v1".to_string(),
@@ -256,6 +261,7 @@ ExecStart=/usr/bin/new-daemon --fast
         };
 
         let snap2 = SystemdSnapshot {
+            manager: None,
             schema: SNAPSHOT_SCHEMA_V1.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             semantics: "systemd-255-subset-v1".to_string(),
@@ -285,6 +291,7 @@ ExecStart=/usr/bin/new-daemon --fast
     #[test]
     fn test_s01_diff_systemd_masked_and_alias_of_changes() {
         let make_snap = |unit: SystemdUnit| SystemdSnapshot {
+            manager: None,
             schema: SNAPSHOT_SCHEMA_V1.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             semantics: "systemd-255-subset-v1".to_string(),

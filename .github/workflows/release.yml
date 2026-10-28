@@ -22,6 +22,10 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -83,16 +87,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+        with:
+          targets: x86_64-unknown-linux-musl
+
       - name: Build release binaries
-        run: cargo build --release -p lens-cli -p lens-tui -p lens-mcp
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p lens-cli -p lens-tui -p lens-mcp
 
       - name: Package artifacts
-        run: |
-          set -euo pipefail
-          ARCHIVE="lens-${RELEASE_TAG}-linux-x86_64.tar.gz"
-          mkdir -p dist
-          tar -czf "dist/${ARCHIVE}" -C target/release lens lens-tui lens-mcp
-          (cd dist && sha256sum "${ARCHIVE}" > SHA256SUMS.txt)
+        run: python3 .github/scripts/package_release.py
 
       # Upload to a draft first, re-download what GitHub actually stored, and
       # only then pin the immutable tag and flip the release to published.
@@ -106,16 +108,16 @@ jobs:
         run: |
           set -euo pipefail
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            # Draft is created with the final title and auto-generated notes so
-            # publishing later never leaks placeholder text.
+            # Draft starts with reviewed version-specific notes from CHANGELOG.
             gh release create "$RELEASE_TAG" --target "$SOURCE_SHA" --draft \
-              --title "Release ${RELEASE_TAG}" --generate-notes
+              --title "Lens Diagnostics ${RELEASE_TAG}" --notes-file "$DIST/RELEASE_NOTES.md"
           fi
-          gh release upload "$RELEASE_TAG" "$DIST"/* --clobber
+          gh release upload "$RELEASE_TAG" "$DIST"/*
           VERIFY="$RUNNER_TEMP/verified-assets"
           rm -rf "$VERIFY"
           gh release download "$RELEASE_TAG" --dir "$VERIFY"
           (cd "$VERIFY" && sha256sum -c SHA256SUMS.txt)
+          python3 "$GITHUB_WORKSPACE/.github/scripts/verify_release.py" "$VERIFY" "$RELEASE_TAG" "$SOURCE_SHA"
           EXISTING=""
           if RES="$(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha' 2>/dev/null)"; then
             EXISTING="$RES"
@@ -136,6 +138,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.sha }}
         run: |
           set -euo pipefail
           if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" != "false" ]; then
@@ -146,4 +149,5 @@ jobs:
           rm -rf "$VERIFY"
           gh release download "$RELEASE_TAG" --dir "$VERIFY"
           (cd "$VERIFY" && sha256sum -c SHA256SUMS.txt)
+          python3 "$GITHUB_WORKSPACE/.github/scripts/verify_release.py" "$VERIFY" "$RELEASE_TAG" "$SOURCE_SHA"
           echo "published=true" >> "$GITHUB_OUTPUT"

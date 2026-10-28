@@ -417,8 +417,12 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             Ok(ToolOutcome {
                 value: val,
                 findings: Vec::new(),
-                diagnostics: Vec::new(),
-                complete: true,
+                diagnostics: if lossy_lines > 0 {
+                    vec![format!("{lossy_lines} scanned line(s) contained invalid UTF-8; parsed text is lossy")]
+                } else {
+                    Vec::new()
+                },
+                complete: lossy_lines == 0,
             })
         }
         "lens_log_stats" => {
@@ -481,6 +485,13 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             let baseline = tool_path(args, "baseline")?;
             let candidate = tool_path(args, "candidate")?;
             lens_ops::sys::diff(&baseline, &candidate)
+                .map(ToolOutcome::from)
+                .map_err(|e| e.to_string())
+        }
+        "lens_log_diff" => {
+            let baseline = tool_path(args, "baseline")?;
+            let candidate = tool_path(args, "candidate")?;
+            lens_ops::log::diff(&baseline, &candidate)
                 .map(ToolOutcome::from)
                 .map_err(|e| e.to_string())
         }

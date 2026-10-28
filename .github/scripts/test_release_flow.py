@@ -2,6 +2,8 @@
 """Exercise release shell steps with a local fake GitHub API; never publish."""
 
 import hashlib
+import io
+import tarfile
 import json
 import os
 from pathlib import Path
@@ -70,7 +72,7 @@ if args[:2] == ["release", "download"]:
     for asset in pathlib.Path(os.environ["DIST"]).iterdir():
         shutil.copyfile(asset, destination / asset.name)
     if os.environ.get("MOCK_CORRUPT"):
-        (destination / "artifact.whl").write_text("corrupt")
+        next(destination.glob("*.tar.gz")).write_text("corrupt")
     finish("download")
 if args[:2] == ["release", "edit"]:
     assert state["tag"] == state["target"]
@@ -94,15 +96,23 @@ class ReleaseFlow(unittest.TestCase):
         )
         dist = self.root / "dist"
         dist.mkdir()
-        content = b"verified package"
-        (dist / "artifact.whl").write_bytes(content)
-        (dist / "SHA256SUMS.txt").write_text(
-            hashlib.sha256(content).hexdigest() + "  artifact.whl\n"
-        )
+        content = b"#!/bin/sh\nprintf 'lens 0.5.0\\n'\n"
+        names = ("lens", "lens-tui", "lens-mcp")
+        build = {"version": "0.5.0", "target": "x86_64-unknown-linux-musl", "source_sha": SHA,
+                 "sha256": {name: hashlib.sha256(content).hexdigest() for name in names}}
+        archive = dist / f"lens-{TAG}-x86_64-unknown-linux-musl.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            for name, data in [(name, content) for name in names] + [("BUILD.json", json.dumps(build).encode())]:
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                member.mode = 0o755
+                tar.addfile(member, io.BytesIO(data))
+        (dist / "SHA256SUMS.txt").write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + f"  {archive.name}\n")
         self.environment = {
             **os.environ,
             "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
             "MOCK_STATE": str(self.state_path),
+            "GITHUB_WORKSPACE": str(ROOT),
             "GH_REPO": "owner/repository",
             "RELEASE_TAG": TAG,
             "REQUESTED_SHA": SHA,

@@ -95,6 +95,7 @@ mod tests {
     #[test]
     fn test_diff_net_reports() {
         let left = NetReport {
+            scope: None,
             schema_version: "lens.net/v1".to_string(),
             summary: NetSummary {
                 total_sockets: 1,
@@ -121,6 +122,7 @@ mod tests {
         };
 
         let right = NetReport {
+            scope: None,
             schema_version: "lens.net/v1".to_string(),
             summary: NetSummary {
                 total_sockets: 1,
@@ -174,6 +176,7 @@ mod tests {
 
     fn report(listening: Vec<SocketEntry>, sockets: Vec<SocketEntry>) -> NetReport {
         NetReport {
+            scope: None,
             schema_version: "lens.net/v1".to_string(),
             summary: NetSummary::default(),
             sockets,

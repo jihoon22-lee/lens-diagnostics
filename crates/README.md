@@ -278,3 +278,12 @@ let snap = SnapshotV2::from_tree(&res.tree, res.root_id, res.complete, res.trunc
 ```json
 { "mcpServers": { "lens": { "command": "/path/to/lens-mcp" } } }
 ```
+
+
+## 0.10 추가 계약
+
+`lens-ops`는 source capability, 결과 envelope용 판정, systemd user manager, aggregate log diff,
+선택적 journal/docker/podman 로그 수집을 제공합니다. 외부 adapter는 CLI에서만 명시적으로
+실행합니다. `lens-core`의 POSIX identity backend와 `lens-disk` 취소 토큰은 기존 안전 계약을
+보존합니다. 실제 지원 범위는 [설치 가이드](../docs/INSTALL.md), 결과 소비 계약은
+[RESULT](../docs/RESULT.md)를 따릅니다.

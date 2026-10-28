@@ -310,6 +310,7 @@ pub fn stats(
     bucket_secs: Option<u64>,
 ) -> Result<Report<LogStats>> {
     let mut total_lines = 0u64;
+    let mut lossy_lines = 0usize;
     let mut matched_lines = 0u64;
     let mut by_level: BTreeMap<String, u64> = BTreeMap::new();
     let mut unknown_timestamp = 0u64;
@@ -323,6 +324,7 @@ pub fn stats(
     for path in inputs {
         let indexer = open(path)?;
         total_lines += indexer.len() as u64;
+        lossy_lines += indexer.lossy_lines();
         for idx in 0..indexer.len() {
             let line = indexer.get_line_lossy(idx).unwrap_or_default();
             let record = parse_line(&line, idx + 1);
@@ -378,7 +380,7 @@ pub fn stats(
         .collect();
 
     let fmt = lens_log::timestamp::format_rfc3339_ms;
-    Ok(Report::new(LogStats {
+    let mut report = Report::new(LogStats {
         schema: "lens.log-stats/v1",
         inputs: inputs
             .iter()
@@ -393,7 +395,73 @@ pub fn stats(
         // failure surfaces as null, never a fabricated timestamp.
         unknown_timestamp,
         buckets,
-    }))
+    });
+    if lossy_lines > 0 {
+        report.complete = false;
+        report.diagnostics.push(format!(
+            "{lossy_lines} line(s) contained invalid UTF-8; parsed text is lossy"
+        ));
+    }
+    Ok(report)
+}
+
+/// Aggregate severity comparison. Different time windows are explicitly reported,
+/// not normalized into a rate or treated as evidence of causality.
+#[derive(Debug, serde::Serialize)]
+pub struct LogDiff {
+    pub schema: &'static str,
+    pub baseline: LogStats,
+    pub candidate: LogStats,
+    pub total_lines_delta: i64,
+    pub level_delta: BTreeMap<String, i64>,
+}
+
+pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<LogDiff>> {
+    if baseline.as_os_str() == "-" && candidate.as_os_str() == "-" {
+        return Err(LensError::Usage {
+            message: "stdin may be used for only one side of a log diff".into(),
+        });
+    }
+    let a = stats(&[baseline.to_path_buf()], &LogFilter::new(), None)?;
+    let b = stats(&[candidate.to_path_buf()], &LogFilter::new(), None)?;
+    let level_delta: BTreeMap<String, i64> = a
+        .data
+        .by_level
+        .keys()
+        .chain(b.data.by_level.keys())
+        .map(|key| {
+            (
+                key.clone(),
+                *b.data.by_level.get(key).unwrap_or(&0) as i64
+                    - *a.data.by_level.get(key).unwrap_or(&0) as i64,
+            )
+        })
+        .collect();
+    let mut report = Report::new(LogDiff {
+        schema: "lens.log-diff/v1",
+        total_lines_delta: b.data.total_lines as i64 - a.data.total_lines as i64,
+        level_delta,
+        baseline: a.data,
+        candidate: b.data,
+    });
+    report.complete = a.complete && b.complete;
+    report.diagnostics.extend(a.diagnostics);
+    report.diagnostics.extend(b.diagnostics);
+    report.diagnostics.push("Scope: aggregate counts over the supplied inputs; unequal durations/volumes are not normalized, unknown levels are not treated as errors.".into());
+    for (level, delta) in report.data.level_delta.clone() {
+        if delta > 0 && matches!(level.as_str(), "error" | "fatal" | "warn") {
+            report.push(
+                if level == "warn" {
+                    crate::Severity::Warn
+                } else {
+                    crate::Severity::Fail
+                },
+                "log.level_increase",
+                format!("{level}: {delta:+} line(s)"),
+            );
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

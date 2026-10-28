@@ -230,3 +230,24 @@ cli.rs (인자) → ops.rs dispatch
 - 새 스키마/필드는 명시적으로 추가하고 문서·가이드 동기화.
 - 회귀 테스트는 버그의 실패 모드를 재현하는 최소 케이스로 추가.
 - 커밋은 작업 단위별 conventional commit.
+
+
+## 0.10 범위 계약과 플랫폼 경계
+
+- `lens-core::collection`은 source와 capability 상태(collected/unavailable/denied/failed/excluded)를
+  나타냅니다. 이것은 건강 판정과 별개이며 unavailable을 PASS/0개로 바꾸지 않습니다.
+- POSIX `FileIdentity` 생성과 nonblocking open은 `lens-core::platform` backend에 모았습니다.
+  dev/inode/mode/mtime/ctime 비교와 FIFO race 방어를 유지합니다. native Windows backend를
+  제공하지 않으며, 다른 Unix에서 컴파일된다는 사실만으로 Linux 수집의 동등 지원을 주장하지 않습니다.
+- `lens-ops::platform`은 현재 계정 manager identity 및 user unit 검색 경로를 담당합니다.
+  입력 artifact의 provenance와 현재 collector identity를 섞지 않습니다. 명시 procfs의 누락된
+  hostname/OS 정보를 현재 호스트에서 채워 넣지 않습니다.
+- systemd parser/loader의 `ManagerContext`는 template/drop-in/instance 확장 전 과정에 명시적으로
+  전달됩니다. system 기본 의미론과 user manager identity는 스냅샷에서 구별됩니다.
+- `lens-ops::collect`만 외부 도구를 명시적으로 실행합니다. 선택한 unit/container를 argv로 전달하고
+  process group, timeout, stream별 상한을 적용합니다. MCP의 allow-root가 외부 실행 권한으로
+  확장되지 않도록 collect는 CLI 전용입니다.
+- 디스크 스캔의 `Arc<AtomicBool>` 취소는 cooperative이며 partial evidence를 유지합니다.
+  TUI는 새 요청에서 이전 receiver를 제거해 늦은 결과를 채택하지 않습니다.
+- [envelope](RESULT.md)는 CLI 선택 직렬화입니다. 도메인 JSON 및 MCP bounded pagination은
+  유지하고, 분석 incomplete와 응답 페이지 절단을 구별합니다.
