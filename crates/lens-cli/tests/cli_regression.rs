@@ -1142,7 +1142,7 @@ fn log_filter_shows_lossy_utf8_lines() {
     std::fs::write(&log, bytes).unwrap();
 
     let out = lens(&["log", "filter", log.to_str().unwrap(), "--query", "disk"]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
     let stdout = stdout_of(&out);
     assert!(stdout.contains("disk"), "{stdout}");
     assert!(
@@ -1152,7 +1152,7 @@ fn log_filter_shows_lossy_utf8_lines() {
     );
 
     let out = lens(&["log", "filter", log.to_str().unwrap(), "--format", "json"]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
     let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON output");
     assert_eq!(json["lossy_lines"], serde_json::json!(1));
     assert_eq!(json["total"], serde_json::json!(3));
@@ -3166,7 +3166,7 @@ fn envelope_preserves_domain_json_and_carries_incomplete_decision() {
 
 #[test]
 fn envelope_rejects_streaming_mode_without_writing_payload() {
-    let output = lens(&["log", "filter", "-", "--format", "envelope"]);
+    let output = lens(&["log", "filter", "-", "--follow", "--format", "envelope"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
 }
@@ -3246,4 +3246,32 @@ fn explicit_collector_preserves_failed_source_and_literal_arguments() {
         "json",
     ]);
     assert!(stdout_of(&inspect).contains("source exit=Some(9)"));
+}
+
+#[test]
+fn finite_log_filter_envelope_keeps_requested_limit_as_scope() {
+    let dir = tmp_file(
+        "filter-envelope",
+        "input.log",
+        "INFO one\nERROR two\nERROR three\n",
+    );
+    let out = lens(&[
+        "log",
+        "filter",
+        dir.to_str().unwrap(),
+        "--min-level",
+        "error",
+        "--limit",
+        "1",
+        "--format",
+        "envelope",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["complete"], true);
+    assert_eq!(value["data"]["matched"], 1);
+    assert!(value["diagnostics"][0]
+        .as_str()
+        .unwrap()
+        .contains("match limit Some(1)"));
 }

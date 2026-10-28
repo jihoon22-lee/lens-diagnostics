@@ -69,3 +69,5 @@ CLI `lens`, crate `lens-*`, `.lens`, 기존 schema 및 JSON 기본 출력 유지
 - 전체 Cargo 406개 테스트 통과(이후 log diff/collector stdio/MCP 및 bundle scope 메타데이터 추가로 재검증 중). clippy 첫 실행은 테스트 뒤 re-export/Drop 위치 규칙 위반 발견, 선언 위치 수정.
 - 실제 source smoke 결과: journal user unit(empty observation) source0/lens0/verify0, docker 미존재 container source1/lens1/incomplete/verify0, 실제 계정 user manager name/home 일치. Podman은 로컬 미설치이므로 실제 runtime 시험 미수행(동일 argv/캡처 계약 테스트 적용).
 - 자체 코드 검토 보강: 프로세스 열거/FD 읽기 실패를 capability에 반영하고, 관측 중 종료된 PID는 권한 실패로 오분류하지 않음. unavailable/denied/failed를 구별하고 전체 열거 실패 시 orphan 단정 방지. 빈 XDG_*_DIRS 값에는 표준 fallback 적용. 실패 범위 회귀 테스트 추가.
+- 최종 기능 보강: finite log inspect/filter도 envelope 지원. follow/TUI/completion/trash는 명시 거부. lossy UTF-8은 기존 표시 데이터를 유지하면서 CLI/MCP incomplete 진단을 일치시킴. 제한한 match 수는 의도한 scope라 incomplete로 오분류하지 않음.
+- 기능 PR153: https://github.com/jihoon22-lee/lens-diagnostics/pull/153 (초안). 현재 전체 suite 413개 테스트 통과; 이후 finite filter 추가 회귀는 다음 좁은 검증에서 확인. 이전 '406개' 표기는 집계 오류이며 실제 직전 suite는 408개였음.

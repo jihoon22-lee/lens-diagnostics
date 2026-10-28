@@ -575,6 +575,8 @@ lens diff baseline.log candidate.log
   생략한 collector를 정상 검사 결과로 해석하지 마세요.
 - doctor의 `evidence_complete`는 검사 결과와 별도입니다. Skip↔관측 결과 변화는
   diff의 `scope_changed`이며, 관측하지 못한 상태를 개선으로 계산하지 않습니다.
+- 유효하지 않은 UTF-8은 기존처럼 표시/집계에서 누락하지 않고 대체 문자로 보존합니다.
+  필터·통계·비교 결과는 lossy 진단과 incomplete(종료1)를 함께 표시합니다.
 - 로그 비교는 입력별 severity 수와 시간 구간의 비교입니다. 길이가 다른 관측 구간을
   자동으로 정규화하지 않으며 Unknown을 Error로 바꾸지 않습니다. ERROR/FATAL 증가가
   종료 1이고 WARN 증가는 `--fail-on warn`에서 종료 1입니다.

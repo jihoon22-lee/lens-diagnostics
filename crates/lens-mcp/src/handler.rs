@@ -417,8 +417,12 @@ fn execute_tool_value(name: &str, args: &Value) -> Result<ToolOutcome, String> {
             Ok(ToolOutcome {
                 value: val,
                 findings: Vec::new(),
-                diagnostics: Vec::new(),
-                complete: true,
+                diagnostics: if lossy_lines > 0 {
+                    vec![format!("{lossy_lines} scanned line(s) contained invalid UTF-8; parsed text is lossy")]
+                } else {
+                    Vec::new()
+                },
+                complete: lossy_lines == 0,
             })
         }
         "lens_log_stats" => {

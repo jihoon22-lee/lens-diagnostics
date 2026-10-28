@@ -473,12 +473,12 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     action: DiskCommands::Trash { .. }
                 }
                 | Commands::Log {
-                    action: LogCommands::Inspect { .. } | LogCommands::Filter { .. }
+                    action: LogCommands::Filter { follow: true, .. }
                 }
         )
     {
         return Err(usage(
-            "--format envelope is supported for report commands; log filter uses json/jsonl",
+            "--format envelope requires a finite report command; use text/jsonl for --follow",
         ));
     }
     let mut outcome = Outcome::Clean;
@@ -884,7 +884,8 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     } else {
                         serde_json::Value::Array(blocks)
                     };
-                    outln!("{}", to_deterministic_pretty(&value)?);
+                    let report = Report::new(value);
+                    outln!("{}", render_report(&report.data, &report, opts)?);
                 } else {
                     for (i, (path, indexer)) in paths.iter().zip(&indexers).enumerate() {
                         if i > 0 {
@@ -1012,7 +1013,11 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     } else {
                         inputs_json.into_iter().next().unwrap()
                     };
-                    outln!("{}", to_deterministic_pretty(&value)?);
+                    let mut report = Report::new(value);
+                    report.complete = total_lossy == 0;
+                    report.diagnostics.push(format!("Scope: requested filter and match limit {:?}; excluded {} unknown-level and {} unknown-time lines; {} lossy lines", limit, excluded_unknown, excluded_unknown_ts, total_lossy));
+                    outln!("{}", render_report(&report.data, &report, opts)?);
+                    apply(&mut outcome, &report, threshold);
                 }
 
                 if follow && !stopped {
@@ -1084,6 +1089,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     diagln!("Stopped after {} match(es): --limit reached.", matched);
                 }
                 if total_lossy > 0 {
+                    outcome = Outcome::Findings;
                     diagln!(
                         "{} line(s) contain invalid UTF-8 (shown lossy as U+FFFD).",
                         total_lossy

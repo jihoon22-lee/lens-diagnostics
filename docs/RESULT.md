@@ -10,6 +10,6 @@
 - `findings`: severity info/warn/fail, stable code, message. There is no general path/line contract; consumers must not invent location evidence from message text.
 - `diagnostics`: operational and scope explanations; `data`: the existing command JSON payload.
 
-Reports support this mode. Interactive TUI, completion, trash and streaming log inspect/filter reject it explicitly; log filter retains JSON/JSONL. Finite log stats supports it. MCP retains domain JSON plus a separate findings metadata item; pagination totals/flags describe response trimming independently of analysis `complete`.
+Reports support this mode. Interactive TUI, completion, trash and `log filter --follow` reject it explicitly. Finite log inspect/filter/stats/diff support it; streaming log filter retains text/JSONL. MCP retains domain JSON plus a separate findings metadata item; pagination totals/flags describe response trimming independently of analysis `complete`.
 
 This fixture is synthetic contract evidence, not a claim that a host check ran. Unknown fields must be tolerated; unknown schema versions must not silently be interpreted as v1. argv may contain user-supplied sensitive values: consumers choose storage and redaction policies explicitly.
