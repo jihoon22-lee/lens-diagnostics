@@ -2,6 +2,8 @@
 
 2026-10-28 사용자 승인: 권장 전체 구현, 문서, 버전/태그/공개 릴리스, 소유 작업 자원 정리. 저장소 rename 승인 포함.
 
+현재 P0–P4 구현과 v0.10.0 공개 검증을 완료했다. 중간 진행 기록은 당시 상태의 이력이며, 최종 근거와 종료 절차는 문서 말미의 공개 및 종료 검증을 따른다.
+
 ## 시작 상태와 보존 대상
 - 원본 checkout `/home/jihoon/projects/toy-projects`: main `11c537872473eb38140a7219c7661415c9561dc7`, clean.
 - 시작 당시 local/remote branch main만 존재, worktree 원본 하나, 열린 PR 없음. 공개 latest v0.9.0.
@@ -20,12 +22,12 @@
 - [x] P1-B 수집 capability/범위, doctor Skip/Pass 및 diff 범위 변화, bundle provenance.
 - [x] P2-A 플랫폼 경계: identity/Linux 수집 격리, 기존 안전 계약 유지.
 - [x] P2-B 명시적 systemd user manager와 system 회귀 보호.
-- [ ] P3-A 명시 target 배포 및 설치, checksum/다운로드 실행 검증.
+- [x] P3-A 명시 target 배포 및 설치, checksum/다운로드 실행 검증.
 - [x] P3-B 스캔 취소/오래된 워커 결과 차단/대규모 탐색.
 - [x] P4 로그 비교, 사용자 선택 journald/container 수집 adapter. 기존 stdin/JSONL/JUnit/ABI/env 기능 재사용.
 - [x] docs/README/GUIDE/지원표/CHANGELOG/metadata 갱신, 버전 결정.
 - [x] 필요한 좁은 테스트 및 heavy lock 하 전체 fmt/clippy/test/문서 검사, 실제 MCP 통합, CI/PR 병합.
-- [ ] 릴리스 게시/공개 asset 다운로드 digest 및 smoke 확인.
+- [x] 릴리스 게시/공개 asset 다운로드 digest 및 smoke 확인.
 - [ ] main 동기화, 소유 merged branch/worktree/임시자원 정리.
 
 ## 지원 범위
@@ -77,3 +79,16 @@ CLI `lens`, crate `lens-*`, `.lens`, 기존 schema 및 JSON 기본 출력 유지
 - PR153 최신 head4d48d776 CI Test Workspace/Build Release/Merge Gate 통과 후 병합. 로컬 전체 suite413 + 후속 CLI/MCP134 테스트, clippy/fmt, 문서/schema fixture, release flow6/installer2 통과.
 - x86_64-unknown-linux-musl 실제 release 빌드/INTERP 부재/세 실행파일 help/version, BUILD.json digest/sourceSHA 검증 및 offline installer smoke 통과. worktree/dist의 v0.9.0 파일은 신규 기능 개발판의 로컬 검증용이며 공개 릴리스 v0.9.0 asset을 변경하지 않았음. 해당 dist는 작업 소유, 정리 대상.
 - release/v0.10.0 소유 branch에서 workspace/lock/manifest/changelog 동시 범프. 공개 artifact 검증은 후속 기록으로 남김.
+
+- 공개 릴리스 검증 소유 임시 경로: /tmp/lens-generalization-public-qh9i09vh; verification.json에 source/tag/asset digest/unauthenticated download/online installer/CLI/MCP 결과 기록.
+
+## 공개 및 종료 검증 (2026-10-28)
+- 릴리스 [v0.10.0](https://github.com/jihoon22-lee/lens-diagnostics/releases/tag/v0.10.0) 공개 완료. tag 및 BUILD.json source SHA: `ad68e69d25cc328c52ff3a6e1a8f25aa1a5a9d39`.
+- [릴리스 워크플로](https://github.com/jihoon22-lee/lens-diagnostics/actions/runs/40607821439) 성공. [버전 PR154 CI](https://github.com/jihoon22-lee/lens-diagnostics/actions/runs/40607629616) 테스트414개/실패0, clippy/fmt/문서/schema/배포/설치 검사 성공. PR154와 release merge source의 tree 동일성 확인.
+- 인증 없는 HTTPS로 공개 asset5개를 새로 내려받아 inventory SHA256 모두 확인. target/legacy archive bytes 동일. 온라인 installer를 별도 임시 prefix에 실제 실행하고 세 실행파일 help/version, CLI incomplete exit1 및 run_id/producer0.10.0, MCP findings 페이지절단과 분석 incomplete 구분을 재검증.
+- target 및 legacy archive SHA256: `ead763c46cf09bbaaa6bc6c7cee63adbaab852ae71a1612c559fe2e9fadf3806`. installer SHA256: `3e2004de248d71608c8b0cfbb507884ff5d9e28e230e605a5f01cc76ec927ca6` (release source 파일 bytes와도 일치).
+- [문서 사이트](https://jihoon22-lee.github.io/lens-diagnostics/) 인증 없는 HTTP200 및 Lens Diagnostics title 확인.
+- 원본 checkout을 main release SHA로 fast-forward한 뒤 `/home/jihoon/projects/lens-generalization` worktree(소유 target/dist/cache 포함) 제거, prune 완료. active cwd가 없는 것을 확인했다. local/remote `fix/build-evidence`, `feat/generalization`, `release/v0.10.0` 삭제 완료. 세 브랜치 모두 PR merge와 main ancestor로 변경 보존을 확인했다. merge commit까지 전진한 local ref는 upstream보다 앞서 있었으므로 main ancestry 확인 후 upstream을 해제하고 일반 `branch -d`로 제거했다.
+- 소유 `/tmp/lens-generalization-*` 로그/PR본문/검증스크립트 파일11개 및 smoke/download/install 디렉터리2개를 이름별로 제거했다. 무차별 git clean은 사용하지 않았다. 원본 checkout의 기존 target/cache, 공개 tag/releases, 부모 공통 flock, idk 소유 integration 증거는 보존한다.
+- 이 종료 기록은 원본 checkout의 `docs/generalization-closeout` 브랜치에서 작성한다. 이 문서 PR의 필수 CI/병합 후 원본 main으로 복귀·fast-forward하고 해당 local/remote 기록 브랜치와 PR본문 임시파일을 마지막으로 제거한다. 최종 main SHA와 clean 결과는 세션 최종 보고에 남긴다. 이 항목은 종료 기록 작성 시점의 절차이며 기능/릴리스 미완료를 의미하지 않는다.
+- 원본 로컬 폴더명 `toy-projects`는 활성 Paseo 세션 경로를 보호하기 위해 유지했다. GitHub/제품명/remote는 Lens Diagnostics/lens-diagnostics이며 CLI/crate/schema 이름은 기존 계약을 유지한다. 로컬 폴더 이동은 활성 세션 종료 후 별도로 수행할 수 있다.
