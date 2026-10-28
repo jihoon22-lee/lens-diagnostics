@@ -116,8 +116,8 @@ Lens 책임자는 자신의 저장소를 소유하고 기능·문서·회귀·�
 |---|---|
 | 사용자 방향과 현재 기능 확인 | 반영 |
 | 독립 계획 검토 | Claude·Codex 교차 검토 및 조정 완료 |
-| L0–L8 구현 | 진행 중; 아래 실행 원장 참고 |
-| 제품 검증·PR·릴리스 | 통합 gate 진행 중 |
+| L0–L8 구현 | 완료; 아래 실행 원장 참고 |
+| 제품 검증·PR·릴리스 | PR #156/#157 병합, v0.11.0 공개 및 새 다운로드 검증 완료 |
 
 근거: [CLI](../../crates/lens-cli/src/cli.rs), [출력과 dispatch](../../crates/lens-cli/src/ops.rs), [자동 판별](../../crates/lens-ops/src/detect.rs), [결과 계약](../RESULT.md), [현재 설치](../INSTALL.md), [도메인 안내](../GUIDE.md).
 
@@ -132,8 +132,25 @@ Lens 책임자는 자신의 저장소를 소유하고 기능·문서·회귀·�
 | L3 | 이름 기반 collect/snapshot, 부분 override와 CLI override | stub argv literal·양 스트림·실패 provenance·bundle 무결성 integration | 구현 완료; 실제 외부 runtime은 미실행 |
 | L4/L7 | 선택적 evidence와 5종 고정 consumer corpus | schema·실제 case/env path·bundle pointer 및 이전 JSON round-trip | 구현 완료 |
 | L5 | 적응형 log histogram·단일 TUI worker·비교 범위 | 100만행 전후 JSON 동일, RSS 80976→65280 KiB, 실제 취소 0.264ms | 로컬 측정 완료; [한계/재현](../USABILITY_VALIDATION.md) |
-| L6 | 설치/첫 사용/선택 설정 문서 및 실제 binary smoke | 9 domains·doctor·bundle·TUI PTY·MCP 접근/paging debug 통과 | musl 후보 smoke 통과; 공개 재다운로드 대기 |
-| L8 | 통합/후보/PR/공개/정리 | PR #156 병합 a62b51e; fmt/Clippy/430 tests/musl smoke 통과 | 진행 중 |
+| L6 | 설치/첫 사용/선택 설정 문서 및 실제 binary smoke | 9 domains·doctor·bundle·TUI PTY·MCP 접근/paging debug 통과 | musl 후보·공개 재다운로드 설치 및 CLI/TUI/MCP 통과 |
+| L8 | 통합/후보/PR/공개/정리 | PR #156/#157 Merge Gate 통과, 공개 tag 9d9f6ff; 새 다운로드 digest/설치/실행 통과 | 완료; 아래 정리 범위 참고 |
 
 
 무거운 검증은 `flock /tmp/paseo-products-20261028-heavy.lock` 및 jobs/thread 상한 아래 수행한다. 기존 `target`은 사용자/기존 공유 산출물로 보존한다.
+
+
+### 최종 공개와 정리 범위
+
+- 구현 PR [#156](https://github.com/jihoon22-lee/lens-diagnostics/pull/156),
+  릴리스 PR [#157](https://github.com/jihoon22-lee/lens-diagnostics/pull/157).
+- [v0.11.0](https://github.com/jihoon22-lee/lens-diagnostics/releases/tag/v0.11.0)
+  source/tag SHA `9d9f6ff62cfa6d6fe68fc3dca38d66018586af7d`.
+- 검증 명령·환경 한계·공개 archive와 세 실행파일 digest는
+  [검증 원장](../USABILITY_VALIDATION.md#published-v0110-acceptance)에 기록했다.
+- 구현·릴리스 작업 branch는 정리했다. 이 완료 문서 branch도 병합 뒤 삭제한다.
+  새 worktree는 만들지 않았다. 실제 fixture/설치 prefix는 임시 디렉터리에서
+  검증 후 제거하며, 다운로드·로그·PR 본문 임시 파일도 최종 보고 전에 제거한다.
+- 초기 `docs/usability-execution-plan` branch, 기존 `target`/사용자 cache와 자료,
+  다른 제품의 저장소·산출물 및 공유 heavy lock은 보존한다.
+- 완료 범위는 Linux/WSL x86_64의 실제 검증과 문서화된 미실행 환경 구분을 따른다.
+  로그 인덱스는 여전히 O(lines), build impact는 정적 근사이며 기존 한계를 유지한다.

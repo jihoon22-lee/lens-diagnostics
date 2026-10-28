@@ -114,3 +114,54 @@ The Linux musl build passed the same real-binary acceptance script, including TU
 PTY and MCP permission/pagination checks. All three executables had no ELF
 interpreter. This candidate still used version 0.10.0; the separate 0.11.0 release
 bump and public-asset verification follow.
+
+## Published v0.11.0 acceptance
+
+Release PR [#157](https://github.com/jihoon22-lee/lens-diagnostics/pull/157) passed
+Merge Gate. Tag `v0.11.0` and `BUILD.json.source_sha` both identify
+`9d9f6ff62cfa6d6fe68fc3dca38d66018586af7d`.
+The [release run](https://github.com/jihoon22-lee/lens-diagnostics/actions/runs/40691267570)
+built the explicit Linux musl target, uploaded draft assets, downloaded those
+same assets, checked checksums/source/binary digests and execution, then published.
+The [public release](https://github.com/jihoon22-lee/lens-diagnostics/releases/tag/v0.11.0)
+was independently downloaded again on 2026-10-28. Anonymous HTTPS download of
+the canonical archive was byte-identical to the release API download. Both
+canonical and `linux-x86_64` alias archives have the same SHA-256:
+
+`dc841437d5d750078fcf3326c44816886cc25788a118e96c40f5073e5478645b`
+
+Published executable SHA-256 (verified against archive `BUILD.json`, installed
+bytes, and subsequent extracted copies):
+
+| Binary | SHA-256 |
+|---|---|
+| lens | `88b55d57235312bbdaaf93b1320a96243607bd5faf04b48311a5524f12a92fdc` |
+| lens-tui | `c222585546ba0ad24102be724c07c8f891b5a32343f0f9a0dab4bb47599257b2` |
+| lens-mcp | `7cfa8f91c08a75fc31f94c359f904ab28172823f82b90617889b72bc4253c3da` |
+
+All downloaded checksums passed, including installer and release notes. The
+published binaries use `rustc 1.99.1 (58cf8f9c3 2026-10-13)` and have no ELF
+interpreter. Local build digests are separate measurements; reproducible equality
+between different local/CI compiler environments is not claimed.
+
+Actual public installation/execution checks:
+
+- Fresh prefix containing spaces installed all three executables successfully.
+- Reinstall without `--force` failed and preserved every installed digest;
+  explicit `--force` update succeeded.
+- `verify_release.py` confirmed version, source SHA and executable digests.
+- `acceptance_smoke.py` against that installed prefix passed the full surface
+  table above: all nine domains, doctor, bundle, TUI PTY, MCP root restrictions
+  and pagination, and fixed consumer corpus.
+- Native archive extraction, per-binary digest comparison and `--help` for all
+  three binaries passed with PATH containing only the extracted binaries, with
+  no Python command available. Python is used for the validation harness and
+  optional installer, not required to run the native executables.
+- Installer corruption and replacement regressions passed in the two existing
+  installer tests; six release-flow tests and documentation checks also passed.
+
+Permission, malformed input, partial evidence, external adapter timeout/stream
+caps and MCP boundary cases remain covered by the 430-test workspace suite.
+Actual journal/Docker/Podman runtime integration, native Windows, macOS and
+other CPU architectures were not executed. Net's incomplete current-namespace
+observation remains incomplete; no host-wide success is inferred.
