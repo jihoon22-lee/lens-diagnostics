@@ -465,7 +465,7 @@ AI 어시스턴트 연동용 stdio JSON-RPC 서버. 도구: `lens_disk_scan`,
 `lens_log_filter`, `lens_trace_analyze`, `lens_sys_cycles`,
 `lens_sys_diff`, `lens_test_diff`, `lens_net_diff`, `lens_build_impact`,
 `lens_env_check`, `lens_net_inspect`, `lens_bundle_verify`,
-`lens_bundle_diff`, `lens_log_stats`, `lens_doctor`.
+`lens_bundle_diff`, `lens_log_stats`, `lens_log_diff`, `lens_doctor`.
 
 ```bash
 cargo build --release -p lens-mcp
@@ -541,3 +541,69 @@ parsing. Bundle diff bounds imported collection diagnostics to 128 messages,
 the report remains incomplete when collection evidence is missing.
 Bundle sections deserialize directly into their report types, skipping unknown
 fields without allocating an intermediate JSON tree.
+
+
+## Lens Diagnostics 0.10: 범위와 결과 계약
+
+기존 JSON 도메인 스키마는 그대로 유지합니다. 자동화에서는 `--format envelope`로
+`lens.result` v1의 `complete`, `findings`, `diagnostics`, 실제 입력 JSON을 함께 받습니다.
+[결과 계약](RESULT.md)과 [fixture](fixtures/lens-result-v1.json)를 참조하세요.
+`IDK_RUN_ID`가 있으면 `run_id`에 복사하며, 결과 파일을 암묵적으로 생성하지 않습니다.
+실제 프로세스 종료 상태와 envelope의 판정 코드는 소비자가 각각 보존해야 합니다.
+
+```sh
+lens --format envelope build impact compile_commands.json --header include/common.h
+lens --format envelope sys inspect --user
+lens sys cycles --user ~/.config/systemd/user
+lens log diff baseline.log candidate.log --format envelope
+lens diff baseline.log candidate.log
+```
+
+- build 분석은 리터럴 include의 정적 근사입니다. 전처리 조건, 매크로 include,
+  compiler builtin 검색 경로, include_next의 정확한 검색 순서를 계산하지 않습니다.
+  missing source/forced include, unreadable header, scan cap은 incomplete 및 종료 1입니다.
+- systemd `--user`는 현재 유효 계정의 이름/home 및 XDG 경로를 사용합니다.
+  `Service.User`로 manager identity를 바꾸지 않으며 템플릿/drop-in에도 동일한 context를
+  적용합니다. `%u`, `%h`, `%t` 및 기존 unit specifier 부분집합만 확장합니다.
+  사용자 manager의 실행 상태나 로그인/버스 연결을 검사하는 명령은 아닙니다.
+  경로 우선순위는 [systemd 공식 unit 문서](https://www.freedesktop.org/software/systemd/man/261/systemd.unit.html)를 따르며
+  `SYSTEMD_UNIT_PATH`와 배포판의 커스텀 compiled-in 검색 경로는 자동 재현하지 않습니다.
+- net JSON `scope`는 procfs origin과 프로토콜/소유권 capability를 담습니다.
+  optional 파일 부재는 unavailable이며 socket 0개와 다릅니다. denied/failed evidence는
+  incomplete입니다. 보고서는 현재 namespace만 나타내며 호스트 전체를 주장하지 않습니다.
+- 번들의 `reports/collection_scope.json`은 선택한 입력과 실제 생성한 artifact를 기록합니다.
+  생략한 collector를 정상 검사 결과로 해석하지 마세요.
+- doctor의 `evidence_complete`는 검사 결과와 별도입니다. Skip↔관측 결과 변화는
+  diff의 `scope_changed`이며, 관측하지 못한 상태를 개선으로 계산하지 않습니다.
+- 로그 비교는 입력별 severity 수와 시간 구간의 비교입니다. 길이가 다른 관측 구간을
+  자동으로 정규화하지 않으며 Unknown을 Error로 바꾸지 않습니다. ERROR/FATAL 증가가
+  종료 1이고 WARN 증가는 `--fail-on warn`에서 종료 1입니다.
+- TUI 스캔에서 `c`는 현재 워커를 취소하고 이전 표시를 유지합니다. 새 경로 스캔은
+  이전 receiver를 버리므로 늦게 끝난 결과가 새 화면을 덮지 않습니다. entry cap으로
+  절단한 대형 디렉터리의 선택된 부분집합은 순서를 보장하지 않으며 incomplete입니다.
+
+### 명시적 외부 로그 수집
+
+```sh
+lens collect journal my-app.service --user --since '1 hour ago' --lines 1000 --output journal.lens
+lens collect docker my-container --since 1h --output docker.lens --redact
+lens collect podman my-container --output podman.lens
+lens bundle verify journal.lens
+lens bundle show journal.lens logs/stdout.log | lens log stats -
+```
+
+실행파일은 PATH에서 찾고 argv를 직접 전달합니다. 선택한 unit/container만 읽으며
+shell이나 sudo를 실행하거나 서비스/컨테이너를 변경하지 않습니다. source tool은
+별도 설치가 필요합니다. Docker/Podman은 기존 계정의 runtime context/endpoint를
+사용하므로 원격 context라면 자료 원본도 원격입니다. `--since`는 source-native 문법입니다.
+[journalctl](https://www.freedesktop.org/software/systemd/man/261/journalctl.html),
+[Docker logs](https://docs.docker.com/reference/cli/docker/container/logs/),
+[Podman logs](https://docs.podman.io/en/latest/markdown/podman-logs.1.html) 문서를 참조하세요.
+
+`.lens`에는 `reports/collection.json`, `logs/stdout.log`, `logs/stderr.log`를 저장합니다.
+컨테이너 stderr도 앱 로그일 수 있으므로 stdout과 합치지 않습니다. source 종료 코드,
+수집 시각, argv, 시간/byte 제한을 기록하고 manifest는 저장한 bytes의 SHA-256을 담습니다.
+30초 default timeout(`--timeout` 최대300초), 각 stream 8MiB 상한을 적용합니다.
+강제 중단/실패는 부분 evidence를 남기고 incomplete(종료1), 실행파일 부재는 종료2입니다.
+`--lines`로 지정한 tail은 의도한 수집 범위이고, byte cap은 incomplete입니다.
+재사용 파일을 덮으려면 `--force`가 필요합니다. `--redact`는 기존 번들 redactor를 사용합니다.

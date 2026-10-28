@@ -57,7 +57,11 @@ lens-diagnostics/
 
 ---
 
-## 3. 빌드 및 테스트
+## 3. 설치, 빌드 및 테스트
+
+[설치 가이드와 지원표](docs/INSTALL.md)에서 공개 target, 폐쇄망 전달, 검증 절차를 확인하세요.
+[릴리스](https://github.com/jihoon22-lee/lens-diagnostics/releases)에는 `lens`, `lens-tui`, `lens-mcp`와 체크섬을 제공합니다.
+
 
 ### 전체 테스트 실행 (14개 크레이트 동시 검증)
 ```bash
@@ -163,6 +167,8 @@ $ source <(lens completion bash)
 
 ## 5. 상세 문서
 
+- [결과 envelope 계약](docs/RESULT.md) — 기존 JSON과 선택 `lens.result` v1
+- [설치 및 지원 범위](docs/INSTALL.md)
 - [사용 가이드](docs/GUIDE.md) — 전체 커맨드·출력 스키마·번들 워크플로
 - [아키텍처](docs/ARCHITECTURE.md) — 크레이트 책임, 데이터 흐름, 설계 불변조건
 - [크레이트별 아키텍처·스키마·구현 상태](crates/README.md)
