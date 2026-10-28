@@ -13,8 +13,8 @@ GNU target으로 소스 빌드한 실행파일에는 해당 빌드 환경과 호
 Python 3.10 이상이 있는 환경에서 정확한 버전을 지정해 설치할 수 있습니다.
 
 ```sh
-curl -fLO https://github.com/jihoon22-lee/lens-diagnostics/releases/download/v0.10.0/install.py
-python3 install.py --version v0.10.0
+curl -fLO https://github.com/jihoon22-lee/lens-diagnostics/releases/download/v0.11.0/install.py
+python3 install.py --version v0.11.0
 ~/.local/bin/lens --version
 ```
 
@@ -34,7 +34,7 @@ checksum은 손상 검출용이고, 독립 서명이나 공급자 인증을 의�
   lens_install_dir=$(mktemp -d)
   trap 'rm -rf "$lens_install_dir"' EXIT
   cd "$lens_install_dir"
-  lens_version=v0.10.0
+  lens_version=v0.11.0
   lens_archive="lens-${lens_version}-x86_64-unknown-linux-musl.tar.gz"
   lens_release="https://github.com/jihoon22-lee/lens-diagnostics/releases/download/${lens_version}"
   curl -fLO "$lens_release/$lens_archive"
@@ -68,15 +68,15 @@ checksum은 손상 검출용이고, 독립 서명이나 공급자 인증을 의�
 
 연결된 환경에서 같은 release의 다음 파일을 받습니다.
 
-- `lens-v0.10.0-x86_64-unknown-linux-musl.tar.gz`
+- `lens-v0.11.0-x86_64-unknown-linux-musl.tar.gz`
 - `SHA256SUMS.txt`
 - `install.py`
 
 대상 환경으로 전달한 뒤 네트워크 없이 실행합니다.
 
 ```sh
-python3 install.py --version v0.10.0 \
-  --archive lens-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
+python3 install.py --version v0.11.0 \
+  --archive lens-v0.11.0-x86_64-unknown-linux-musl.tar.gz \
   --checksums SHA256SUMS.txt --prefix "$HOME/.local"
 ```
 

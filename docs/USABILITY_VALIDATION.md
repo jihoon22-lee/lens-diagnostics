@@ -103,3 +103,14 @@ Observed debug SHA-256 at this checkpoint:
 
 Release acceptance must rerun this script against the extracted candidate/public
 binaries and separately verify archive checksums and source identity.
+
+## Integrated implementation candidate
+
+Implementation PR [#156](https://github.com/jihoon22-lee/lens-diagnostics/pull/156)
+passed GitHub Merge Gate and merged as `a62b51e`.
+Local workspace validation passed 430 tests, rustfmt, and Clippy with warnings denied.
+Documentation consistency, six release-flow tests and two installer tests passed.
+The Linux musl build passed the same real-binary acceptance script, including TUI
+PTY and MCP permission/pagination checks. All three executables had no ELF
+interpreter. This candidate still used version 0.10.0; the separate 0.11.0 release
+bump and public-asset verification follow.
