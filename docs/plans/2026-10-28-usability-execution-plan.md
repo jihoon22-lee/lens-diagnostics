@@ -1,6 +1,6 @@
 # Lens 기본 설정과 진단 사용성 개선 실행 계획
 
-2026-10-28 사용자 결정은 간편한 사용성, 독립 제품 완성도, 프로젝트 간 연계 순이다. 좋은 기본값으로 일반 검사를 수행하고 반복 작업이나 특수 환경만 설정한다. 기능을 줄이거나 자동 판별을 없애는 계획이 아니다. 현재는 작업 준비 단계이며 구현·원격 게시·릴리스는 미착수다.
+2026-10-28 사용자 결정은 간편한 사용성, 독립 제품 완성도, 프로젝트 간 연계 순이다. 좋은 기본값으로 일반 검사를 수행하고 반복 작업이나 특수 환경만 설정한다. 기능을 줄이거나 자동 판별을 없애는 계획이 아니다. 2026-10-28 후속 실행 지시로 L0–L8 구현·검증·PR/병합·공개·소유 자원 정리가 승인되었으며 구현을 시작했다.
 
 기준은 main 974f866c7288e12fb9facb734a7a592fd3985137, 공개판 v0.10.0이다. [이전 범용화 기록](../GENERALIZATION.md)은 역사적 완료 근거로 유지한다. 새 기능을 시작하기 전에 실제 HEAD와 사용자 변경을 확인한다.
 
@@ -100,7 +100,7 @@ ici의 Lens importer는 ici가 소유한다. Lens는 원본 envelope와 참조 �
 
 ## 7. 착수와 완료 보고
 
-Lens 책임자는 자신의 저장소를 소유하고 기능·문서·회귀·실행 증거를 같은 작업 단위로 관리한다. 구현은 목적별 branch/PR로 진행한다. 후보 버전 0.11.0은 계획값이며 완료 범위와 호환 영향에 따라 릴리스 단계에서 확정한다. 현재 문서 작성 요청은 구현·공개 시작 승인이 아니다. 실제 실행 지시에서 받은 승인 범위를 확인하고 같은 승인에 반복 확인을 요구하지 않는다.
+Lens 책임자는 자신의 저장소를 소유하고 기능·문서·회귀·실행 증거를 같은 작업 단위로 관리한다. 구현은 목적별 branch/PR로 진행한다. 후보 버전 0.11.0은 계획값이며 완료 범위와 호환 영향에 따라 릴리스 단계에서 확정한다. 후속 실행 지시에서 구현·공개 시작 승인을 받았다. 실제 실행 지시에서 받은 승인 범위를 확인하고 같은 승인에 반복 확인을 요구하지 않는다.
 
 현재 준비 branch는 docs/usability-execution-plan이며 로컬 전용이다. 실제 착수 때 이 문서 commit을 포함한 feature branch/worktree를 만들고 main 대상 PR로 진행한다. 무거운 전체 build/test는 다른 제품 책임자와 host 자원을 조정한다. 계약이 고정된 독립 부분만 병렬화한다.
 
@@ -116,7 +116,24 @@ Lens 책임자는 자신의 저장소를 소유하고 기능·문서·회귀·�
 |---|---|
 | 사용자 방향과 현재 기능 확인 | 반영 |
 | 독립 계획 검토 | Claude·Codex 교차 검토 및 조정 완료 |
-| L0–L8 구현 | 미착수 |
-| 제품 검증·PR·릴리스 | 미착수 |
+| L0–L8 구현 | 진행 중; 아래 실행 원장 참고 |
+| 제품 검증·PR·릴리스 | 통합 gate 진행 중 |
 
 근거: [CLI](../../crates/lens-cli/src/cli.rs), [출력과 dispatch](../../crates/lens-cli/src/ops.rs), [자동 판별](../../crates/lens-ops/src/detect.rs), [결과 계약](../RESULT.md), [현재 설치](../INSTALL.md), [도메인 안내](../GUIDE.md).
+
+### 실행 원장
+
+기준 HEAD `7fb230aab8257c1511de546d08070e8f2e08981b` (계획 포함), main `974f866c7288e12fb9facb734a7a592fd3985137`. Clean checkout 확인 후 `feat/usability-execution` 생성. 적용되는 상위/저장소 AGENTS.md 없음.
+
+| WP | 구현 | 실제 검증 | 완료 판정 |
+|---|---|---|---|
+| L0/L1 | 선택적 resolver·경계·우선순위·init/explain·disk 범위 | 7 unit 및 설정 integration 통과; 29 report 명령 TTY/pipe/명시 format 행렬 | 구현 완료, 전체 gate 진행 |
+| L2 | JUnit 사례/원인, 제한된 요약과 근거·전체 조회 안내, 시작 도움말 | 긴 메시지/25개 실패 사례에서 text 제한 및 envelope 25개 보존 | 구현 완료 |
+| L3 | 이름 기반 collect/snapshot, 부분 override와 CLI override | stub argv literal·양 스트림·실패 provenance·bundle 무결성 integration | 구현 완료; 실제 외부 runtime은 미실행 |
+| L4/L7 | 선택적 evidence와 5종 고정 consumer corpus | schema·실제 case/env path·bundle pointer 및 이전 JSON round-trip | 구현 완료 |
+| L5 | 적응형 log histogram·단일 TUI worker·비교 범위 | 100만행 전후 JSON 동일, RSS 80976→65280 KiB, 실제 취소 0.264ms | 로컬 측정 완료; [한계/재현](../USABILITY_VALIDATION.md) |
+| L6 | 설치/첫 사용/선택 설정 문서 및 실제 binary smoke | 9 domains·doctor·bundle·TUI PTY·MCP 접근/paging debug 통과 | native 후보 및 공개 재다운로드 대기 |
+| L8 | 통합/후보/PR/공개/정리 | 전체 fmt/Clippy/tests 및 musl build 진행 | 진행 중 |
+
+
+무거운 검증은 `flock /tmp/paseo-products-20261028-heavy.lock` 및 jobs/thread 상한 아래 수행한다. 기존 `target`은 사용자/기존 공유 산출물로 보존한다.

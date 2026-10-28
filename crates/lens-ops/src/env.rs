@@ -7,10 +7,11 @@ use crate::{json, Finding, Report, Severity};
 
 /// Shared env findings: missing/conflicting deps are Fail, shadowing is
 /// Warn, unevaluated requirements are Info.
-fn venv_findings(venv: &PyVenv) -> Vec<Finding> {
+fn venv_findings(venv: &PyVenv, prefix: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     for d in &venv.missing_dependencies {
         findings.push(Finding {
+            evidence: None,
             severity: Severity::Fail,
             code: "env.missing".to_string(),
             message: d.clone(),
@@ -18,13 +19,19 @@ fn venv_findings(venv: &PyVenv) -> Vec<Finding> {
     }
     for d in &venv.version_conflicts {
         findings.push(Finding {
+            evidence: None,
             severity: Severity::Fail,
             code: "env.conflict".to_string(),
             message: d.clone(),
         });
     }
-    for i in &venv.shadowing_issues {
+    for (index, i) in venv.shadowing_issues.iter().enumerate() {
         findings.push(Finding {
+            evidence: Some(crate::FindingEvidence {
+                data_pointer: format!("{prefix}/shadowing_issues/{index}"),
+                path: Some(i.local_path.clone()),
+                object: Some(i.module_name.clone()),
+            }),
             severity: Severity::Warn,
             code: "env.shadowing".to_string(),
             message: format!("{} ({}) shadows {}", i.module_name, i.local_path, i.shadows),
@@ -32,6 +39,7 @@ fn venv_findings(venv: &PyVenv) -> Vec<Finding> {
     }
     for d in &venv.unevaluated_dependencies {
         findings.push(Finding {
+            evidence: None,
             severity: Severity::Info,
             code: "env.unevaluated".to_string(),
             message: format!("{d} — requirement marker could not be evaluated"),
@@ -54,7 +62,7 @@ pub fn inspect(venv_path: &Path, project: Option<&Path>) -> Result<Report<EnvSna
     if let Some(proj) = project {
         venv.shadowing_issues = detect_shadowing(proj, &venv.packages);
     }
-    let findings = venv_findings(&venv);
+    let findings = venv_findings(&venv, "/venv");
     let snapshot = EnvSnapshot {
         schema: lens_env::SNAPSHOT_SCHEMA_V1.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -70,7 +78,7 @@ pub fn inspect(venv_path: &Path, project: Option<&Path>) -> Result<Report<EnvSna
 pub fn check(venv_path: &Path, extras: &[String]) -> Result<Report<PyVenv>> {
     let venv = open_venv(venv_path, extras)?;
     let mut report = Report::new(venv);
-    report.findings = venv_findings(&report.data);
+    report.findings = venv_findings(&report.data, "");
     Ok(report)
 }
 

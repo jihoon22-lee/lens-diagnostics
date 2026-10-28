@@ -1,0 +1,49 @@
+{
+  "schema_id": "lens.result",
+  "schema_version": 1,
+  "producer": {
+    "name": "lens",
+    "version": "0.10.0"
+  },
+  "run_id": "fixture-run-1",
+  "execution": {
+    "argv": [
+      "lens",
+      "--format",
+      "envelope",
+      "build",
+      "impact",
+      "compile_commands.json",
+      "--header",
+      "missing.h"
+    ],
+    "cwd": "/project",
+    "exit_code": 0
+  },
+  "source": {
+    "kind": "command",
+    "identity": [
+      "lens",
+      "--format",
+      "envelope",
+      "build",
+      "impact",
+      "compile_commands.json",
+      "--header",
+      "missing.h"
+    ]
+  },
+  "complete": true,
+  "findings": [],
+  "diagnostics": [],
+  "data": {
+    "schema": "buildscope.impact/v1",
+    "target_header": "/project/missing.h",
+    "impacted_units": [],
+    "total_impacted": 0,
+    "scan_truncated": false,
+    "missing_sources": 1,
+    "unresolved_includes": 0,
+    "hint": "header is not in the include graph"
+  }
+}

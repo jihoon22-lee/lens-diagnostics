@@ -1,0 +1,57 @@
+{
+  "schema_id": "lens.result",
+  "schema_version": 1,
+  "producer": {
+    "name": "lens",
+    "version": "0.10.0"
+  },
+  "run_id": "fixture-run-1",
+  "execution": {
+    "argv": [
+      "lens",
+      "--format",
+      "envelope",
+      "build",
+      "impact",
+      "compile_commands.json",
+      "--header",
+      "missing.h"
+    ],
+    "cwd": "/project",
+    "exit_code": 1
+  },
+  "source": {
+    "kind": "command",
+    "identity": [
+      "lens",
+      "--format",
+      "envelope",
+      "build",
+      "impact",
+      "compile_commands.json",
+      "--header",
+      "missing.h"
+    ]
+  },
+  "complete": false,
+  "findings": [
+    {
+      "severity": "warn",
+      "code": "build.incomplete_graph",
+      "message": "impact graph incomplete: 1 missing source(s), 0 unresolved include(s), truncated=false"
+    }
+  ],
+  "diagnostics": [
+    "Scope: static literal includes only; compiler builtin headers, macro expansion, conditional preprocessing and include_next search semantics are not evaluated. Empty impact does not prove that no rebuild is needed."
+  ],
+  "data": {
+    "schema": "buildscope.impact/v1",
+    "target_header": "/project/missing.h",
+    "impacted_units": [],
+    "total_impacted": 0,
+    "scan_truncated": false,
+    "missing_sources": 1,
+    "unresolved_includes": 0,
+    "hint": "header is not in the include graph"
+  }
+}

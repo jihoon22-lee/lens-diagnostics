@@ -9,7 +9,7 @@ pub enum FailOn {
 }
 
 /// `--format` output selector, unified across report commands.
-/// Commands keep their historical default when the flag is absent.
+/// With no preference, terminals use text and pipelines keep historical defaults.
 /// `jsonl` is honored by `log filter` (one object per matched line);
 /// elsewhere it falls back to `json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -34,10 +34,19 @@ pub struct GlobalOpts {
 #[derive(Parser)]
 #[command(name = "lens")]
 #[command(version)]
+#[command(
+    after_help = "Start here: lens inspect PATH\nCompare: lens diff BASE CURRENT\nOptional defaults: lens config init\nRepeat a configured capture: lens run NAME"
+)]
 #[command(about = "Lens Diagnostics — system and artifact inspection", long_about = None)]
 pub struct Cli {
-    /// Output format: text, json, envelope, or jsonl (log filter only). Each
-    /// command keeps its historical default when the flag is absent.
+    /// Read only this configuration file and built-in defaults
+    #[arg(long, global = true, conflicts_with = "no_config")]
+    pub config: Option<PathBuf>,
+    /// Disable persistent configuration discovery
+    #[arg(long, global = true)]
+    pub no_config: bool,
+    /// Output format: text, json, envelope, or jsonl (log filter only).
+    /// Defaults to text in terminals, historical command defaults in pipes.
     #[arg(long, value_enum, global = true)]
     pub format: Option<OutputFormat>,
     /// Emit the report as JSON (equivalent to --format json)
@@ -82,6 +91,17 @@ pub enum AsKind {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Explain effective settings or create an optional minimal lens.toml
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
+    /// Run a named collection or snapshot declared in lens.toml
+    Run {
+        name: String,
+        #[command(flatten)]
+        options: RunOverrides,
+    },
     /// Capture a selected journal unit or container into a .lens evidence bundle
     Collect {
         #[arg(value_enum)]
@@ -656,4 +676,48 @@ pub enum CollectSource {
     Journal,
     Docker,
     Podman,
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommands {
+    Explain,
+    Init {
+        #[arg(default_value = "lens.toml")]
+        path: PathBuf,
+    },
+}
+
+/// Explicit overrides for a named collection or snapshot.
+#[derive(clap::Args, Default)]
+pub struct RunOverrides {
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub target: Option<String>,
+    #[arg(long)]
+    pub since: Option<String>,
+    #[arg(long)]
+    pub lines: Option<usize>,
+    #[arg(long)]
+    pub timeout: Option<u64>,
+    #[arg(long, num_args=0..=1, default_missing_value="true")]
+    pub user: Option<bool>,
+    #[arg(long, num_args=0..=1, default_missing_value="true")]
+    pub redact: Option<bool>,
+    #[arg(long)]
+    pub force: bool,
+    #[arg(long)]
+    pub procfs: Option<PathBuf>,
+    #[arg(long)]
+    pub systemd_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub log: Option<PathBuf>,
+    #[arg(long)]
+    pub disk: Option<PathBuf>,
+    #[arg(long)]
+    pub env: Option<PathBuf>,
+    #[arg(long)]
+    pub test: Option<PathBuf>,
+    #[arg(long)]
+    pub trace: Option<PathBuf>,
 }

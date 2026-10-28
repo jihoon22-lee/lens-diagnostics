@@ -1,104 +1,49 @@
 # Lens Diagnostics (`lens`)
 
-Linux 시스템 상태와 개발 산출물을 검사·비교하고 근거를 `.lens` 번들로 공유하는 CLI 도구입니다. 파일 분석, 호스트 수집, 대화형 TUI 및 MCP 연결을 제공합니다.
+Linux 시스템과 개발 산출물을 검사하고 두 결과를 비교하는 도구입니다. 로그, JUnit, ELF, 디렉터리 등을 자동 판별하며 `.lens` 번들, TUI와 MCP도 제공합니다. idk나 ici 설치는 필요하지 않습니다.
 
-파편화되어 있던 기존 8개 독립 도구(`diskmap`, `abilens`, `loglens`, `testlens`, `tracelens`, `servicelens`, `buildscope`, `envlens`)의 엄격한 계약(Fail-Closed, Evidence-Bound, Schema 호환)을 온전히 계승하면서, **단일 Rust CLI 바이너리(`lens`), mmap 기반 Zero-Copy I/O, 사고 포렌식 비행기록장치(`.lens` bundle)**로 전면 재개발 및 현대화되었습니다.
+## 설치
+
+Linux x86_64에서는 버전을 지정한 공식 installer를 권장합니다. Python 3.10 이상이 필요합니다.
+
+```sh
+curl -fLO https://github.com/jihoon22-lee/lens-diagnostics/releases/download/v0.10.0/install.py
+python3 install.py --version v0.10.0
+~/.local/bin/lens --version
+```
+
+`~/.local/bin`을 PATH에 추가한 뒤 다음 명령을 사용하세요. Python 없는 설치, 체크섬 확인, 업데이트와 기존 실행파일 충돌은 [설치 가이드](docs/INSTALL.md)에 설명되어 있습니다.
+
+## 첫 검사와 비교
+
+```sh
+lens inspect target/junit.xml
+lens inspect /var/log/syslog
+lens inspect .
+lens diff baseline.xml candidate.xml
+lens doctor
+```
+
+검사 대상을 지정하면 도메인을 자동 판별합니다. 터미널에서는 사람이 읽는 text가 기본이며 파이프에서는 기존 명령별 형식을 유지합니다. 자동화는 `--format json` 또는 `--format envelope`를 명시하세요. 종료 코드 0은 설정된 실패 기준을 넘지 않았다는 뜻이며 모든 대상의 정상이나 전체 수집을 보장하지 않습니다. 불완전 결과는 종료 코드 1입니다.
+
+## 반복 작업만 설정하기
+
+설정 없이 바로 사용할 수 있습니다. 반복하는 정책만 프로젝트의 선택적 `lens.toml`에 기록하세요.
+
+```toml
+schema_version = 1
+
+[policy]
+fail_on = "warn"
+```
+
+`lens config init`은 기본 의미를 바꾸지 않는 최소 파일을 만들고, `lens config explain`은 선택된 설정과 탐색 경계를 보여줍니다. `--no-config`는 파일 설정을 끄며 `--config PATH`는 해당 파일만 사용합니다. 출력 형식은 개인 선호가 프로젝트보다 우선하고 명시 CLI 옵션이 최종 우선입니다. 자세한 규칙과 명명된 수집은 [사용 가이드](docs/GUIDE.md)를 참조하세요.
 
 ## 지원 범위
 
-- Linux 우선입니다. WSL과 컨테이너에서는 노출된 `/proc`, 파일 권한, systemd 유무에 따라 수집 범위가 달라집니다. 호스트 전체를 검사했다고 해석하지 마세요.
-- ELF, 로그, JUnit, strace, compile database, Python 환경의 파일 기반 분석을 제공합니다. macOS/native Windows의 동등 지원, PE/Mach-O 분석은 이번 릴리스 범위에 포함하지 않습니다.
-- `build impact`는 리터럴 include의 정적 근사입니다. 전처리 조건·매크로·컴파일러 내장 검색 경로를 재현하지 않으므로 컴파일러 depfile을 대체하지 않습니다. 누락·미해결·스캔 절단은 incomplete로 판정합니다.
-- 단일 실행 파일이라는 설명은 정적 링크 보장이 아닙니다. GNU target은 호환 glibc가 필요하며, 폐쇄망에서는 배포 target과 체크섬을 확인하여 전달해야 합니다.
+Linux x86_64 musl 배포를 제공합니다. WSL과 컨테이너에서는 노출된 `/proc`, 권한, systemd 유무에 따라 수집 범위가 달라집니다. macOS/native Windows 동등 지원과 PE/Mach-O 분석은 포함하지 않습니다. `build impact`는 정적 include 근사이며 compiler depfile을 대체하지 않습니다.
 
----
-
-## 1. 아키텍처 및 워크스페이스 구조 (`crates/`)
-
-플랫폼은 14개의 고성능 모듈식 Rust 크레이트로 구성되어 있습니다.
-
-```text
-lens-diagnostics/
-├── Cargo.toml          루트 워크스페이스 정의
-├── crates/
-│   ├── lens-core/      공통 기반 (Zero-Copy I/O, SafeInput TOCTOU 방어, SHA-256, 3상태 Diff, 번들 매니페스트 무결성 검증)
-│   ├── lens-disk/      스토리지 분석, 연속 메모리 아레나 트리, 중복 파일 탐지, FreeDesktop Trash
-│   ├── lens-abi/       ELF 동적 심볼 검사, C++/Rust 심볼 디맹글링, ABI 3상태 Diff
-│   ├── lens-log/       mmap 제로카피 라인 인덱서, 무할당 필터 평가, Session v2
-│   ├── lens-test/      quick-xml 초고속 스트리밍 테스트 파서, 회귀 자동 탐지
-│   ├── lens-trace/     strace 스트리밍 파서, FD 누수/IO 처리량 추적, 미완료 스레드 복원, 지연/에러 diff
-│   ├── lens-sys/       systemd 유닛/드롭인 파서, Specifier 확장, Tarjan SCC 순환 탐지
-│   ├── lens-build/     compile_commands.json 파서, 플래그 정규화, 헤더 영향도 역방향 DAG
-│   ├── lens-env/       Zero-Code Python venv 분석기, 미충족 패키지 검사, import 섀도잉 탐지
-│   ├── lens-net/       네트워크 소켓 포렌식, IPv4/IPv6 /proc/net 무실행 파싱, 프로세스 FD 상관관계, 포트 Diff
-│   ├── lens-ops/       공유 오퍼레이션 레이어 — 수집+판정 `Report<T>`/findings, doctor 구현, 번들 수집
-│   ├── lens-cli/       단일 통합 CLI (`lens`), 시스템 종합 진단 (`doctor`), 셸 자동완성, 포렌식 번들
-│   ├── lens-tui/       대화형 터미널 UI 대시보드 (Storage, Services, Logs, Network 실데이터)
-│   └── lens-mcp/       AI 어시스턴트(Claude, Antigravity) 연동용 Model Context Protocol 서버
-```
-
----
-
-## 2. 레거시 도구 대비 혁신 지표
-
-| 영역 | 기존 레거시 도구 | 차세대 Rust 엔진 (`lens`) |
-|---|---|---|
-| **배포 형태** | Qt6, Python, libstdc++ 런타임 종속 8개 분열 | 단일 CLI 바이너리 (`lens`) |
-| **디스크 트리 저장** | 경로별 개체 분산 할당 | `u32` 인덱스 연속 아레나(`ArenaTree`), 캐시 지역성 확보 |
-| **로그 검색 핫패스** | 검색 시마다 `toLowerAscii` 힙 할당 (100만회+) | mmap 라인 인덱싱 + 무할당 슬라이딩 윈도우 필터 (`contains_insensitive`) |
-| **테스트 XML 파싱** | Python `defusedxml` | `quick-xml` 스트리밍 파서 |
-| **strace 다중스레드** | C++ 파서 복잡성, 스레드 중첩 분실 위험 | 비동기 호출 매칭 및 스트리밍 파서 |
-| **systemd 정적 분석** | Python AST 파싱 | 무평가 정적 파서 + Tarjan SCC 순환 그래프 탐지 |
-| **빌드 영향도 분석** | CMake 캐시 수동 파싱 | 헤더→소스 역방향 영향도 분석 |
-| **Python 환경 감사** | Python 인터프리터 구동 위험 | 제로 코드 실행 정적 메타데이터 & 섀도잉 감사 |
-| **사고 포렌식 기록** | 도구별 산출물 수동 수집 | 통합 `.lens` 비행기록장치 번들 생성/검사/검증 |
-
-> 정확한 구현 상태와 한계는 [crates/README.md](crates/README.md)와 소스를 참조하세요. 심볼 버전 수집, DWARF 타입 추출, `.d/` drop-in 병합 등이 구현되어 있습니다.
-
----
-
-## 3. 설치, 빌드 및 테스트
-
-[설치 가이드와 지원표](docs/INSTALL.md)에서 공개 target, 폐쇄망 전달, 검증 절차를 확인하세요.
-[릴리스](https://github.com/jihoon22-lee/lens-diagnostics/releases)에는 `lens`, `lens-tui`, `lens-mcp`와 체크섬을 제공합니다.
-
-
-### 전체 테스트 실행 (14개 크레이트 동시 검증)
-```bash
-cargo test --workspace --jobs 2
-```
-
-### 릴리즈 바이너리 컴파일
-```bash
-cargo build --release -p lens-cli --jobs 2
-# 생성 바이너리: target/release/lens
-```
-
-### 릴리스 절차
-
-버전 범프는 수동 PR로 진행한다 (release-please가 생성하지 않음).
-
-1. `main`에서 `release/vX.Y.Z` 브랜치를 만들고 `chore(release): vX.Y.Z`
-   커밋 하나로 다음을 수정한다:
-   - `.release-please-manifest.json` — `"."` 버전
-   - `Cargo.toml` — `[workspace.package] version`
-   - `Cargo.lock` — `cargo check`로 재생성 (lens-* 크레이트 버전만 바뀌어야 함)
-   - `CHANGELOG.md` — `## Unreleased` 헤딩을 `## X.Y.Z`로 바꾸고 한 줄 요약 추가
-2. CI Merge Gate 통과 후 머지 커밋으로 병합한다. Merge Gate는
-   `main` 대상 PR에서만 동작하므로 스택드 PR 체인은 머지할 수 없다 —
-   통합 브랜치를 `main`으로 머지할 것.
-3. 머지되면 release-please 워크플로가 manifest 버전과 기존 태그를
-   비교해 태그가 없으면 Release 워크플로를 자동으로 호출한다.
-   아티팩트 빌드와 `SHA256SUMS` 검증 후 해당 SHA에 태그를 만들어
-   릴리스를 발행한다. 자동 호출이 실패했거나 건너뛴 경우에는
-   수동으로 실행할 수 있다:
-   ```bash
-   gh workflow run release.yml -f tag=vX.Y.Z -f sha=<머지 커밋 SHA>
-   ```
-
----
-
-## 4. 통합 CLI 사용법 (`lens`)
+## 도메인별 사용법 (`lens`)
 
 단일 실행 파일 `lens` 하나로 9개 진단 도메인(disk, abi, log, test, trace, sys, build, env, net)의 기능과 포렌식 번들링을 모두 실행할 수 있습니다.
 
@@ -165,7 +110,7 @@ $ source <(lens completion bash)
 
 ---
 
-## 5. 상세 문서
+## 상세 문서
 
 - [결과 envelope 계약](docs/RESULT.md) — 기존 JSON과 선택 `lens.result` v1
 - [설치 및 지원 범위](docs/INSTALL.md)
@@ -174,3 +119,5 @@ $ source <(lens completion bash)
 - [크레이트별 아키텍처·스키마·구현 상태](crates/README.md)
 - [로드맵](ROADMAP.md)
 - [변경 이력](CHANGELOG.md)
+
+- [개발·테스트·릴리스 절차](docs/DEVELOPMENT.md)

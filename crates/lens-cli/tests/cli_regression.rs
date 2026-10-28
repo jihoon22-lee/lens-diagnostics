@@ -3275,3 +3275,134 @@ fn finite_log_filter_envelope_keeps_requested_limit_as_scope() {
         .unwrap()
         .contains("match limit Some(1)"));
 }
+
+#[test]
+fn junit_text_shows_failure_evidence_and_bounds_details_only() {
+    let mut xml = String::from("<testsuite>");
+    for i in 0..25 {
+        xml.push_str(&format!("<testcase name=\"case{i}\" classname=\"Checkout\"><failure message=\"expected paid but got pending {}\"/></testcase>", "x".repeat(1000)));
+    }
+    xml.push_str("</testsuite>");
+    let file = tmp_file("failure-summary", "junit.xml", &xml);
+    let output = lens(&[
+        "--no-config",
+        "--fail-on",
+        "warn",
+        "--format",
+        "text",
+        "inspect",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout_of(&output);
+    assert!(
+        text.contains("case0") && text.contains("expected paid but got pending"),
+        "{text}"
+    );
+    assert!(text.contains("5 more failing cases omitted"), "{text}");
+    assert!(!text.contains(&"x".repeat(500)));
+    let output = lens(&[
+        "--no-config",
+        "--format",
+        "envelope",
+        "inspect",
+        file.to_str().unwrap(),
+    ]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["cases"].as_array().unwrap().len(), 25);
+    assert!(json["data"]["cases"][0]["message"].as_str().unwrap().len() > 1000);
+}
+
+#[test]
+fn config_init_preserves_default_report_and_refuses_overwrite() {
+    let dir = tmp_dir("config-init");
+    std::fs::write(dir.join("report.xml"), JUNIT_XML).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_lens"))
+            .current_dir(&dir.path)
+            .env("XDG_CONFIG_HOME", dir.join("preferences"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let before = run(&["inspect", "report.xml"]);
+    assert!(before.status.success(), "{}", stderr_of(&before));
+    assert!(run(&["config", "init"]).status.success());
+    let after = run(&["inspect", "report.xml"]);
+    let mut before_json: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    let mut after_json: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    before_json.as_object_mut().unwrap().remove("collected_at");
+    after_json.as_object_mut().unwrap().remove("collected_at");
+    assert_eq!(before_json, after_json);
+    assert_eq!(before.status.code(), after.status.code());
+    let contents = std::fs::read(dir.join("lens.toml")).unwrap();
+    assert_eq!(run(&["config", "init"]).status.code(), Some(2));
+    assert_eq!(std::fs::read(dir.join("lens.toml")).unwrap(), contents);
+    let explain = run(&["config", "explain"]);
+    assert!(explain.status.success());
+    assert!(stdout_of(&explain).contains("lens.toml"));
+}
+
+#[cfg(unix)]
+#[test]
+fn config_named_collection_preserves_argv_streams_and_provenance() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir("named-collection");
+    let executable = dir.join("docker");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'configured source diagnostic\\n' >&2\nexit 9\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("lens.toml"), "schema_version=1\n[collect.api]\nsource='docker'\ntarget='name;not-a-shell-command'\noutput='named.lens'\nlines=12\nsince='2 hours ago'\n").unwrap();
+    let child = dir.join("child");
+    std::fs::create_dir(&child).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_lens"))
+        .current_dir(&child)
+        .env("PATH", &dir.path)
+        .env("XDG_CONFIG_HOME", dir.join("preferences"))
+        .args(["run", "api", "--format", "envelope"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["complete"], false);
+    assert_eq!(value["data"]["exit_code"], 9);
+    assert_eq!(
+        value["data"]["argv"],
+        serde_json::json!([
+            "docker",
+            "logs",
+            "--timestamps",
+            "--tail=12",
+            "--since=2 hours ago",
+            "name;not-a-shell-command"
+        ])
+    );
+    let bundle = dir.join("named.lens");
+    assert!(
+        lens(&["--no-config", "bundle", "verify", bundle.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let stdout = lens(&[
+        "--no-config",
+        "bundle",
+        "show",
+        bundle.to_str().unwrap(),
+        "logs/stdout.log",
+    ]);
+    assert_eq!(
+        stdout_of(&stdout),
+        "logs\n--timestamps\n--tail=12\n--since=2 hours ago\nname;not-a-shell-command\n\n"
+    );
+    let stderr = lens(&[
+        "--no-config",
+        "bundle",
+        "show",
+        bundle.to_str().unwrap(),
+        "logs/stderr.log",
+    ]);
+    assert_eq!(stdout_of(&stderr), "configured source diagnostic\n\n");
+}

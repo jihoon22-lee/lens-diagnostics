@@ -62,6 +62,31 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+/// Keep summaries readable without changing machine output or source data.
+fn text_excerpt(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut out: String = chars
+        .by_ref()
+        .take(400)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if chars.next().is_some() {
+        out.push_str("… [use --format json for full text]");
+    }
+    out
+}
+
+fn preview<I: ExactSizeIterator>(items: I) -> std::iter::Take<I> {
+    let omitted = items.len().saturating_sub(20);
+    if omitted > 0 {
+        outln!(
+            "  {} more items omitted; use --format json for all details.",
+            omitted
+        );
+    }
+    items.take(20)
+}
+
 /// Text-mode findings trailer: printed after the domain output on
 /// stdout. Fail findings first, then Warn; Info is never printed.
 /// `json_mode` suppresses the block so JSON stdout stays a pure report.
@@ -98,7 +123,16 @@ fn print_findings(findings: &[Finding], json_mode: bool) {
         } else {
             "WARN"
         };
-        outln!("  [{}] {}: {}", tag, f.code, f.message);
+        outln!("  [{}] {}: {}", tag, f.code, text_excerpt(&f.message));
+        if let Some(evidence) = &f.evidence {
+            if let Some(path) = &evidence.path {
+                outln!("    source: {}", text_excerpt(path));
+            }
+            outln!(
+                "    evidence: data{} (--format envelope)",
+                text_excerpt(&evidence.data_pointer)
+            );
+        }
         shown += 1;
     }
     let remaining = fails + warns - shown;
@@ -490,6 +524,9 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
         FailOn::Fail => Severity::Fail,
     };
     match command {
+        Commands::Config { .. } | Commands::Run { .. } => {
+            unreachable!("configuration commands are resolved before dispatch")
+        }
         Commands::Collect {
             source,
             target,
@@ -665,14 +702,14 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         diagln!("hash warning: {e}");
                     }
                     outln!("Found {} duplicate group(s):", dup.groups.len());
-                    for (i, group) in dup.groups.iter().enumerate() {
+                    for (i, group) in preview(dup.groups.iter()).enumerate() {
                         outln!("\n[{}] Hash: {}", i + 1, group.sha256);
                         outln!(
                             "    File size: {}, Reclaimable: {}",
                             human_bytes(group.size),
                             human_bytes(group.reclaimable_bytes)
                         );
-                        for file in &group.files {
+                        for file in preview(group.files.iter()) {
                             outln!("    - {}", file.display());
                         }
                     }
@@ -836,8 +873,8 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     for s in diff.symbols.removed.iter().take(10) {
                         outln!("  - export removed: {}", s);
                     }
-                    for d in &diff.diagnostics {
-                        outln!("  ! {}", d);
+                    for d in preview(diff.diagnostics.iter()) {
+                        outln!("  ! {}", text_excerpt(d));
                     }
                 }
                 apply(&mut outcome, &report, threshold);
@@ -854,6 +891,9 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     outln!("{}", render_report(&report.data, &report, opts)?);
                 } else {
                     outln!("Log diff: {:+} line(s)", report.data.total_lines_delta);
+                    for note in preview(report.diagnostics.iter()) {
+                        outln!("  {}", text_excerpt(note));
+                    }
                     for (level, delta) in &report.data.level_delta {
                         outln!("  {level}: {delta:+}");
                     }
@@ -1165,7 +1205,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     if !s.buckets.is_empty() {
                         outln!("Histogram:");
                         let max = s.buckets.iter().map(|b| b.total).max().unwrap_or(1);
-                        for b in &s.buckets {
+                        for b in preview(s.buckets.iter()) {
                             let width = ((b.total * 40).div_ceil(max)).max(1) as usize;
                             let bar = "#".repeat(width.min(40));
                             if b.warn_or_higher > 0 {
@@ -1193,7 +1233,12 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     outln!("{}", render_report(run, &report, opts)?);
                 } else {
                     let s = &run.summary;
-                    outln!("Test run: {} (project {})", run.run_id, run.project);
+                    outln!(
+                        "Test run: {} (project {}) from {}",
+                        run.run_id,
+                        text_excerpt(&run.project),
+                        file.display()
+                    );
                     outln!(
                         "  {} total | {} passed | {} failed | {} errors | {} skipped | {:.2}s",
                         s.total,
@@ -1203,6 +1248,34 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         s.skipped,
                         s.duration_sec
                     );
+                    let failed: Vec<_> = run
+                        .cases
+                        .iter()
+                        .filter(|case| {
+                            matches!(
+                                case.status,
+                                lens_test::TestStatus::Failed | lens_test::TestStatus::Error
+                            )
+                        })
+                        .collect();
+                    for case in failed.iter().take(20) {
+                        outln!(
+                            "  {:?}: {} — {}",
+                            case.status,
+                            text_excerpt(&case.identity),
+                            text_excerpt(
+                                case.message
+                                    .as_deref()
+                                    .unwrap_or("No failure message supplied")
+                            )
+                        );
+                    }
+                    if failed.len() > 20 {
+                        outln!(
+                            "  {} more failing cases omitted; use --format json for all cases.",
+                            failed.len() - 20
+                        );
+                    }
                     if !run.complete {
                         outln!("  INCOMPLETE: the report was truncated or malformed");
                     }
@@ -1227,18 +1300,25 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         diff.removed_tests.len(),
                         diff.skipped_changes.len()
                     );
-                    for r in diff.regressions.iter().chain(&diff.new_failures) {
+                    let failures = diff.regressions.len() + diff.new_failures.len();
+                    if failures > 20 {
+                        outln!(
+                            "  {} more failing cases omitted; use --format json for all cases.",
+                            failures - 20
+                        );
+                    }
+                    for r in diff.regressions.iter().chain(&diff.new_failures).take(20) {
                         outln!(
                             "  - {}{}",
-                            r.id,
+                            text_excerpt(&r.id),
                             r.message
                                 .as_deref()
-                                .map(|m| format!(": {}", m))
+                                .map(|m| format!(": {}", text_excerpt(m)))
                                 .unwrap_or_default()
                         );
                     }
-                    for d in &diff.diagnostics {
-                        outln!("  ! {}", d);
+                    for d in preview(diff.diagnostics.iter()) {
+                        outln!("  ! {}", text_excerpt(d));
                     }
                 }
                 apply(&mut outcome, &report, threshold);
@@ -1266,7 +1346,10 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         outln!("    {}: {} calls, {} errors", name, st.count, st.errors);
                     }
                     if !snapshot.fd_leaks.is_empty() {
-                        outln!("  fd leaks: {:?}", snapshot.fd_leaks);
+                        outln!(
+                            "  fd leaks: {} (use --format json for details)",
+                            snapshot.fd_leaks.len()
+                        );
                     }
                 }
                 apply(&mut outcome, &report, threshold);
@@ -1290,13 +1373,13 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         diff.baseline_errors,
                         diff.candidate_errors
                     );
-                    for e in &diff.new_errors {
+                    for e in preview(diff.new_errors.iter()) {
                         outln!("  + new error: {}", e);
                     }
-                    for e in &diff.resolved_errors {
+                    for e in preview(diff.resolved_errors.iter()) {
                         outln!("  - resolved: {}", e);
                     }
-                    for s in &diff.significant_latency_shifts {
+                    for s in preview(diff.significant_latency_shifts.iter()) {
                         outln!("  ~ {}", s);
                     }
                 }
@@ -1316,8 +1399,12 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         snapshot.units.len(),
                         snapshot.cycles.len()
                     );
-                    for (name, u) in &snapshot.units {
-                        outln!("  {} {}", name, u.exec_start.as_deref().unwrap_or("-"));
+                    for (name, u) in preview(snapshot.units.iter()) {
+                        outln!(
+                            "  {} {}",
+                            text_excerpt(name),
+                            text_excerpt(u.exec_start.as_deref().unwrap_or("-"))
+                        );
                     }
                 }
                 apply(&mut outcome, &report, threshold);
@@ -1335,14 +1422,25 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     );
                 } else {
                     outln!("Detected {} cycle(s):", cycles.len());
-                    for (i, c) in cycles.iter().enumerate() {
+                    for (i, c) in preview(cycles.iter()).enumerate() {
                         if c.edges.is_empty() {
-                            outln!("  [{}] {}", i + 1, c.members.join(" -> "));
+                            outln!(
+                                "  [{}] {}",
+                                i + 1,
+                                text_excerpt(
+                                    &c.members
+                                        .iter()
+                                        .take(20)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(" -> ")
+                                )
+                            );
                         } else {
                             // Real directed path: each hop carries the
                             // directive and file:line that produced it.
                             let mut line = String::new();
-                            for e in &c.edges {
+                            for e in c.edges.iter().take(20) {
                                 let origin = match (&e.path, e.line) {
                                     (Some(p), Some(l)) => format!(
                                         "{}:{}",
@@ -1360,8 +1458,12 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                                     e.before, e.directive, origin
                                 ));
                             }
-                            line.push_str(&c.edges.last().unwrap().after);
-                            outln!("  [{}] {}", i + 1, line);
+                            if c.edges.len() > 20 {
+                                line.push_str("… [remaining edges omitted; use --format json]");
+                            } else {
+                                line.push_str(&c.edges.last().unwrap().after);
+                            }
+                            outln!("  [{}] {}", i + 1, text_excerpt(&line));
                         }
                     }
                 }
@@ -1386,8 +1488,8 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         diff.new_cycles.len(),
                         diff.resolved_cycles.len()
                     );
-                    for u in &diff.modified_units {
-                        outln!("  ~ {}", u.unit);
+                    for u in preview(diff.modified_units.iter()) {
+                        outln!("  ~ {}", text_excerpt(&u.unit));
                     }
                 }
                 apply(&mut outcome, &report, threshold);
@@ -1406,8 +1508,12 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         snapshot.total_units,
                         snapshot.reverse_impact.len()
                     );
-                    for u in &snapshot.units {
-                        outln!("  {} [{}]", u.file, u.compiler);
+                    for u in preview(snapshot.units.iter()) {
+                        outln!(
+                            "  {} [{}]",
+                            text_excerpt(&u.file),
+                            text_excerpt(&u.compiler)
+                        );
                     }
                 }
                 for diagnostic in &report.diagnostics {
@@ -1431,7 +1537,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         impact.target_header,
                         impact.total_impacted
                     );
-                    for u in &impact.impacted_units {
+                    for u in preview(impact.impacted_units.iter()) {
                         outln!("  - {}", u);
                     }
                 }
@@ -1470,13 +1576,29 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         diff.removed_units.len(),
                         diff.modified_units.len()
                     );
-                    for u in &diff.modified_units {
-                        outln!("  ~ {}", u.file);
+                    for u in preview(diff.modified_units.iter()) {
+                        outln!("  ~ {}", text_excerpt(&u.file));
                         if let Some(order) = &u.forced_include_order {
                             outln!(
-                                "    forced includes: {:?} -> {:?}",
-                                order.before,
-                                order.after
+                                "    forced includes: {} -> {}",
+                                text_excerpt(
+                                    &order
+                                        .before
+                                        .iter()
+                                        .take(20)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                                text_excerpt(
+                                    &order
+                                        .after
+                                        .iter()
+                                        .take(20)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
                             );
                         }
                     }
@@ -1536,20 +1658,20 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                             "Found {} missing dependenc(ies):",
                             venv.missing_dependencies.len()
                         );
-                        for d in &venv.missing_dependencies {
-                            outln!("  - {}", d);
+                        for d in preview(venv.missing_dependencies.iter()) {
+                            outln!("  - {}", text_excerpt(d));
                         }
                     }
                     if !venv.version_conflicts.is_empty() {
                         outln!("Version conflicts:");
-                        for d in &venv.version_conflicts {
-                            outln!("  - {}", d);
+                        for d in preview(venv.version_conflicts.iter()) {
+                            outln!("  - {}", text_excerpt(d));
                         }
                     }
                     if !venv.unevaluated_dependencies.is_empty() {
                         outln!("Unevaluated requirements (uncertain markers):");
-                        for d in &venv.unevaluated_dependencies {
-                            outln!("  - {}", d);
+                        for d in preview(venv.unevaluated_dependencies.iter()) {
+                            outln!("  - {}", text_excerpt(d));
                         }
                     }
                 }
@@ -1571,7 +1693,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         diff.removed_packages.len(),
                         diff.version_changes.len()
                     );
-                    for p in &diff.version_changes {
+                    for p in preview(diff.version_changes.iter()) {
                         outln!("  ~ {}: {} -> {}", p.package, p.old_version, p.new_version);
                     }
                 }
@@ -1730,21 +1852,21 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         outln!("Tool:          {} v{}", m.tool, m.version);
                         outln!("Created At:    {}", m.created_at);
                         outln!("Manifest Files:");
-                        for s in &m.sources {
-                            outln!("  - {} ({} bytes)", s.path, s.size);
+                        for s in preview(m.sources.iter()) {
+                            outln!("  - {} ({} bytes)", text_excerpt(&s.path), s.size);
                         }
                         if !m.diagnostics.is_empty() {
                             outln!("Capture Diagnostics:");
-                            for d in &m.diagnostics {
-                                outln!("  ! {}", d);
+                            for d in preview(m.diagnostics.iter()) {
+                                outln!("  ! {}", text_excerpt(d));
                             }
                         }
                     }
                     None => outln!("Manifest: NOT FOUND (untrusted bundle)"),
                 }
                 outln!("Archive Entries:");
-                for e in &inspect.entries {
-                    outln!("  - {} ({} bytes)", e.name, e.size);
+                for e in preview(inspect.entries.iter()) {
+                    outln!("  - {} ({} bytes)", text_excerpt(&e.name), e.size);
                 }
             }
             BundleCommands::Verify { bundle } => {
@@ -1762,7 +1884,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     // The manifest has no signature: this reports integrity
                     // against the embedded manifest, not provenance.
                     outln!("  Integrity: all files match the embedded manifest");
-                    for u in &vr.unexpected_files {
+                    for u in preview(vr.unexpected_files.iter()) {
                         outln!("  Unlisted entry (not in manifest): {}", u);
                     }
                 } else {
@@ -1770,13 +1892,13 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     if let Some(err) = &vr.error {
                         eprintln!("  Error: {}", err);
                     }
-                    for t in &vr.tampered_files {
+                    for t in preview(vr.tampered_files.iter()) {
                         eprintln!("  Tampered: {}", t);
                     }
-                    for m in &vr.missing_files {
+                    for m in preview(vr.missing_files.iter()) {
                         eprintln!("  Missing:  {}", m);
                     }
-                    for u in &vr.unexpected_files {
+                    for u in preview(vr.unexpected_files.iter()) {
                         eprintln!("  Unlisted: {}", u);
                     }
                 }
@@ -1891,7 +2013,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         "PID",
                         "PROCESS"
                     );
-                    for l in &net_report.listening {
+                    for l in preview(net_report.listening.iter()) {
                         let proc_str = l
                             .process
                             .as_ref()
@@ -1940,10 +2062,10 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         diff.closed_connections.len(),
                         diff.time_wait_delta
                     );
-                    for l in &diff.new_listeners {
+                    for l in preview(diff.new_listeners.iter()) {
                         outln!("  + {}:{}", l.local_address, l.local_port);
                     }
-                    for l in &diff.closed_listeners {
+                    for l in preview(diff.closed_listeners.iter()) {
                         outln!("  - {}:{}", l.local_address, l.local_port);
                     }
                 }
@@ -1971,7 +2093,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     dr.summary.failures
                 );
                 outln!("{:<12} {:<30} {:<8} MESSAGE", "CATEGORY", "CHECK", "STATUS");
-                for c in &dr.checks {
+                for c in preview(dr.checks.iter()) {
                     let status_str = match c.status {
                         HealthStatus::Pass => "[PASS]",
                         HealthStatus::Warn => "[WARN]",
@@ -1983,13 +2105,13 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         c.category,
                         c.name,
                         status_str,
-                        c.message
+                        text_excerpt(&c.message)
                     );
                     if let Some(ref rec) = c.recommendation {
-                        outln!("             -> Recommendation: {}", rec);
+                        outln!("             -> Recommendation: {}", text_excerpt(rec));
                     }
                     if let Some(ref cmd) = c.next_command {
-                        outln!("             -> Next: {}", cmd);
+                        outln!("             -> Next: {}", text_excerpt(cmd));
                     }
                 }
             }

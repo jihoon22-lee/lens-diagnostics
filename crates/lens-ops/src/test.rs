@@ -115,18 +115,59 @@ pub fn diff_runs(run_base: &TestRun, run_cand: &TestRun) -> Report<TestDiff> {
     );
     let mut report = Report::new(diff);
     report.complete = complete;
-    for r in regressions {
+    for (index, r) in regressions.into_iter().enumerate() {
         report.push(Severity::Fail, "test.regression", r);
+        report.findings.last_mut().unwrap().evidence = Some(crate::FindingEvidence {
+            data_pointer: format!("/regressions/{index}"),
+            path: None,
+            object: Some(report.data.regressions[index].id.clone()),
+        });
     }
-    for r in new_failures {
+    for (index, r) in new_failures.into_iter().enumerate() {
         report.push(Severity::Fail, "test.new_failure", r);
+        report.findings.last_mut().unwrap().evidence = Some(crate::FindingEvidence {
+            data_pointer: format!("/new_failures/{index}"),
+            path: None,
+            object: Some(report.data.new_failures[index].id.clone()),
+        });
     }
-    for r in removed {
+    for (index, r) in removed.into_iter().enumerate() {
         report.push(
             Severity::Warn,
             "test.removed",
             format!("{r} removed from candidate run"),
         );
+        report.findings.last_mut().unwrap().evidence = Some(crate::FindingEvidence {
+            data_pointer: format!("/removed_tests/{index}"),
+            path: None,
+            object: Some(report.data.removed_tests[index].id.clone()),
+        });
     }
     report
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    #[test]
+    fn regression_reference_resolves_to_observed_case_without_inventing_path() {
+        let baseline = parse_junit_xml(
+            br#"<testsuite><testcase name="a" classname="suite"/></testsuite>"#,
+            "p",
+        )
+        .unwrap();
+        let candidate = parse_junit_xml(br#"<testsuite><testcase name="a" classname="suite"><failure message="wrong value"/></testcase></testsuite>"#, "p").unwrap();
+        let report = diff_runs(&baseline, &candidate);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == "test.regression")
+            .unwrap();
+        let evidence = finding.evidence.as_ref().unwrap();
+        let data = serde_json::to_value(&report.data).unwrap();
+        let case = data.pointer(&evidence.data_pointer).unwrap();
+        assert_eq!(case["id"].as_str(), evidence.object.as_deref());
+        assert!(evidence.path.is_none());
+    }
 }

@@ -871,6 +871,7 @@ pub fn run(
                 _ => return None,
             };
             Some(crate::Finding {
+                evidence: None,
                 severity,
                 code: format!("doctor.{}", c.category.to_lowercase()),
                 message: format!("{}: {}", c.name, c.message),
