@@ -7,8 +7,8 @@ Linux 시스템과 개발 산출물을 검사하고 두 결과를 비교하는 �
 Linux x86_64에서는 버전을 지정한 공식 installer를 권장합니다. Python 3.10 이상이 필요합니다.
 
 ```sh
-curl -fLO https://github.com/jihoon22-lee/lens-diagnostics/releases/download/v0.10.0/install.py
-python3 install.py --version v0.10.0
+curl -fLO https://github.com/jihoon22-lee/lens-diagnostics/releases/download/v0.11.0/install.py
+python3 install.py --version v0.11.0
 ~/.local/bin/lens --version
 ```
 

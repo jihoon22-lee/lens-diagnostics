@@ -127,13 +127,13 @@ Lens 책임자는 자신의 저장소를 소유하고 기능·문서·회귀·�
 
 | WP | 구현 | 실제 검증 | 완료 판정 |
 |---|---|---|---|
-| L0/L1 | 선택적 resolver·경계·우선순위·init/explain·disk 범위 | 7 unit 및 설정 integration 통과; 29 report 명령 TTY/pipe/명시 format 행렬 | 구현 완료, 전체 gate 진행 |
+| L0/L1 | 선택적 resolver·경계·우선순위·init/explain·disk 범위 | 7 unit 및 설정 integration 통과; 29 report 명령 TTY/pipe/명시 format 행렬 | 완료; workspace 430 tests·Clippy 통과 |
 | L2 | JUnit 사례/원인, 제한된 요약과 근거·전체 조회 안내, 시작 도움말 | 긴 메시지/25개 실패 사례에서 text 제한 및 envelope 25개 보존 | 구현 완료 |
 | L3 | 이름 기반 collect/snapshot, 부분 override와 CLI override | stub argv literal·양 스트림·실패 provenance·bundle 무결성 integration | 구현 완료; 실제 외부 runtime은 미실행 |
 | L4/L7 | 선택적 evidence와 5종 고정 consumer corpus | schema·실제 case/env path·bundle pointer 및 이전 JSON round-trip | 구현 완료 |
 | L5 | 적응형 log histogram·단일 TUI worker·비교 범위 | 100만행 전후 JSON 동일, RSS 80976→65280 KiB, 실제 취소 0.264ms | 로컬 측정 완료; [한계/재현](../USABILITY_VALIDATION.md) |
-| L6 | 설치/첫 사용/선택 설정 문서 및 실제 binary smoke | 9 domains·doctor·bundle·TUI PTY·MCP 접근/paging debug 통과 | native 후보 및 공개 재다운로드 대기 |
-| L8 | 통합/후보/PR/공개/정리 | 전체 fmt/Clippy/tests 및 musl build 진행 | 진행 중 |
+| L6 | 설치/첫 사용/선택 설정 문서 및 실제 binary smoke | 9 domains·doctor·bundle·TUI PTY·MCP 접근/paging debug 통과 | musl 후보 smoke 통과; 공개 재다운로드 대기 |
+| L8 | 통합/후보/PR/공개/정리 | PR #156 병합 a62b51e; fmt/Clippy/430 tests/musl smoke 통과 | 진행 중 |
 
 
 무거운 검증은 `flock /tmp/paseo-products-20261028-heavy.lock` 및 jobs/thread 상한 아래 수행한다. 기존 `target`은 사용자/기존 공유 산출물로 보존한다.
