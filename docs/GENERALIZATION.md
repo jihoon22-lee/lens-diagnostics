@@ -23,8 +23,8 @@
 - [ ] P3-A 명시 target 배포 및 설치, checksum/다운로드 실행 검증.
 - [x] P3-B 스캔 취소/오래된 워커 결과 차단/대규모 탐색.
 - [x] P4 로그 비교, 사용자 선택 journald/container 수집 adapter. 기존 stdin/JSONL/JUnit/ABI/env 기능 재사용.
-- [ ] docs/README/GUIDE/지원표/CHANGELOG/metadata 갱신, 버전 결정.
-- [ ] 필요한 좁은 테스트 및 heavy lock 하 전체 fmt/clippy/test/문서 검사, 실제 MCP 통합, CI/PR 병합.
+- [x] docs/README/GUIDE/지원표/CHANGELOG/metadata 갱신, 버전 결정.
+- [x] 필요한 좁은 테스트 및 heavy lock 하 전체 fmt/clippy/test/문서 검사, 실제 MCP 통합, CI/PR 병합.
 - [ ] 릴리스 게시/공개 asset 다운로드 digest 및 smoke 확인.
 - [ ] main 동기화, 소유 merged branch/worktree/임시자원 정리.
 
@@ -71,3 +71,9 @@ CLI `lens`, crate `lens-*`, `.lens`, 기존 schema 및 JSON 기본 출력 유지
 - 자체 코드 검토 보강: 프로세스 열거/FD 읽기 실패를 capability에 반영하고, 관측 중 종료된 PID는 권한 실패로 오분류하지 않음. unavailable/denied/failed를 구별하고 전체 열거 실패 시 orphan 단정 방지. 빈 XDG_*_DIRS 값에는 표준 fallback 적용. 실패 범위 회귀 테스트 추가.
 - 최종 기능 보강: finite log inspect/filter도 envelope 지원. follow/TUI/completion/trash는 명시 거부. lossy UTF-8은 기존 표시 데이터를 유지하면서 CLI/MCP incomplete 진단을 일치시킴. 제한한 match 수는 의도한 scope라 incomplete로 오분류하지 않음.
 - 기능 PR153: https://github.com/jihoon22-lee/lens-diagnostics/pull/153 (초안). 현재 전체 suite 413개 테스트 통과; 이후 finite filter 추가 회귀는 다음 좁은 검증에서 확인. 이전 '406개' 표기는 집계 오류이며 실제 직전 suite는 408개였음.
+- release notes 초안 소유 임시 파일: /tmp/lens-generalization-release-notes.txt. 0.10.0 minor는 새 public Rust 필드/enum 및 사용자 기능에 맞춘 결정; 기존 태그/asset 덮어쓰지 않음.
+
+## 릴리스 준비
+- PR153 최신 head4d48d776 CI Test Workspace/Build Release/Merge Gate 통과 후 병합. 로컬 전체 suite413 + 후속 CLI/MCP134 테스트, clippy/fmt, 문서/schema fixture, release flow6/installer2 통과.
+- x86_64-unknown-linux-musl 실제 release 빌드/INTERP 부재/세 실행파일 help/version, BUILD.json digest/sourceSHA 검증 및 offline installer smoke 통과. worktree/dist의 v0.9.0 파일은 신규 기능 개발판의 로컬 검증용이며 공개 릴리스 v0.9.0 asset을 변경하지 않았음. 해당 dist는 작업 소유, 정리 대상.
+- release/v0.10.0 소유 branch에서 workspace/lock/manifest/changelog 동시 범프. 공개 artifact 검증은 후속 기록으로 남김.

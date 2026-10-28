@@ -2,6 +2,35 @@
 
 Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.Z` 형식이다.
 
+## 0.10.0
+
+Lens Diagnostics 전환 릴리스. 기존 `lens` CLI와 도메인 JSON을 유지하면서 수집 범위, 분석 완결성, 자동화 결과 계약 및 검증된 Linux 배포를 추가했다.
+
+### 사용자 기능
+
+- `--format envelope`로 `lens.result` v1을 선택한다. producer/version, IDK_RUN_ID 기반 run_id, 실행 argv/cwd/판정, complete, findings, diagnostics와 기존 data를 함께 제공한다. 기본 JSON 구조는 유지한다. 유한 log inspect/filter/stats/diff도 지원하고 follow/TUI/completion/trash에는 명시적으로 오류를 반환한다.
+- build inspect/impact가 missing source, forced include 누락, 읽지 못한 header, unresolved include, scan cap을 incomplete로 판정한다. 매크로/조건부 전처리/builtin 경로를 재현하지 않는 정적 근사라는 설명을 결과와 문서에 남긴다.
+- net scope는 procfs origin 및 collected/unavailable/denied/failed/excluded capability를 구별한다. doctor의 evidence_complete와 scope_changed가 미관측 범위를 정상이나 개선으로 오인하지 않게 한다. `.lens`에는 선택한 입력과 생성한 artifact를 기록하고, 명시 procfs의 누락된 identity를 현재 호스트 값으로 채우지 않는다.
+- `sys inspect --user` / `sys cycles --user`는 현재 계정과 XDG 검색 경로를 사용한다. manager identity는 Service.User와 독립적이며 템플릿·drop-in·instance 전 과정에서 유지한다. 기존 system manager 기본 동작을 보존한다.
+- TUI의 `c`로 스캔을 취소한다. 새 요청은 이전 결과 채널을 버려 늦게 끝난 워커가 화면을 덮지 못한다. 대형 디렉터리는 enumeration/stat 이전에 entry 상한을 적용한다.
+- `lens log diff A B`와 일반 `lens diff`, MCP `lens_log_diff`가 severity 수와 관측 시간 구간을 비교한다. ERROR/FATAL 증가는 findings다. 서로 다른 길이의 구간은 자동 정규화하지 않는다.
+- `lens collect journal|docker|podman TARGET --output capture.lens`로 지정한 소스만 수집한다. 직접 argv 실행, 기본30초/최대300초 timeout, stream별8MiB 상한, stdout/stderr/source exit 별도 보존을 적용한다. 서비스나 컨테이너를 변경하지 않는다.
+
+### 설치와 이행
+
+- 저장소의 canonical URL은 https://github.com/jihoon22-lee/lens-diagnostics 이다. 제품명만 변경하며 `lens-*` crate, CLI, `.lens`, 기존 schema 문자열을 유지한다.
+- 공개 target은 `x86_64-unknown-linux-musl`이다. ELF interpreter가 없는 정적 실행파일을 검증하며, `BUILD.json`에 source SHA/target/Rust 버전/실행파일 digest를 기록한다. 기존 `linux-x86_64` archive URL은 동일 bytes alias로 유지한다. GNU source build에는 호환 glibc가 필요하다.
+- `install.py --version v0.10.0`은 체크섬/내부 digest를 확인하여 기본 `~/.local/bin`에 설치한다. `--archive`와 `--checksums`로 폐쇄망 설치를 지원하며 기존 일반 실행파일 교체에는 `--force`가 필요하다.
+- 불완전한 build/systemd/수집 evidence 및 lossy UTF-8 필터·통계는 warning 임계값과 무관하게 종료1이다. 이전의 성공 종료에 의존한 자동화는 종료 코드와 envelope의 complete를 함께 처리해야 한다. 실제 process exit와 envelope 판정, MCP 페이지 절단은 별개다.
+- Rust 호출자는 새 public struct 필드(`NetReport.scope`, `SystemdSnapshot.manager`, `DoctorCheck.evidence_complete`, `DoctorDiff.scope_changed`) 및 enum variant를 반영해야 한다. 저장된 이전 JSON은 serde 기본값으로 읽으며, 생략된 scope는 관측 범위 미기록을 뜻한다.
+
+### 검증과 지원 한계
+
+- Workspace 테스트, clippy, fmt, CLI/MCP 실제 stdio, 배포 흐름/오프라인 installer 검증을 수행한다. idk 실제 소비자 시험에서 run identity, 종료1, incomplete/findings, 독립 출력 보존을 확인했다.
+- WSL2 Linux x86_64에서 계정/user manager 및 journal(empty result)/Docker(source failure) adapter와 생성 bundle 무결성을 확인했다. Podman runtime은 로컬에 없으므로 실제 runtime 실행 PASS를 주장하지 않는다.
+- Linux/WSL/container의 실제 수집은 namespace·mount·권한·설치된 source CLI 범위에 한정한다. Native Windows/macOS, 다른 CPU의 공개 artifact, PE/Mach-O, compiler와 동등한 전처리 영향 분석은 이번 지원 범위가 아니다.
+- 공개 workflow는 업로드한 bytes를 다시 내려받아 SHA-256, source SHA, 버전 및 실행 smoke를 검증한 후 release를 공개한다. checksum은 무결성 확인이며 독립 서명이 아니다.
+
 ## 0.9.0
 
 v0.8.0 후속 리뷰에서 확인한 14건을 수정한 안정화 릴리스: 번들 마스킹·입력 무결성, systemd 자원 제한·의미론, MCP 복구, 도메인 판정 정확도를 보완했다.
