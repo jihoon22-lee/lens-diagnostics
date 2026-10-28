@@ -110,6 +110,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_process_scope_is_failed_not_success_or_permission_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("net")).unwrap();
+        std::fs::write(dir.path().join("net/tcp"), "header\n").unwrap();
+        std::fs::create_dir(dir.path().join("123")).unwrap();
+        std::fs::write(dir.path().join("123/fd"), "not a directory").unwrap();
+        let report = inspect(Some(dir.path()), false).unwrap();
+        assert!(!report.complete);
+        assert_eq!(
+            report.data.scope.unwrap().capabilities["process_owners"].state,
+            lens_core::collection::CapabilityState::Failed
+        );
+    }
+
+    #[test]
     fn excluding_unix_sockets_also_excludes_their_findings_and_counts() {
         let dir = tempfile::tempdir().unwrap();
         let net = dir.path().join("net");

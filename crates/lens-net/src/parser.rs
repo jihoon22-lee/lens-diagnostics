@@ -164,6 +164,8 @@ pub struct ProcessSocketScan {
     pub inode_map: HashMap<u64, SocketProcess>,
     pub uninspectable_uids: HashSet<u32>,
     pub uninspectable_count: usize,
+    pub enumeration_failed: bool,
+    pub capability: lens_core::collection::Capability,
 }
 
 pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
@@ -171,21 +173,40 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
         inode_map: HashMap::new(),
         uninspectable_uids: HashSet::new(),
         uninspectable_count: 0,
+        enumeration_failed: false,
+        capability: lens_core::collection::Capability::collected(),
     };
     let inode_map = &mut scan.inode_map;
 
     let entries = match lens_core::read_policy::read_dir(proc_dir) {
         Ok(e) => e,
-        Err(_) => return scan,
+        Err(error) => {
+            scan.enumeration_failed = true;
+            scan.capability = lens_core::collection::Capability::from_error(&error);
+            if scan.capability.state == lens_core::collection::CapabilityState::Unavailable {
+                scan.capability.state = lens_core::collection::CapabilityState::Failed;
+            }
+            return scan;
+        }
     };
 
-    let mut pids: Vec<(u32, std::path::PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
-            Some((pid, entry.path()))
-        })
-        .collect();
+    let mut pids = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                    pids.push((pid, entry.path()));
+                }
+            }
+            Err(error) => {
+                scan.enumeration_failed = true;
+                scan.capability = lens_core::collection::Capability::from_error(&error);
+                if scan.capability.state == lens_core::collection::CapabilityState::Unavailable {
+                    scan.capability.state = lens_core::collection::CapabilityState::Failed;
+                }
+            }
+        }
+    }
     // Sort PIDs in ascending order so shared sockets (e.g. pre-fork workers)
     // deterministically attribute to the lowest PID (master process).
     pids.sort_by_key(|(pid, _)| *pid);
@@ -195,7 +216,18 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
 
         let fd_entries = match lens_core::read_policy::read_dir(&fd_dir) {
             Ok(e) => e,
-            Err(_) => {
+            Err(error) => {
+                // A process that exited during enumeration is not a permission failure.
+                if error.kind() == std::io::ErrorKind::NotFound && !pid_path.exists() {
+                    continue;
+                }
+                if scan.capability.state != lens_core::collection::CapabilityState::Failed {
+                    scan.capability = lens_core::collection::Capability::from_error(&error);
+                    if scan.capability.state == lens_core::collection::CapabilityState::Unavailable
+                    {
+                        scan.capability.state = lens_core::collection::CapabilityState::Failed;
+                    }
+                }
                 // EACCES on /proc/<pid>/fd — the process exists but its
                 // sockets cannot be attributed. Record the owner uid so
                 // unowned sockets of that uid classify as owner_unknown.
@@ -205,6 +237,8 @@ pub fn scan_process_socket_inodes(proc_dir: &Path) -> ProcessSocketScan {
                     use std::os::unix::fs::MetadataExt;
                     if let Ok(meta) = lens_core::read_policy::metadata(&pid_path) {
                         scan.uninspectable_uids.insert(meta.uid());
+                    } else {
+                        scan.enumeration_failed = true;
                     }
                 }
                 continue;
@@ -350,30 +384,19 @@ pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
             // Not attributable to any inspected process. If the socket's
             // uid matches a process whose fd table we could not read, the
             // owner is unknown rather than the socket being orphaned.
-            s.owner_state = Some(if proc_scan.uninspectable_uids.contains(&s.uid) {
-                OwnerState::OwnerUnknown
-            } else {
-                OwnerState::Orphan
-            });
+            s.owner_state = Some(
+                if proc_scan.enumeration_failed || proc_scan.uninspectable_uids.contains(&s.uid) {
+                    OwnerState::OwnerUnknown
+                } else {
+                    OwnerState::Orphan
+                },
+            );
         }
     }
 
     sort_sockets(&mut sockets);
 
-    capabilities.insert(
-        "process_owners".into(),
-        if proc_scan.uninspectable_count == 0 {
-            lens_core::collection::Capability::collected()
-        } else {
-            lens_core::collection::Capability {
-                state: lens_core::collection::CapabilityState::Denied,
-                detail: Some(format!(
-                    "{} process fd tables could not be inspected",
-                    proc_scan.uninspectable_count
-                )),
-            }
-        },
-    );
+    capabilities.insert("process_owners".into(), proc_scan.capability);
     let mut report = NetReport {
         scope: Some(lens_core::collection::CollectionScope {
             source: base.to_string_lossy().into_owned(),

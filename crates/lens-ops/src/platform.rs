@@ -74,7 +74,9 @@ pub fn user_unit_paths(manager: &lens_sys::ManagerContext) -> Vec<std::path::Pat
     ];
     let list = |name: &str, fallback: &str| {
         std::env::var(name)
-            .unwrap_or_else(|_| fallback.into())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| fallback.into())
             .split(':')
             .filter(|s| Path::new(s).is_absolute())
             .map(|s| Path::new(s).join("systemd/user"))
