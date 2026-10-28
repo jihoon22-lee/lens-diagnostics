@@ -111,6 +111,7 @@ fn dependency_directory_changes_are_visible_to_diff() {
     write(dir.path(), "a.service", "[Unit]\nDescription=A\n");
     write(dir.path(), "b.service", "[Unit]\nDescription=B\n");
     let snapshot = || SystemdSnapshot {
+        manager: None,
         schema: lens_sys::SNAPSHOT_SCHEMA_V1.into(),
         version: "test".into(),
         semantics: "systemd-255-subset-v2".into(),
@@ -234,4 +235,49 @@ fn ordering_reference_limit_counts_provenance_only_once() {
             ));
         }
     }
+}
+
+#[test]
+fn user_manager_context_survives_template_and_drop_in_expansion() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("main.service"),
+        "[Unit]\nWants=worker@one.service\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("worker@.service"),
+        "[Service]\nUser=nobody\nExecStart=/bin/echo %u %h %t %i\n",
+    )
+    .unwrap();
+    let drop = root.path().join("worker@one.service.d");
+    std::fs::create_dir(&drop).unwrap();
+    std::fs::write(
+        drop.join("override.conf"),
+        "[Service]\nExecStartPre=/bin/echo %u %h %i\n",
+    )
+    .unwrap();
+    let manager = lens_sys::ManagerContext {
+        user: "alice".into(),
+        home: "/home/alice".into(),
+        runtime_dir: "/run/user/1001".into(),
+    };
+    for units in [
+        lens_sys::load_units_with_manager(root.path(), &manager).unwrap(),
+        lens_sys::load_units_merged_with_manager(&[root.path()], &manager).unwrap(),
+    ] {
+        assert_eq!(
+            units["worker@one.service"].exec_start.as_deref(),
+            Some("/bin/echo alice /home/alice /run/user/1001 one")
+        );
+        assert_eq!(
+            units["worker@one.service"].sections["Service"]["ExecStartPre"],
+            ["/bin/echo alice /home/alice one"]
+        );
+    }
+    let system = lens_sys::load_units(root.path()).unwrap();
+    assert_eq!(
+        system["worker@one.service"].exec_start.as_deref(),
+        Some("/bin/echo root /root /run one")
+    );
 }

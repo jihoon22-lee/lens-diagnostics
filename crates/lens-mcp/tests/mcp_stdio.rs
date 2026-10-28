@@ -1251,3 +1251,38 @@ fn review2_mask_exception_does_not_follow_external_hops() {
     assert_eq!(exists[0]["result"]["isError"], true);
     assert_eq!(exists, missing);
 }
+
+#[test]
+fn build_incomplete_survives_findings_pagination() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("compile_commands.json");
+    std::fs::write(&db, serde_json::to_vec(&serde_json::json!([{"directory":dir.path(), "file":"missing.c", "arguments":["cc","missing.c"]}])).unwrap()).unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_build_impact","arguments":{"compile_commands":db,"header":"missing.h","limit":1}}}).to_string();
+    let response = roundtrip(&[&call]);
+    let result = &response[0]["result"];
+    assert!(result.get("isError").is_none(), "{result}");
+    let metadata: Value =
+        serde_json::from_str(result["content"][1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["complete"], false);
+    assert_eq!(metadata["findings_truncated"], true);
+    assert_eq!(metadata["findings_total"], 2);
+}
+
+#[test]
+fn log_diff_stdio_reports_findings_without_transport_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.log");
+    let b = dir.path().join("b.log");
+    std::fs::write(&a, "INFO ready\n").unwrap();
+    std::fs::write(&b, "ERROR failed\n").unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lens_log_diff","arguments":{"baseline":a,"candidate":b}}}).to_string();
+    let response = roundtrip(&[&call]);
+    let result = &response[0]["result"];
+    assert!(result.get("isError").is_none(), "{result}");
+    let data: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    let metadata: Value =
+        serde_json::from_str(result["content"][1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(data["schema"], "lens.log-diff/v1");
+    assert_eq!(metadata["complete"], true);
+    assert_eq!(metadata["findings"][0]["severity"], "fail");
+}

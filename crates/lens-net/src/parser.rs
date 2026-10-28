@@ -305,17 +305,30 @@ pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
             source: e,
         })?;
     sockets.extend(parse_proc_net_tcp(&tcp_content, SocketKind::Tcp));
-    if let Ok(content) = lens_core::read_policy::read_to_string(&udp_path) {
-        sockets.extend(parse_proc_net_tcp(&content, SocketKind::Udp));
-    }
-    if let Ok(content) = lens_core::read_policy::read_to_string(&tcp6_path) {
-        sockets.extend(parse_proc_net_tcp(&content, SocketKind::Tcp6));
-    }
-    if let Ok(content) = lens_core::read_policy::read_to_string(&udp6_path) {
-        sockets.extend(parse_proc_net_tcp(&content, SocketKind::Udp6));
-    }
-    if let Ok(content) = lens_core::read_policy::read_to_string(&unix_path) {
-        sockets.extend(parse_proc_net_unix(&content));
+    let mut capabilities = std::collections::BTreeMap::new();
+    capabilities.insert("tcp".into(), lens_core::collection::Capability::collected());
+    for (name, path, kind) in [
+        ("udp", udp_path, SocketKind::Udp),
+        ("tcp6", tcp6_path, SocketKind::Tcp6),
+        ("udp6", udp6_path, SocketKind::Udp6),
+        ("unix", unix_path, SocketKind::Other),
+    ] {
+        match lens_core::read_policy::read_to_string(&path) {
+            Ok(content) => {
+                if name == "unix" {
+                    sockets.extend(parse_proc_net_unix(&content));
+                } else {
+                    sockets.extend(parse_proc_net_tcp(&content, kind));
+                }
+                capabilities.insert(name.into(), lens_core::collection::Capability::collected());
+            }
+            Err(error) => {
+                capabilities.insert(
+                    name.into(),
+                    lens_core::collection::Capability::from_error(&error),
+                );
+            }
+        }
     }
 
     // Correlate with process inodes
@@ -347,7 +360,25 @@ pub fn inspect_network(proc_path: Option<&Path>) -> Result<NetReport> {
 
     sort_sockets(&mut sockets);
 
+    capabilities.insert(
+        "process_owners".into(),
+        if proc_scan.uninspectable_count == 0 {
+            lens_core::collection::Capability::collected()
+        } else {
+            lens_core::collection::Capability {
+                state: lens_core::collection::CapabilityState::Denied,
+                detail: Some(format!(
+                    "{} process fd tables could not be inspected",
+                    proc_scan.uninspectable_count
+                )),
+            }
+        },
+    );
     let mut report = NetReport {
+        scope: Some(lens_core::collection::CollectionScope {
+            source: base.to_string_lossy().into_owned(),
+            capabilities,
+        }),
         schema_version: crate::model::REPORT_SCHEMA_V1.to_string(),
         summary: NetSummary {
             uninspectable_processes: proc_scan.uninspectable_count,

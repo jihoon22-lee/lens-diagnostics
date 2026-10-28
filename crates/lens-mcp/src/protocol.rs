@@ -211,6 +211,18 @@ pub fn list_tools() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "lens_log_diff".to_string(),
+            description: desc("Compare aggregate log severity counts and observed time windows. Increased error/fatal counts are findings; unequal input durations are not normalized."),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": with_pag(serde_json::json!({
+                    "baseline": {"type": "string", "description": "Baseline log file"},
+                    "candidate": {"type": "string", "description": "Candidate log file"}
+                }).as_object().unwrap().clone()),
+                "required": ["baseline", "candidate"]
+            }),
+        },
+        McpTool {
             name: "lens_test_diff".to_string(),
             description: desc(
                 "Compare two JUnit XML runs (file or directory of *.xml) and report regressions, fixes, and new failures.",

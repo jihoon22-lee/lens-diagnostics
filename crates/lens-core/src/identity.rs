@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{LensError, Result};
@@ -20,16 +19,7 @@ pub struct FileIdentity {
 
 impl FileIdentity {
     pub fn from_metadata(meta: &std::fs::Metadata) -> Self {
-        Self {
-            device: meta.dev(),
-            inode: meta.ino(),
-            mode: meta.mode(),
-            size: meta.size(),
-            modified_sec: meta.mtime(),
-            modified_nsec: meta.mtime_nsec(),
-            changed_sec: meta.ctime(),
-            changed_nsec: meta.ctime_nsec(),
-        }
+        crate::platform::file_identity(meta)
     }
 
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -93,20 +83,7 @@ impl SafeInput {
             });
         }
 
-        #[cfg(target_os = "linux")]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(0o4000) // O_NONBLOCK
-                .open(&path_buf)
-                .map_err(|e| LensError::Io {
-                    path: path_buf.clone(),
-                    source: e,
-                })?
-        };
-        #[cfg(not(target_os = "linux"))]
-        let file = File::open(&path_buf).map_err(|e| LensError::Io {
+        let file = crate::platform::open_nonblocking(&path_buf).map_err(|e| LensError::Io {
             path: path_buf.clone(),
             source: e,
         })?;

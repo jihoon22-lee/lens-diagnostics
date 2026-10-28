@@ -13,6 +13,7 @@
 //! - **Error ([`error`])**: Unified typed error handling.
 
 pub mod bundle;
+pub mod collection;
 pub mod diff;
 pub mod error;
 pub mod evidence;
@@ -20,6 +21,7 @@ pub mod glob;
 pub mod hash;
 pub mod identity;
 pub mod json;
+mod platform;
 pub mod read_policy;
 pub mod redact;
 pub mod time;

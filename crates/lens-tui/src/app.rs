@@ -4,6 +4,10 @@ use lens_net::{inspect_network, NetReport};
 use lens_sys::SystemdUnit;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiTab {
@@ -68,6 +72,7 @@ pub struct TuiApp {
     /// Node ids from the tree root down to `current_path`'s node.
     nav_stack: Vec<NodeId>,
     scan_rx: Option<Receiver<ScanOutcome>>,
+    scan_cancel: Option<Arc<AtomicBool>>,
     pub scanning: bool,
     pub spinner_frame: usize,
     pub scan_errors: Vec<String>,
@@ -117,6 +122,7 @@ impl TuiApp {
             tree: None,
             nav_stack: Vec::new(),
             scan_rx: None,
+            scan_cancel: None,
             scanning: false,
             spinner_frame: 0,
             scan_errors: Vec::new(),
@@ -155,15 +161,14 @@ impl TuiApp {
     /// `poll_scan` on the next frame; until then the previous listing
     /// stays visible with a scanning indicator.
     pub fn request_scan(&mut self, path: PathBuf) {
-        if self.scanning {
-            // A scan is already in flight; queueing another would make
-            // adoption order ambiguous.
-            return;
-        }
+        self.cancel_scan();
+        let token = Arc::new(AtomicBool::new(false));
+        self.scan_cancel = Some(token.clone());
         let (tx, rx) = mpsc::channel();
         let target = path.clone();
         std::thread::spawn(move || {
             let res = DiskScanner::new(ScanOptions::default())
+                .with_cancellation(token)
                 .scan(&target)
                 .map_err(|e| e.to_string());
             let _ = tx.send((target, res));
@@ -172,6 +177,19 @@ impl TuiApp {
         self.scanning = true;
         self.spinner_frame = 0;
         self.status_message = format!("Scanning {} …", path.display());
+    }
+
+    /// Drop the old receiver as well as cancelling its worker: late results
+    /// cannot replace a more recently requested directory.
+    pub fn cancel_scan(&mut self) {
+        if let Some(token) = self.scan_cancel.take() {
+            token.store(true, Ordering::Relaxed);
+        }
+        self.scan_rx = None;
+        if self.scanning {
+            self.status_message = "Scan cancelled; previous listing retained".into();
+        }
+        self.scanning = false;
     }
 
     /// Drain a finished background scan and adopt its tree. Called once
@@ -604,6 +622,12 @@ impl TuiApp {
     }
 }
 
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        self.cancel_scan();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +724,23 @@ mod tests {
         assert_eq!(app.selected_index, 29);
         app.jump_first();
         assert_eq!(app.selected_index, 0);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn new_request_discards_old_worker_receiver() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut app = TuiApp::new(first.path(), None);
+        let old_token = app.scan_cancel.clone().unwrap();
+        app.request_scan(second.path().to_path_buf());
+        assert!(old_token.load(Ordering::Relaxed));
+        app.wait_scan();
+        assert_eq!(app.scan_root, second.path());
+        app.poll_scan();
+        assert_eq!(app.scan_root, second.path());
     }
 }

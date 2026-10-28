@@ -22,16 +22,33 @@ fn unit_diagnostics(units: &BTreeMap<String, SystemdUnit>) -> Vec<Diagnostic> {
 /// `load_units` (fail closed on missing paths); no path merges the
 /// standard systemd search dirs like doctor/TUI.
 pub fn load_units(path: Option<&Path>) -> Result<BTreeMap<String, SystemdUnit>> {
-    match path {
-        Some(p) => lens_sys::load_units(p),
+    load_units_for_manager(path, false).map(|(units, _)| units)
+}
+
+fn load_units_for_manager(
+    path: Option<&Path>,
+    user: bool,
+) -> Result<(BTreeMap<String, SystemdUnit>, lens_sys::ManagerContext)> {
+    let manager = if user {
+        crate::platform::current_user_manager()?
+    } else {
+        lens_sys::ManagerContext::default()
+    };
+    let units = match path {
+        Some(p) => lens_sys::load_units_with_manager(p, &manager)?,
         None => {
-            let dirs: Vec<PathBuf> = lens_sys::SYSTEMD_SEARCH_DIRS
-                .iter()
-                .map(PathBuf::from)
-                .collect();
-            lens_sys::load_units_merged(&dirs)
+            let dirs = if user {
+                crate::platform::user_unit_paths(&manager)
+            } else {
+                lens_sys::SYSTEMD_SEARCH_DIRS
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect()
+            };
+            lens_sys::load_units_merged_with_manager(&dirs, &manager)?
         }
-    }
+    };
+    Ok((units, manager))
 }
 
 /// Build a snapshot from units already loaded (units + cycles +
@@ -40,6 +57,7 @@ pub fn snapshot_from_units(units: BTreeMap<String, SystemdUnit>) -> Result<Syste
     let graph = OrderingGraph::build(&units)?;
     let diagnostics = unit_diagnostics(&units);
     Ok(SystemdSnapshot {
+        manager: None,
         schema: lens_sys::SNAPSHOT_SCHEMA_V1.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         semantics: "systemd-255-subset-v2".to_string(),
@@ -80,10 +98,28 @@ fn push_cycle_findings<T>(report: &mut Report<T>, cycles: Vec<String>, diagnosti
 /// Inspect units: every dependency cycle is a Fail finding; unit parser
 /// diagnostics roll up into one Warn finding.
 pub fn inspect(path: Option<&Path>) -> Result<Report<SystemdSnapshot>> {
-    let snap = snapshot(path)?;
+    inspect_manager(path, false)
+}
+
+pub fn inspect_manager(path: Option<&Path>, user: bool) -> Result<Report<SystemdSnapshot>> {
+    let (units, manager) = load_units_for_manager(path, user)?;
+    let mut snap = snapshot_from_units(units)?;
+    if user {
+        snap.semantics = "systemd-user-subset-v1".into();
+        snap.manager = Some(manager);
+    }
     let cycles = snap.cycles.iter().map(|c| c.join(" -> ")).collect();
-    let diagnostics_count = snap.diagnostics.len();
+    let diagnostics_count = snap
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity != "info")
+        .count();
     let mut report = Report::new(snap);
+    report.complete = diagnostics_count == 0;
+    report.diagnostics.push(format!(
+        "Scope: {} manager; static units only, no service activation or runtime state.",
+        if user { "user" } else { "system" }
+    ));
     push_cycle_findings(&mut report, cycles, diagnostics_count);
     Ok(report)
 }
@@ -98,7 +134,11 @@ pub struct CyclesResult {
 
 /// Detect ordering cycles. Every cycle is a Fail finding.
 pub fn cycles(dir: Option<&Path>) -> Result<Report<CyclesResult>> {
-    let units = load_units(dir)?;
+    cycles_manager(dir, false)
+}
+
+pub fn cycles_manager(dir: Option<&Path>, user: bool) -> Result<Report<CyclesResult>> {
+    let (units, _) = load_units_for_manager(dir, user)?;
     let diagnostics = unit_diagnostics(&units);
     let graph = OrderingGraph::build(&units)?;
     let cycles = graph.find_cycle_paths();
@@ -107,7 +147,9 @@ pub fn cycles(dir: Option<&Path>) -> Result<Report<CyclesResult>> {
         scanned_units: units.len(),
         cycles,
     });
-    push_cycle_findings(&mut report, cycle_msgs, diagnostics.len());
+    let gaps = diagnostics.iter().filter(|d| d.severity != "info").count();
+    report.complete = gaps == 0;
+    push_cycle_findings(&mut report, cycle_msgs, gaps);
     Ok(report)
 }
 
@@ -132,6 +174,14 @@ pub fn diff_snapshots(s1: &SystemdSnapshot, s2: &SystemdSnapshot) -> Report<Syst
         diff.resolved_cycles.len(),
     );
     let mut report = Report::new(diff);
+    report.complete = s1
+        .diagnostics
+        .iter()
+        .chain(&s2.diagnostics)
+        .all(|d| d.severity == "info");
+    if s1.semantics != s2.semantics || s1.manager != s2.manager {
+        report.push(Severity::Warn, "sys.scope_changed", "Manager identity or parser semantics changed; unit changes may reflect collection scope.");
+    }
     for c in new_cycles {
         report.push(Severity::Fail, "sys.new_cycle", c.join(" -> "));
     }

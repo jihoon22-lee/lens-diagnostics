@@ -1065,7 +1065,6 @@ fn net_inspect_distinguishes_owner_unknown_from_orphan() {
         "json",
     ]);
     std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     let json: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("JSON output");
     if json["summary"]["uninspectable_processes"]
         .as_u64()
@@ -1077,6 +1076,15 @@ fn net_inspect_distinguishes_owner_unknown_from_orphan() {
         return;
     }
     assert_eq!(json["summary"]["owner_unknown_sockets"], 1);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "denied ownership scope must be incomplete"
+    );
+    assert_eq!(
+        json["scope"]["capabilities"]["process_owners"]["state"],
+        "denied"
+    );
     assert_eq!(json["summary"]["orphan_sockets"], 0);
     assert_eq!(
         json["sockets"][0]["owner_state"],
@@ -1570,7 +1578,7 @@ fn sys_inspect_reports_parser_diagnostics() {
     .unwrap();
 
     let out = lens(&["sys", "inspect", dir.to_str().unwrap(), "--format", "json"]);
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("snapshot json");
     let diags = v["diagnostics"].as_array().expect("diagnostics array");
     let codes: Vec<&str> = diags.iter().filter_map(|d| d["code"].as_str()).collect();
@@ -2581,6 +2589,9 @@ fn snapshot_collects_host_net_sys_doctor_and_verifies() {
     let log = dir.join("fixture.log");
     std::fs::write(&log, "INFO snapshot fixture\n").unwrap();
 
+    let procfs = dir.join("proc");
+    std::fs::create_dir_all(procfs.join("net")).unwrap();
+    std::fs::write(procfs.join("net/tcp"), "header\n").unwrap();
     let out = lens(&[
         "snapshot",
         "-o",
@@ -2588,7 +2599,7 @@ fn snapshot_collects_host_net_sys_doctor_and_verifies() {
         "--log",
         log.to_str().unwrap(),
         "--procfs",
-        "/proc",
+        procfs.to_str().unwrap(),
         "--systemd-dir",
         units.to_str().unwrap(),
     ]);
@@ -2626,6 +2637,12 @@ fn snapshot_collects_host_net_sys_doctor_and_verifies() {
     ])))
     .expect("host JSON");
     assert_eq!(host["schema"], "lens.host/v1", "{host}");
+    assert!(
+        host["hostname"].is_null(),
+        "fixture identity must not borrow host identity"
+    );
+    assert!(host["os_pretty_name"].is_null());
+    assert_eq!(host["source"]["kind"], "explicit_procfs");
 
     let verify = lens(&["bundle", "verify", out_path.to_str().unwrap()]);
     assert_eq!(verify.status.code(), Some(0), "{}", stderr_of(&verify));
@@ -3095,4 +3112,138 @@ fn log_inspect_multiple_inputs() {
     let arr = json.as_array().expect("array for multi-input");
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[1]["total_lines"], 2);
+}
+
+#[test]
+fn envelope_preserves_domain_json_and_carries_incomplete_decision() {
+    let dir = tmp_dir("envelope");
+    let db = dir.join("compile_commands.json");
+    std::fs::write(
+        &db,
+        serde_json::to_vec(&serde_json::json!([{
+            "directory": dir.path, "file": "deleted.c", "arguments": ["cc", "deleted.c"]
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let args = [
+        "build",
+        "impact",
+        db.to_str().unwrap(),
+        "--header",
+        "missing.h",
+    ];
+    let raw = lens(&args);
+    assert_eq!(raw.status.code(), Some(1));
+    let output = Command::new(env!("CARGO_BIN_EXE_lens"))
+        .args(["--format", "envelope"])
+        .args(args)
+        .env("IDK_RUN_ID", "integration-run")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema_id"], "lens.result");
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["run_id"], "integration-run");
+    assert_eq!(result["complete"], false);
+    assert_eq!(result["execution"]["exit_code"], 1);
+    assert_eq!(
+        result["data"],
+        serde_json::from_slice::<serde_json::Value>(&raw.stdout).unwrap()
+    );
+    assert!(result["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str().unwrap().contains("static literal")));
+    assert!(result["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["code"] == "build.incomplete_graph"));
+}
+
+#[test]
+fn envelope_rejects_streaming_mode_without_writing_payload() {
+    let output = lens(&["log", "filter", "-", "--format", "envelope"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn log_diff_routes_automatically_and_reports_increased_errors() {
+    let dir = tmp_dir("log-diff");
+    let a = dir.join("a.log");
+    let b = dir.join("b.log");
+    std::fs::write(&a, "2026-10-01T00:00:00Z INFO ready\n").unwrap();
+    std::fs::write(&b, "2026-10-01T01:00:00Z ERROR failed\n").unwrap();
+    let out = lens(&[
+        "diff",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--format",
+        "envelope",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["data"]["schema"], "lens.log-diff/v1");
+    assert_eq!(value["data"]["level_delta"]["error"], 1);
+    assert_eq!(value["complete"], true);
+    assert!(value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["code"] == "log.level_increase"));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_collector_preserves_failed_source_and_literal_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir("collect-adapter");
+    let executable = dir.join("docker");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'source diagnostic\\n' >&2\nexit 9\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bundle = dir.join("capture.lens");
+    let out = Command::new(env!("CARGO_BIN_EXE_lens"))
+        .args([
+            "collect",
+            "docker",
+            "name;not-a-shell-command",
+            "--output",
+            bundle.to_str().unwrap(),
+            "--format",
+            "envelope",
+        ])
+        .env("PATH", &dir.path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["complete"], false);
+    assert_eq!(value["data"]["exit_code"], 9);
+    assert_eq!(value["data"]["target"], "name;not-a-shell-command");
+    assert!(lens(&["bundle", "verify", bundle.to_str().unwrap()])
+        .status
+        .success());
+    let bytes = lens(&[
+        "bundle",
+        "show",
+        bundle.to_str().unwrap(),
+        "logs/stdout.log",
+    ]);
+    assert!(stdout_of(&bytes).contains("logs\n--timestamps\n--tail=1000\nname;not-a-shell-command"));
+    let inspect = lens(&[
+        "bundle",
+        "inspect",
+        bundle.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert!(stdout_of(&inspect).contains("source exit=Some(9)"));
 }

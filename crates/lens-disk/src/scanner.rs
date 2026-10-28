@@ -2,6 +2,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::arena::{ArenaTree, DiskMetadata, FsKind, FsNode, NodeId};
 use lens_core::{FileIdentity, LensError, Result};
@@ -70,11 +74,27 @@ pub struct ScanResult {
 
 pub struct DiskScanner {
     options: ScanOptions,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl DiskScanner {
     pub fn new(options: ScanOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            cancellation: None,
+        }
+    }
+
+    /// Cooperative cancellation preserves partial evidence as incomplete.
+    pub fn with_cancellation(mut self, token: Arc<AtomicBool>) -> Self {
+        self.cancellation = Some(token);
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|t| t.load(Ordering::Relaxed))
     }
 
     pub fn with_parallel(mut self, parallel: bool) -> Self {
@@ -131,7 +151,10 @@ impl DiskScanner {
         if root_is_dir {
             let mut stack: Vec<(NodeId, PathBuf, usize)> = vec![(root_id, root.clone(), 0)];
 
-            while let Some((parent_id, current_dir, depth)) = stack.pop() {
+            'walk: while let Some((parent_id, current_dir, depth)) = stack.pop() {
+                if self.cancelled() {
+                    break;
+                }
                 if depth >= self.options.max_depth {
                     depth_limited += 1;
                     // A user-set limit is a deliberate cut, not an
@@ -164,6 +187,21 @@ impl DiskScanner {
 
                 let mut entries = Vec::new();
                 for entry_res in read_dir {
+                    if self.cancelled() {
+                        break 'walk;
+                    }
+                    // Bound enumeration before sorting/statting a huge directory.
+                    // A truncated directory's selected subset is unspecified.
+                    if entries.len()
+                        >= self
+                            .options
+                            .max_entries
+                            .saturating_sub(scanned_entries)
+                            .saturating_add(1)
+                    {
+                        truncated = true;
+                        break;
+                    }
                     let entry = match entry_res {
                         Ok(e) => e,
                         Err(e) => {
@@ -181,6 +219,9 @@ impl DiskScanner {
                 // path keeps identical semantics; only the syscall latency
                 // is parallelized.
                 let stat_entry = |entry: &fs::DirEntry| -> StatOutcome {
+                    if self.cancelled() {
+                        return StatOutcome::Excluded;
+                    }
                     let path = entry.path();
                     let name = entry.file_name().to_string_lossy().into_owned();
                     // Exclusion semantics: `a/b` patterns glob the path
@@ -226,6 +267,9 @@ impl DiskScanner {
                 let mut child_dirs = Vec::new();
 
                 for stat in stats {
+                    if self.cancelled() {
+                        break 'walk;
+                    }
                     if scanned_entries >= self.options.max_entries {
                         truncated = true;
                         if let Some(p) = tree.get_mut(parent_id) {
@@ -338,6 +382,15 @@ impl DiskScanner {
             }
         }
 
+        if self.cancelled() {
+            truncated = true;
+            errors.push("Scan cancelled; retained tree is partial evidence".into());
+            if let Some(root) = tree.get_mut(root_id) {
+                root.complete = false;
+                root.error = "Scan cancelled".into();
+            }
+        }
+
         // Post-order aggregation
         tree.aggregate_sizes(root_id);
 
@@ -383,5 +436,38 @@ impl DiskScanner {
                 .saturating_add(meta.mtime_nsec()),
             modified_time_known: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn pre_cancelled_scan_is_partial_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("entry"), "payload").unwrap();
+        let report = DiskScanner::new(ScanOptions::default())
+            .with_cancellation(Arc::new(AtomicBool::new(true)))
+            .scan(root.path())
+            .unwrap();
+        assert!(!report.complete);
+        assert!(report.truncated);
+        assert!(report.errors.iter().any(|e| e.contains("cancelled")));
+    }
+    #[test]
+    fn wide_directory_respects_entry_budget_before_statting_everything() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..1000 {
+            std::fs::write(root.path().join(format!("file-{i}")), "x").unwrap();
+        }
+        let report = DiskScanner::new(ScanOptions {
+            max_entries: 8,
+            ..Default::default()
+        })
+        .scan(root.path())
+        .unwrap();
+        assert_eq!(report.scanned_entries, 8);
+        assert!(report.truncated);
+        assert!(!report.complete);
     }
 }

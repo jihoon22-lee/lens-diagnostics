@@ -11,6 +11,15 @@ use crate::{json, Report, Severity};
 pub fn inspect(proc_dir: Option<&Path>, no_unix: bool) -> Result<Report<NetReport>> {
     let mut net = inspect_network(proc_dir)?;
     if no_unix {
+        if let Some(scope) = &mut net.scope {
+            scope.capabilities.insert(
+                "unix".into(),
+                lens_core::collection::Capability {
+                    state: lens_core::collection::CapabilityState::Excluded,
+                    detail: Some("--no-unix".into()),
+                },
+            );
+        }
         net.sockets.retain(|s| {
             !matches!(
                 s.kind,
@@ -20,6 +29,15 @@ pub fn inspect(proc_dir: Option<&Path>, no_unix: bool) -> Result<Report<NetRepor
         net.refresh_summary();
     }
     let mut report = Report::new(net);
+    if let Some(scope) = &report.data.scope {
+        report.complete = scope.complete();
+        report.diagnostics.push(format!("Network scope: {}; current network namespace only; optional absent protocols are unavailable, not zero sockets.", scope.source));
+        for (name, capability) in &scope.capabilities {
+            if let Some(detail) = &capability.detail {
+                report.diagnostics.push(format!("{name}: {detail}"));
+            }
+        }
+    }
     if report.data.summary.orphan_sockets > 0 {
         report.push(
             Severity::Warn,
@@ -54,6 +72,15 @@ pub fn diff_values(b: &NetReport, c: &NetReport) -> Report<NetDiffReport> {
         diff.time_wait_delta,
     );
     let mut report = Report::new(diff);
+    if b.scope != c.scope {
+        report.push(
+            Severity::Warn,
+            "net.scope_changed",
+            "Collection scope changed; socket additions/removals may reflect visibility changes.",
+        );
+    }
+    report.complete = b.scope.as_ref().is_none_or(|s| s.complete())
+        && c.scope.as_ref().is_none_or(|s| s.complete());
     for l in &new_listeners {
         report.push(
             Severity::Fail,

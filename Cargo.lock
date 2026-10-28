@@ -913,6 +913,7 @@ version = "0.9.0"
 dependencies = [
  "flate2",
  "jiff",
+ "libc",
  "memmap2",
  "serde",
  "serde_json",

@@ -72,6 +72,8 @@ pub struct SystemdUnit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemdSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<crate::parser::ManagerContext>,
     pub schema: String,
     pub version: String,
     pub semantics: String,

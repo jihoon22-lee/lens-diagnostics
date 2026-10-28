@@ -432,6 +432,7 @@ where
                     Line::from("  Backspace/h parent directory"),
                     Line::from("  /           search log lines (Enter applies, Esc clears)"),
                     Line::from("  r           rescan current directory"),
+                    Line::from("  c           cancel background scan"),
                     Line::from("  ?           toggle this help"),
                     Line::from("  q / Esc     quit"),
                 ])
@@ -479,6 +480,7 @@ where
                 }
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('c') => app.cancel_scan(),
                     KeyCode::Esc => {
                         if app.show_help {
                             app.show_help = false;

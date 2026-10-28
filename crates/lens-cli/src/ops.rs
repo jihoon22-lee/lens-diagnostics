@@ -14,10 +14,36 @@ use std::path::{Path, PathBuf};
 fn wants_json(format: Option<OutputFormat>, json_flag: bool, default_json: bool) -> bool {
     match format {
         // `jsonl` is a `log filter`-only mode; other commands fall back to json.
-        Some(OutputFormat::Json) | Some(OutputFormat::Jsonl) => true,
+        Some(OutputFormat::Json) | Some(OutputFormat::Jsonl) | Some(OutputFormat::Envelope) => true,
         Some(OutputFormat::Text) => false,
         None => json_flag || default_json,
     }
+}
+
+fn render_report<T, D: serde::Serialize>(
+    data: &D,
+    report: &Report<T>,
+    opts: &GlobalOpts,
+) -> Result<String> {
+    if opts.format != Some(OutputFormat::Envelope) {
+        return to_deterministic_pretty(data);
+    }
+    let threshold = match opts.fail_on {
+        FailOn::Warn => Severity::Warn,
+        FailOn::Fail => Severity::Fail,
+    };
+    let argv: Vec<String> = std::env::args_os()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    to_deterministic_pretty(&serde_json::json!({
+        "schema_id": "lens.result", "schema_version": 1,
+        "producer": {"name": "lens", "version": env!("CARGO_PKG_VERSION")},
+        "run_id": std::env::var("IDK_RUN_ID").ok(),
+        "execution": {"argv": argv, "cwd": std::env::current_dir().ok(), "exit_code": if report.is_actionable(threshold) {1} else {0}},
+        "source": {"kind": "command", "identity": argv},
+        "complete": report.complete, "findings": report.findings,
+        "diagnostics": report.diagnostics, "data": data,
+    }))
 }
 
 /// Human-readable binary size (KiB/MiB/GiB) for text-mode summaries.
@@ -207,7 +233,10 @@ fn inspect_command(path: &Path, domain: Domain) -> Result<Commands> {
             action: BuildCommands::Inspect { file: p },
         },
         Domain::Sys => Commands::Sys {
-            action: SysCommands::Inspect { path: Some(p) },
+            action: SysCommands::Inspect {
+                path: Some(p),
+                user: false,
+            },
         },
         Domain::Env => Commands::Env {
             action: EnvCommands::Inspect {
@@ -291,7 +320,13 @@ fn diff_command(domain: Domain, baseline: &Path, candidate: &Path) -> Result<Com
                 candidate: b,
             },
         },
-        Domain::Log | Domain::Disk => {
+        Domain::Log => Commands::Log {
+            action: LogCommands::Diff {
+                baseline: a,
+                candidate: b,
+            },
+        },
+        Domain::Disk => {
             return Err(usage(format!(
                 "cannot diff {} inputs; pass --as",
                 domain.name()
@@ -429,6 +464,23 @@ fn resolve_diff(baseline: &Path, candidate: &Path, as_kind: Option<AsKind>) -> R
 }
 
 pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
+    if opts.format == Some(OutputFormat::Envelope)
+        && matches!(
+            &command,
+            Commands::Tui { .. }
+                | Commands::Completion { .. }
+                | Commands::Disk {
+                    action: DiskCommands::Trash { .. }
+                }
+                | Commands::Log {
+                    action: LogCommands::Inspect { .. } | LogCommands::Filter { .. }
+                }
+        )
+    {
+        return Err(usage(
+            "--format envelope is supported for report commands; log filter uses json/jsonl",
+        ));
+    }
     let mut outcome = Outcome::Clean;
     // Global options: every arm reads the same --format/--json/--fail-on.
     let format = opts.format;
@@ -438,6 +490,46 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
         FailOn::Fail => Severity::Fail,
     };
     match command {
+        Commands::Collect {
+            source,
+            target,
+            output,
+            user,
+            since,
+            lines,
+            timeout,
+            force,
+            redact,
+        } => {
+            let adapter = match source {
+                CollectSource::Journal => lens_ops::collect::Adapter::Journal,
+                CollectSource::Docker => lens_ops::collect::Adapter::Docker,
+                CollectSource::Podman => lens_ops::collect::Adapter::Podman,
+            };
+            let report = lens_ops::collect::collect(&lens_ops::collect::CollectRequest {
+                adapter,
+                target,
+                user,
+                since,
+                lines,
+                timeout: std::time::Duration::from_secs(timeout),
+                output,
+                force,
+                redact,
+            })?;
+            if wants_json(format, json, true) {
+                outln!("{}", render_report(&report.data, &report, opts)?);
+            } else {
+                outln!(
+                    "Captured {} stdout bytes and {} stderr bytes into {}",
+                    report.data.stdout_bytes,
+                    report.data.stderr_bytes,
+                    report.data.output.display()
+                );
+            }
+            apply(&mut outcome, &report, threshold);
+            print_findings(&report.findings, wants_json(format, json, true));
+        }
         // `inspect`/`diff` resolve detection into the equivalent domain
         // command and re-enter dispatch, so output and exit codes are
         // identical to spelling the command out.
@@ -489,7 +581,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                         result.complete,
                         result.truncated,
                     );
-                    outln!("{}", to_deterministic_pretty(&snapshot)?);
+                    outln!("{}", render_report(&snapshot, &report, opts)?);
                 } else {
                     let root_node = &result.tree.nodes[result.root_id as usize];
                     // Unreadable entries or truncation mean the totals
@@ -567,7 +659,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                     diagln!("scan warning: {e}");
                 }
                 if wants_json(format, json, false) {
-                    outln!("{}", to_deterministic_pretty(dup)?);
+                    outln!("{}", render_report(dup, &report, opts)?);
                 } else {
                     for e in &dup.errors {
                         diagln!("hash warning: {e}");
@@ -695,7 +787,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = abi::inspect(&binary, true)?;
                 let elf = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(elf)?);
+                    outln!("{}", render_report(elf, &report, opts)?);
                 } else {
                     // Human summary: the JSON report can be thousands of
                     // lines; text mode is the at-a-glance answer.
@@ -726,7 +818,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = abi::diff(&baseline, &candidate, true)?;
                 let diff = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(diff)?);
+                    outln!("{}", render_report(diff, &report, opts)?);
                 } else {
                     outln!(
                         "ABI diff: {}",
@@ -753,6 +845,22 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
             }
         },
         Commands::Log { action } => match action {
+            LogCommands::Diff {
+                baseline,
+                candidate,
+            } => {
+                let report = log::diff(&baseline, &candidate)?;
+                if wants_json(format, json, true) {
+                    outln!("{}", render_report(&report.data, &report, opts)?);
+                } else {
+                    outln!("Log diff: {:+} line(s)", report.data.total_lines_delta);
+                    for (level, delta) in &report.data.level_delta {
+                        outln!("  {level}: {delta:+}");
+                    }
+                }
+                apply(&mut outcome, &report, threshold);
+                print_findings(&report.findings, wants_json(format, json, true));
+            }
             LogCommands::Inspect { paths } => {
                 let paths = log::expand_inputs(&paths)?;
                 let mut indexers = Vec::with_capacity(paths.len());
@@ -1031,7 +1139,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = log::stats(&paths, &filter, bucket_secs)?;
                 let s = &report.data;
                 if wants_json(format, json, false) {
-                    outln!("{}", to_deterministic_pretty(s)?);
+                    outln!("{}", render_report(s, &report, opts)?);
                 } else {
                     outln!(
                         "Log stats: {} input(s), {} line(s) scanned, {} matched",
@@ -1076,7 +1184,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = test::parse(&file, &project)?;
                 let run = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(run)?);
+                    outln!("{}", render_report(run, &report, opts)?);
                 } else {
                     let s = &run.summary;
                     outln!("Test run: {} (project {})", run.run_id, run.project);
@@ -1103,7 +1211,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = test::diff(&baseline, &candidate)?;
                 let diff = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(diff)?);
+                    outln!("{}", render_report(diff, &report, opts)?);
                 } else {
                     outln!(
                         "Test diff: {} regressions, {} fixes, {} new failures, {} removed, {} skip changes",
@@ -1136,7 +1244,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = trace::analyze(&trace_file)?;
                 let snapshot = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(snapshot)?);
+                    outln!("{}", render_report(snapshot, &report, opts)?);
                 } else {
                     outln!("Trace summary: {}", trace_file.display());
                     outln!(
@@ -1165,7 +1273,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = trace::diff_files(&baseline, &candidate)?;
                 let diff = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(diff)?);
+                    outln!("{}", render_report(diff, &report, opts)?);
                 } else {
                     outln!(
                         "Trace diff: calls {:+} ({} -> {}), errors {:+} ({} -> {})",
@@ -1191,11 +1299,11 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
             }
         },
         Commands::Sys { action } => match action {
-            SysCommands::Inspect { path } => {
-                let report = sys::inspect(path.as_deref())?;
+            SysCommands::Inspect { path, user } => {
+                let report = sys::inspect_manager(path.as_deref(), user)?;
                 let snapshot = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(snapshot)?);
+                    outln!("{}", render_report(snapshot, &report, opts)?);
                 } else {
                     outln!(
                         "Systemd units: {} | cycles: {}",
@@ -1209,11 +1317,11 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 apply(&mut outcome, &report, threshold);
                 print_findings(&report.findings, wants_json(format, json, true));
             }
-            SysCommands::Cycles { dir } => {
-                let report = sys::cycles(dir.as_deref())?;
+            SysCommands::Cycles { dir, user } => {
+                let report = sys::cycles_manager(dir.as_deref(), user)?;
                 let (cycles, scanned_units) = (&report.data.cycles, report.data.scanned_units);
                 if wants_json(format, json, false) {
-                    outln!("{}", to_deterministic_pretty(cycles)?);
+                    outln!("{}", render_report(cycles, &report, opts)?);
                 } else if cycles.is_empty() {
                     outln!(
                         "No dependency cycles detected among {} units.",
@@ -1262,7 +1370,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = sys::diff(&baseline, &candidate)?;
                 let diff = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(diff)?);
+                    outln!("{}", render_report(diff, &report, opts)?);
                 } else {
                     outln!(
                         "Systemd diff: +{} -{} ~{} unit(s), {} new cycle(s), {} resolved",
@@ -1285,7 +1393,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = build::inspect(&file)?;
                 let snapshot = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(snapshot)?);
+                    outln!("{}", render_report(snapshot, &report, opts)?);
                 } else {
                     outln!(
                         "Build database: {} translation units, {} headers tracked",
@@ -1302,7 +1410,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = build::impact(&file, &header)?;
                 let impact = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(impact)?);
+                    outln!("{}", render_report(impact, &report, opts)?);
                 } else {
                     outln!(
                         "Impact of {}: {} translation unit(s) need rebuild",
@@ -1338,7 +1446,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = build::diff(&baseline, &candidate)?;
                 let diff = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(diff)?);
+                    outln!("{}", render_report(diff, &report, opts)?);
                 } else {
                     outln!(
                         "Build diff: +{} -{} ~{} unit(s)",
@@ -1366,7 +1474,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = env::inspect(&venv_path, project.as_deref())?;
                 let snapshot = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(snapshot)?);
+                    outln!("{}", render_report(snapshot, &report, opts)?);
                 } else {
                     let v = &snapshot.venv;
                     outln!("Virtualenv: {}", venv_path.display());
@@ -1393,12 +1501,16 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 if wants_json(format, json, false) {
                     outln!(
                         "{}",
-                        to_deterministic_pretty(&serde_json::json!({
-                            "venv": venv_path.to_string_lossy(),
-                            "missing_dependencies": venv.missing_dependencies,
-                            "version_conflicts": venv.version_conflicts,
-                            "unevaluated_dependencies": venv.unevaluated_dependencies,
-                        }))?
+                        render_report(
+                            &serde_json::json!({
+                                "venv": venv_path.to_string_lossy(),
+                                "missing_dependencies": venv.missing_dependencies,
+                                "version_conflicts": venv.version_conflicts,
+                                "unevaluated_dependencies": venv.unevaluated_dependencies,
+                            }),
+                            &report,
+                            opts
+                        )?
                     );
                 } else {
                     if venv.missing_dependencies.is_empty() {
@@ -1435,7 +1547,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = env::diff(&baseline, &candidate)?;
                 let diff = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(diff)?);
+                    outln!("{}", render_report(diff, &report, opts)?);
                 } else {
                     outln!(
                         "Environment diff: +{} -{} ~{} package(s)",
@@ -1499,7 +1611,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
             })?;
             let manifest = &report.data;
             if wants_json(format, json, false) {
-                outln!("{}", to_deterministic_pretty(manifest)?);
+                outln!("{}", render_report(manifest, &report, opts)?);
             } else {
                 outln!("Snapshot bundle written: {:?}", output);
                 outln!("  Artifacts embedded: {}", manifest.sources.len());
@@ -1547,7 +1659,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 })?;
                 let manifest = &report.data;
                 if wants_json(format, json, false) {
-                    outln!("{}", to_deterministic_pretty(manifest)?);
+                    outln!("{}", render_report(manifest, &report, opts)?);
                 } else {
                     outln!(
                         "Successfully created forensic flight recorder bundle: {:?}",
@@ -1570,7 +1682,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = bundle::diff(&baseline, &candidate)?;
                 let diff = &report.data;
                 if wants_json(format, json, false) {
-                    outln!("{}", to_deterministic_pretty(diff)?);
+                    outln!("{}", render_report(diff, &report, opts)?);
                     apply(&mut outcome, &report, threshold);
                     return Ok(outcome);
                 }
@@ -1591,7 +1703,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = bundle::inspect(&bundle)?;
                 let inspect = &report.data;
                 if wants_json(format, json, false) {
-                    outln!("{}", to_deterministic_pretty(inspect)?);
+                    outln!("{}", render_report(inspect, &report, opts)?);
                     return Ok(outcome);
                 }
                 outln!("=== Lens Forensic Flight Recorder Bundle ===");
@@ -1623,7 +1735,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = bundle::verify(&bundle)?;
                 let vr = &report.data;
                 if wants_json(format, json, false) {
-                    outln!("{}", to_deterministic_pretty(vr)?);
+                    outln!("{}", render_report(vr, &report, opts)?);
                     apply(&mut outcome, &report, threshold);
                     return Ok(outcome);
                 }
@@ -1660,12 +1772,16 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 if wants_json(format, json, false) {
                     outln!(
                         "{}",
-                        to_deterministic_pretty(&serde_json::json!({
-                            "bundle": bundle.to_string_lossy(),
-                            "entry": entry,
-                            "size": bytes.len(),
-                            "content": String::from_utf8_lossy(bytes),
-                        }))?
+                        render_report(
+                            &serde_json::json!({
+                                "bundle": bundle.to_string_lossy(),
+                                "entry": entry,
+                                "size": bytes.len(),
+                                "content": String::from_utf8_lossy(bytes),
+                            }),
+                            &report,
+                            opts
+                        )?
                     );
                 } else {
                     // Raw entry content — typically already pretty JSON.
@@ -1682,14 +1798,18 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 if wants_json(format, json, false) {
                     outln!(
                         "{}",
-                        to_deterministic_pretty(&serde_json::json!({
-                            "bundle": bundle.to_string_lossy(),
-                            "dest": dest.to_string_lossy(),
-                            "extracted": written
-                                .iter()
-                                .map(|p| p.to_string_lossy())
-                                .collect::<Vec<_>>(),
-                        }))?
+                        render_report(
+                            &serde_json::json!({
+                                "bundle": bundle.to_string_lossy(),
+                                "dest": dest.to_string_lossy(),
+                                "extracted": written
+                                    .iter()
+                                    .map(|p| p.to_string_lossy())
+                                    .collect::<Vec<_>>(),
+                            }),
+                            &report,
+                            opts
+                        )?
                     );
                 } else {
                     outln!(
@@ -1708,7 +1828,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = net::inspect(proc_dir.as_deref(), no_unix)?;
                 let net_report = &report.data;
                 if wants_json(format, json, false) {
-                    outln!("{}", to_deterministic_pretty(net_report)?);
+                    outln!("{}", render_report(net_report, &report, opts)?);
                 } else {
                     outln!("Network & Socket Inspection Summary:");
                     outln!(
@@ -1794,7 +1914,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
                 let report = net::diff(&baseline, &candidate)?;
                 let diff = &report.data;
                 if wants_json(format, json, true) {
-                    outln!("{}", to_deterministic_pretty(diff)?);
+                    outln!("{}", render_report(diff, &report, opts)?);
                 } else {
                     outln!(
                         "Network diff: +{} -{} listener(s), +{} -{} connection(s), TIME_WAIT {:+}",
@@ -1823,7 +1943,7 @@ pub fn dispatch(command: Commands, opts: &GlobalOpts) -> Result<Outcome> {
             let report = doctor::run(root.as_deref(), procfs.as_deref(), systemd_dir.as_deref())?;
             let dr = &report.data;
             if wants_json(format, json, false) {
-                outln!("{}", to_deterministic_pretty(dr)?);
+                outln!("{}", render_report(dr, &report, opts)?);
             } else {
                 outln!("=== Lens System Doctor Diagnosis ===");
                 outln!("Overall Status: {:?}", dr.overall_status);
