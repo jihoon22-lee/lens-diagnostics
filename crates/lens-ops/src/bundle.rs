@@ -739,7 +739,14 @@ pub fn diff(base: &PathBuf, cand: &PathBuf) -> Result<Report<BundleDiff>> {
             Ok(sub)
         })();
         match section {
-            Ok(sub) => {
+            Ok(mut sub) => {
+                for finding in &mut sub.findings {
+                    if let Some(evidence) = &mut finding.evidence {
+                        let escaped = key.replace('~', "~0").replace('/', "~1");
+                        evidence.data_pointer =
+                            format!("/sections/{escaped}{}", evidence.data_pointer);
+                    }
+                }
                 report.data.sections.insert(key.to_string(), sub.data);
                 report.findings.extend(sub.findings);
                 report.diagnostics.extend(sub.diagnostics);
@@ -1031,6 +1038,17 @@ mod tests {
         // passed -> failed on the same case is a regression via the
         // shared test classifier.
         assert!(codes.contains(&"test.regression"), "{codes:?}");
+        let data = serde_json::to_value(&report.data).unwrap();
+        let evidence = report
+            .findings
+            .iter()
+            .find(|f| f.code == "test.regression")
+            .unwrap()
+            .evidence
+            .as_ref()
+            .unwrap();
+        assert!(evidence.data_pointer.starts_with("/sections/test/"));
+        assert!(data.pointer(&evidence.data_pointer).is_some());
         assert!(codes.contains(&"bundle.only_in_baseline"), "{codes:?}");
         assert!(codes.contains(&"bundle.log_delta"), "{codes:?}");
     }

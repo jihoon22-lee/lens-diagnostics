@@ -24,9 +24,45 @@ installer는 archive SHA-256, 내부 실행파일 SHA-256, 버전과 target을 �
 셸 시작 파일과 PATH는 자동 변경하지 않습니다. 저장소 릴리스가 신뢰 경계이며
 checksum은 손상 검출용이고, 독립 서명이나 공급자 인증을 의미하지 않습니다.
 
-Python 없이 설치할 때는 target archive와 `SHA256SUMS.txt`를 내려받아 체크섬을
-확인한 후 `lens`, `lens-tui`, `lens-mcp`를 PATH의 디렉터리에 복사하세요.
-`BUILD.json`에는 빌드 source SHA, target, Rust 버전과 실행파일별 digest가 있습니다.
+### Python 없는 설치
+
+`curl`, GNU `tar`, `sha256sum`, `awk`, `install`이 있는 Linux x86_64에서 아래 절차를 사용합니다. 새 임시 디렉터리에서 정확한 archive 한 개의 체크섬을 검증한 뒤 명시한 실행파일만 추출합니다. 다른 target이나 버전의 파일을 섞지 마세요.
+
+```sh
+(
+  set -eu
+  lens_install_dir=$(mktemp -d)
+  trap 'rm -rf "$lens_install_dir"' EXIT
+  cd "$lens_install_dir"
+  lens_version=v0.10.0
+  lens_archive="lens-${lens_version}-x86_64-unknown-linux-musl.tar.gz"
+  lens_release="https://github.com/jihoon22-lee/lens-diagnostics/releases/download/${lens_version}"
+  curl -fLO "$lens_release/$lens_archive"
+  curl -fLO "$lens_release/SHA256SUMS.txt"
+  awk -v name="$lens_archive" '$2 == name {print; found++} END {if (found != 1) exit 1}' SHA256SUMS.txt > selected.sha256
+  sha256sum -c selected.sha256
+  mkdir extracted
+  tar -xzf "$lens_archive" -C extracted --no-same-owner --no-same-permissions lens lens-tui lens-mcp BUILD.json
+  lens_prefix="$HOME/.local"
+  mkdir -p "$lens_prefix/bin"
+  for lens_binary in lens lens-tui lens-mcp; do
+    if test -e "$lens_prefix/bin/$lens_binary" || test -L "$lens_prefix/bin/$lens_binary"; then
+      echo "Existing destination: $lens_prefix/bin/$lens_binary" >&2
+      exit 1
+    fi
+  done
+  for lens_binary in lens lens-tui lens-mcp; do
+    install -m 755 "extracted/$lens_binary" "$lens_prefix/bin/$lens_binary"
+  done
+  "$lens_prefix/bin/lens" --version
+)
+```
+
+`BUILD.json`에는 source SHA, target, Rust 버전과 실행파일별 digest가 있습니다. 위 절차는 archive 전체 digest를 검증합니다. 개별 digest 비교와 메타데이터의 자동 검증도 필요하면 installer를 사용하세요. 체크섬 실패 시 설치를 진행하지 않습니다.
+
+### 업데이트와 충돌
+
+현재 실행파일은 `command -v lens`로 확인하세요. installer는 기존 파일을 기본적으로 덮지 않습니다. 교체하려는 파일이 맞는지 확인한 후 정확한 새 버전과 `--force`를 지정합니다. Python 없는 절차는 기존 목적지가 있으면 중단하므로 먼저 별도 prefix에 설치해 검증한 뒤 기존 실행파일을 백업하고 교체하세요. 경로에 공백이 있으면 `--prefix "$HOME/Lens Tools"`처럼 인용합니다. PATH에 여러 설치가 있으면 실제 실행되는 버전을 다시 확인하세요.
 
 ## 폐쇄망 전달
 

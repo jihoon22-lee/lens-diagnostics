@@ -682,6 +682,7 @@ mod tests {
         let outcome = ToolOutcome {
             value: json!({"huge": "\"\\\n".repeat(100_000)}),
             findings: vec![Finding {
+                evidence: None,
                 severity: lens_ops::Severity::Fail,
                 code: "test.regression".into(),
                 message: "x".repeat(100_000),
@@ -794,6 +795,7 @@ mod tests {
     fn findings_item_is_capped_and_reports_total() {
         let many: Vec<lens_ops::Finding> = (0..1000)
             .map(|i| lens_ops::Finding {
+                evidence: None,
                 severity: lens_ops::Severity::Warn,
                 code: "x.finding".to_string(),
                 message: format!("finding number {i}"),
@@ -820,6 +822,7 @@ mod tests {
 
         let huge: Vec<lens_ops::Finding> = (0..1000)
             .map(|i| lens_ops::Finding {
+                evidence: None,
                 severity: lens_ops::Severity::Fail,
                 code: "x.finding".to_string(),
                 message: format!("{}:{}", i, "y".repeat(2000)),

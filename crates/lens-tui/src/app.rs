@@ -73,6 +73,8 @@ pub struct TuiApp {
     nav_stack: Vec<NodeId>,
     scan_rx: Option<Receiver<ScanOutcome>>,
     scan_cancel: Option<Arc<AtomicBool>>,
+    scan_worker: Option<std::thread::JoinHandle<()>>,
+    pending_scan: Option<PathBuf>,
     pub scanning: bool,
     pub spinner_frame: usize,
     pub scan_errors: Vec<String>,
@@ -123,6 +125,8 @@ impl TuiApp {
             nav_stack: Vec::new(),
             scan_rx: None,
             scan_cancel: None,
+            scan_worker: None,
+            pending_scan: None,
             scanning: false,
             spinner_frame: 0,
             scan_errors: Vec::new(),
@@ -162,17 +166,36 @@ impl TuiApp {
     /// stays visible with a scanning indicator.
     pub fn request_scan(&mut self, path: PathBuf) {
         self.cancel_scan();
+        self.scanning = true;
+        self.status_message = format!("Scanning {} …", path.display());
+        if self
+            .scan_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            // Coalesce rapid navigation into one pending request. Never spawn
+            // another worker until cancellation of the previous one finishes.
+            self.pending_scan = Some(path);
+            return;
+        }
+        self.start_scan(path);
+    }
+
+    fn start_scan(&mut self, path: PathBuf) {
+        if let Some(worker) = self.scan_worker.take() {
+            let _ = worker.join();
+        }
         let token = Arc::new(AtomicBool::new(false));
         self.scan_cancel = Some(token.clone());
         let (tx, rx) = mpsc::channel();
         let target = path.clone();
-        std::thread::spawn(move || {
+        self.scan_worker = Some(std::thread::spawn(move || {
             let res = DiskScanner::new(ScanOptions::default())
                 .with_cancellation(token)
                 .scan(&target)
                 .map_err(|e| e.to_string());
             let _ = tx.send((target, res));
-        });
+        }));
         self.scan_rx = Some(rx);
         self.scanning = true;
         self.spinner_frame = 0;
@@ -182,6 +205,7 @@ impl TuiApp {
     /// Drop the old receiver as well as cancelling its worker: late results
     /// cannot replace a more recently requested directory.
     pub fn cancel_scan(&mut self) {
+        self.pending_scan = None;
         if let Some(token) = self.scan_cancel.take() {
             token.store(true, Ordering::Relaxed);
         }
@@ -195,6 +219,17 @@ impl TuiApp {
     /// Drain a finished background scan and adopt its tree. Called once
     /// per event-loop iteration.
     pub fn poll_scan(&mut self) {
+        if self.pending_scan.is_some() {
+            if self
+                .scan_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+            {
+                return;
+            }
+            let path = self.pending_scan.take().unwrap();
+            self.start_scan(path);
+        }
         let rx = match self.scan_rx.as_ref() {
             Some(rx) => rx,
             None => return,
@@ -222,6 +257,12 @@ impl TuiApp {
     /// Block until the in-flight scan finishes (tests and synchronous
     /// callers); no-op when nothing is scanning.
     pub fn wait_scan(&mut self) {
+        if let Some(path) = self.pending_scan.take() {
+            if let Some(worker) = self.scan_worker.take() {
+                let _ = worker.join();
+            }
+            self.start_scan(path);
+        }
         if let Some(rx) = self.scan_rx.take() {
             if let Ok((path, res)) = rx.recv() {
                 match res {
@@ -730,6 +771,30 @@ mod tests {
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+    #[test]
+    fn rapid_requests_coalesce_and_cancel_pending_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TuiApp::new(dir.path(), None);
+        app.wait_scan();
+        // Keep a worker alive deterministically while requests arrive.
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        app.scan_worker = Some(std::thread::spawn(move || {
+            let _ = wait.recv();
+        }));
+        for n in 0..1000 {
+            app.request_scan(dir.path().join(n.to_string()));
+        }
+        assert_eq!(app.pending_scan, Some(dir.path().join("999")));
+        assert!(app.scan_rx.is_none());
+        app.cancel_scan();
+        assert!(app.pending_scan.is_none());
+        release.send(()).unwrap();
+        app.scan_worker.take().unwrap().join().unwrap();
+        app.request_scan(dir.path().to_path_buf());
+        app.wait_scan();
+        assert_eq!(app.scan_root, dir.path());
+    }
+
     #[test]
     fn new_request_discards_old_worker_receiver() {
         let first = tempfile::tempdir().unwrap();

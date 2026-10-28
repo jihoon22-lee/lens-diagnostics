@@ -316,10 +316,13 @@ pub fn stats(
     let mut unknown_timestamp = 0u64;
     let mut first_ms = i64::MAX;
     let mut last_ms = i64::MIN;
-    // (timestamp_ms, warn_or_higher) per matched, timestamped line —
-    // remembered so the bucket width can be chosen after the full span
-    // is known.
-    let mut stamped: Vec<(i64, bool)> = Vec::new();
+    if bucket_secs.is_some_and(|width| width == 0 || width > i64::MAX as u64) {
+        return Err(LensError::Usage {
+            message: "bucket width must be between 1 and i64::MAX seconds".into(),
+        });
+    }
+    let mut width = bucket_secs.unwrap_or(BUCKET_CHOICES[0]);
+    let mut acc: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
 
     for path in inputs {
         let indexer = open(path)?;
@@ -344,32 +347,33 @@ pub fn stats(
                 // `Unknown` sorts above `Fatal` in the derived Ord, so
                 // it must be excluded explicitly — an undetermined
                 // level is not warn-or-higher evidence.
-                stamped.push((
-                    ts,
-                    record.level >= LogLevel::Warn && record.level != LogLevel::Unknown,
-                ));
+                if bucket_secs.is_none() {
+                    let wanted =
+                        pick_bucket_secs((last_ms.saturating_sub(first_ms) / 1000 + 1) as u64);
+                    if wanted > width {
+                        let mut rebinned: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
+                        for (start, counts) in acc {
+                            let key = start.div_euclid(wanted as i64) * wanted as i64;
+                            let entry = rebinned.entry(key).or_default();
+                            entry.0 += counts.0;
+                            entry.1 += counts.1;
+                        }
+                        acc = rebinned;
+                        width = wanted;
+                    }
+                }
+                let key = ts.div_euclid(1000).div_euclid(width as i64) * width as i64;
+                let entry = acc.entry(key).or_default();
+                entry.0 += 1;
+                if record.level >= LogLevel::Warn && record.level != LogLevel::Unknown {
+                    entry.1 += 1;
+                }
             } else {
                 unknown_timestamp += 1;
             }
         }
     }
 
-    let bucket_secs = bucket_secs.unwrap_or_else(|| {
-        if first_ms <= last_ms {
-            pick_bucket_secs(((last_ms - first_ms) / 1000 + 1) as u64)
-        } else {
-            3600
-        }
-    });
-    let mut acc: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
-    for (ts, warn_plus) in stamped {
-        let b = ts.div_euclid(1000).div_euclid(bucket_secs as i64) * bucket_secs as i64;
-        let e = acc.entry(b).or_default();
-        e.0 += 1;
-        if warn_plus {
-            e.1 += 1;
-        }
-    }
     let buckets = acc
         .into_iter()
         .map(|(start, (total, warn_or_higher))| LogBucket {
@@ -448,6 +452,24 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<LogDiff>> {
     report.diagnostics.extend(a.diagnostics);
     report.diagnostics.extend(b.diagnostics);
     report.diagnostics.push("Scope: aggregate counts over the supplied inputs; unequal durations/volumes are not normalized, unknown levels are not treated as errors.".into());
+    let before = &report.data.baseline;
+    let after = &report.data.candidate;
+    if before.first_ts != after.first_ts || before.last_ts != after.last_ts {
+        report.diagnostics.push(format!(
+            "Observed time bounds differ: baseline {:?}..{:?}; candidate {:?}..{:?}. Count increases alone do not establish a rate regression.",
+            before.first_ts, before.last_ts, after.first_ts, after.last_ts
+        ));
+    }
+    if before.unknown_timestamp > 0
+        || after.unknown_timestamp > 0
+        || before.first_ts.is_none()
+        || after.first_ts.is_none()
+    {
+        report.diagnostics.push(format!(
+            "Observation duration is unknown or incomplete: baseline {} and candidate {} lines lack timestamps; no rate comparison is available.",
+            before.unknown_timestamp, after.unknown_timestamp
+        ));
+    }
     for (level, delta) in report.data.level_delta.clone() {
         if delta > 0 && matches!(level.as_str(), "error" | "fatal" | "warn") {
             report.push(
@@ -467,6 +489,25 @@ pub fn diff(baseline: &Path, candidate: &Path) -> Result<Report<LogDiff>> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn diff_explains_changed_and_unknown_time_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(&a, "2026-10-09T12:00:00Z ERROR x\n").unwrap();
+        fs::write(&b, "2026-10-10T12:00:00Z ERROR y\nERROR no time\n").unwrap();
+        let report = diff(&a, &b).unwrap();
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("Observed time bounds differ")));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("no rate comparison")));
+        assert_eq!(report.data.level_delta.get("error"), Some(&1));
+    }
+
+    #[test]
     fn follower_waits_for_rotation_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log");
@@ -478,6 +519,38 @@ mod tests {
         assert!(follower.poll().unwrap().lines.is_empty());
         std::fs::write(&path, "replacement\n").unwrap();
         assert_eq!(follower.poll().unwrap().lines, vec!["replacement"]);
+    }
+
+    #[test]
+    fn adaptive_histogram_matches_fixed_width_for_out_of_order_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        // Repeated observations and progressively wider, unordered spans
+        // force every adaptive transition, including across the epoch.
+        let stamps = [
+            0i64,
+            1_000,
+            -1_000,
+            4_000_000,
+            -20_000_000,
+            90_000_000,
+            -400_000_000,
+        ];
+        let mut input = String::new();
+        for stamp in stamps {
+            for _ in 0..100 {
+                input.push_str(&format!(
+                    "{{\"ts\":{stamp},\"level\":\"warn\",\"message\":\"x\"}}\n"
+                ));
+            }
+        }
+        fs::write(&path, input).unwrap();
+        let adaptive = stats(std::slice::from_ref(&path), &LogFilter::new(), None).unwrap();
+        let fixed = stats(&[path], &LogFilter::new(), Some(pick_bucket_secs(490_001))).unwrap();
+        assert_eq!(
+            serde_json::to_value(adaptive.data).unwrap(),
+            serde_json::to_value(fixed.data).unwrap()
+        );
     }
 
     #[test]

@@ -2,6 +2,18 @@
 
 Lens는 워크스페이스 단일 버전으로 릴리스된다. 태그는 `vX.Y.Z` 형식이다.
 
+## Unreleased
+
+기본 검사·비교 흐름과 선택적 반복 작업 설정을 개선한다. CLI/TUI/MCP/bundle과 기존 도메인 JSON을 유지한다.
+
+- 선택적 `lens.toml`, 사용자 설정, `--config`/`--no-config`, `config init`/`explain`을 추가한다. 출력은 사용자 선호, 판정·디스크 범위는 프로젝트 설정을 우선하고 명시 CLI가 최종 우선한다. cwd에서 VCS/home/root 경계까지만 탐색하며 입력 자료에서는 설정을 찾지 않는다.
+- `lens run NAME`으로 명명한 journal/docker/podman 수집이나 snapshot을 실행한다. 설정 상대경로는 선언 파일 기준이며 argv 실행·수집 한도·stdout/stderr/provenance 계약을 유지한다.
+- **기본 출력 변경:** 설정과 명시 옵션이 없는 터미널에서는 report 명령이 text를 사용한다. 파이프에서는 기존 명령별 기본값을 유지한다. 자동화에는 `--format json` 또는 `--format envelope`를 명시한다.
+- JUnit 텍스트에 실패 사례와 원인을 표시한다. 요약 목록과 긴 실패 메시지는 생략 수·상세 조회 안내와 함께 제한하며 JSON 데이터는 보존한다. 테스트 실패는 기존 Warn 판정이므로 `--fail-on warn`에서 종료 1이다.
+- finding의 선택적 `evidence`에 실제 도메인 데이터 포인터와 관측 경로/객체를 기록한다. lens.result v1의 추가 필드이며 기존 JSON reader와 원래 argv identity 의미를 유지한다. Rust `Finding` struct literal에는 새 필드를 반영해야 한다.
+- TUI 스캔 worker를 하나로 제한하고 최신 대기 요청만 유지한다. 로그 통계는 타임스탬프별 저장 대신 점진적 버킷 집계를 사용한다. 입력 인덱스는 여전히 행 수에 비례한다. 로그 diff는 시간 범위 차이·미확인 기간을 표시하며 rate 회귀를 추정하지 않는다.
+- 첫 사용 문서와 Python 없는 native 설치 절차, v1 소비자 corpus 및 재현 가능한 대용량/CLI/TUI/MCP 검증을 추가한다.
+
 ## 0.10.0
 
 Lens Diagnostics 전환 릴리스. 기존 `lens` CLI와 도메인 JSON을 유지하면서 수집 범위, 분석 완결성, 자동화 결과 계약 및 검증된 Linux 배포를 추가했다.

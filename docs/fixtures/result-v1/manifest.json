@@ -1,0 +1,26 @@
+{
+  "synthetic": true,
+  "schema_version": 1,
+  "cases": [
+    {
+      "file": "complete.json",
+      "kind": "envelope"
+    },
+    {
+      "file": "incomplete.json",
+      "kind": "envelope"
+    },
+    {
+      "file": "missing-location.json",
+      "kind": "envelope"
+    },
+    {
+      "file": "large.json",
+      "kind": "envelope"
+    },
+    {
+      "file": "error.json",
+      "kind": "process_capture"
+    }
+  ]
+}

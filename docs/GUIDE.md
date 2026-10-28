@@ -15,13 +15,56 @@ cargo build --release -p lens-cli
 source <(lens completion bash)   # zsh, fish도 지원
 ```
 
+## 선택적 설정과 반복 수집
+
+설정은 필수가 아닙니다. `lens config init [path]`는 기존 파일을 덮지 않고 `schema_version = 1`만 만듭니다. `lens config explain`으로 선택된 파일, 탐색 경계, 유효 출력·정책을 확인합니다.
+
+자동 탐색은 사용자 `$XDG_CONFIG_HOME/lens/config.toml`(미설정 시 `~/.config/lens/config.toml`)과 cwd에서 가장 가까운 상위 `lens.toml`을 사용합니다. `.git`, home, filesystem root에서 멈추며 입력 파일이나 bundle 내부에서는 찾지 않습니다. `--config PATH`는 해당 파일과 내장 기본값만, `--no-config`는 내장 기본값만 사용합니다.
+
+정책·범위는 내장 → 사용자 → 프로젝트 → 명시 CLI 순입니다. 개인 표시(`[output] format`, `quiet`)는 프로젝트보다 사용자 선호가 우선이며 명시 CLI가 최종 우선입니다. 알 수 없는 키와 잘못된 값은 오류입니다. 목록은 교체하며 `[]`는 비우고, 명시 `false`는 앞선 `true`를 덮습니다.
+
+```toml
+schema_version = 1
+
+[output]
+format = "text" # text, json, jsonl, envelope
+quiet = false
+
+[policy]
+fail_on = "warn" # warn, fail
+
+[disk]
+max_depth = 8
+exclude = []
+one_file_system = false
+parallel = true
+top = 20
+min_size = 0
+
+[collect.api]
+source = "journal" # journal, docker, podman
+target = "api.service"
+output = "captures/api.lens"
+lines = 1000
+timeout = 30
+user = false
+redact = false
+
+[snapshot.daily]
+output = "captures/daily.lens"
+log = "logs/api.log"
+redact = true
+```
+
+`lens run api`는 지정 unit/container만 수집하며 `lens run daily`는 snapshot을 만듭니다. 외부 명령은 argv로 실행하고 임의 shell script는 설정하지 않습니다. collect의 source/target/output은 필수이며 lines=1000, timeout=30초가 기본입니다. snapshot은 output/procfs/systemd_dir/log/disk/env/test/trace를 선택적으로 지정합니다. 경로는 선언한 설정 파일 기준입니다. 같은 이름의 collect와 snapshot은 오류입니다. `[disk]`는 `disk scan`/`disk duplicates`와 디렉터리로 자동 판별된 `inspect`에 적용하며 다른 도메인에 전역 제외 규칙을 적용하지 않습니다. 설정 파일로 MCP allow-root 등 접근 권한을 확대할 수 없습니다.
+
 ## 공통 계약
 
 ### 종료 코드
 
 | 코드 | 의미 | 예시 |
 |------|------|------|
-| 0 | clean — findings 없음 | 정상 스캔, 회귀 없는 `test diff` |
+| 0 | 설정한 임계값 이상의 finding 없음, complete=true | 정상 스캔, 회귀 없는 `test diff` |
 | 1 | findings 있음 | `test diff` 회귀/신규 실패, `test parse` 불완전 JUnit, `abi diff` incompatible·uncertain(수동 검토 필요), `sys inspect`/`sys cycles` 사이클, `sys diff` 신규 사이클, `env inspect`/`env check` 누락·충돌 의존성, `net diff` 신규 리스너, `trace analyze` fd 누수, `trace diff` 신규 에러, `disk scan`/`disk duplicates` incomplete(권한 오류·절단·해시 실패), `bundle create`/`snapshot` 수집 경고, `bundle verify` 무결성 불일치, `bundle diff` 섹션 findings·섹션 역직렬화 실패, `doctor`의 `--fail-on` 기준 이상 |
 | 2 | 사용·입력·런타임 오류 | 존재하지 않는 경로, 잘못된 플래그 값, 파싱 불가 입력, `abi inspect`/`abi diff`의 비ELF 입력, diff 입력의 스키마 불일치(`expected schema`), `bundle diff`의 무결성 검증 실패 번들 |
 
@@ -50,8 +93,7 @@ JSON 출력은 도메인 스키마를 그대로 유지하며 `findings` 키가 �
 
 - `--format text|json|jsonl`: 출력 형식. `text`는 사람이 읽는
   요약(색인·집계·top-N)이고, `json`은 기존 결정적 JSON 스키마를
-  출력한다. 기본값은 명령별 기존 동작을 유지한다(예: `abi inspect`는
-  json, `disk scan`은 text). `jsonl`은 `log filter`만 실제 줄 단위
+  출력한다. 설정·명시 옵션이 없으면 TTY에서는 text, non-TTY에서는 명령별 기존 동작을 유지한다(예: `abi inspect`는 json, `disk scan`은 text). `jsonl`은 `log filter`만 실제 줄 단위
   출력에 사용하고, 다른 명령은 `json`과 동일하게 처리한다.
 - `--json`: `--format json`의 별칭.
 - `--fail-on warn|fail`(기본 `fail`): exit 1로 간주할 최소 finding

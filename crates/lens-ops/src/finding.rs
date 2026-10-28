@@ -17,6 +17,19 @@ pub struct Finding {
     pub severity: Severity,
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<FindingEvidence>,
+}
+
+/// Structured reference to observed domain data. Coordinates are never inferred
+/// from human messages. `data_pointer` uses RFC 6901 relative to report data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingEvidence {
+    pub data_pointer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
 }
 
 /// Result of one operation: the data plus everything a front end needs
@@ -49,6 +62,7 @@ impl<T> Report<T> {
             severity,
             code: code.to_string(),
             message: message.into(),
+            evidence: None,
         });
     }
 
@@ -89,5 +103,34 @@ mod tests {
         // Incomplete evidence is actionable at any threshold.
         assert!(report_with(&[], false).is_actionable(Severity::Fail));
         assert!(report_with(&[Severity::Info], false).is_actionable(Severity::Fail));
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    #[test]
+    fn legacy_findings_round_trip_without_new_fields() {
+        let legacy =
+            serde_json::json!({"severity":"warn","code":"test.old","message":"/not/a/location:23"});
+        let finding: Finding = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(finding.evidence.is_none());
+        assert_eq!(serde_json::to_value(finding).unwrap(), legacy);
+    }
+
+    #[test]
+    fn consumer_corpus_retains_all_findings_and_valid_references() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/fixtures/result-v1/large.json"))
+                .unwrap();
+        let findings: Vec<Finding> = serde_json::from_value(value["findings"].clone()).unwrap();
+        assert_eq!(findings.len(), 1024);
+        for finding in findings {
+            let evidence = finding.evidence.unwrap();
+            assert_eq!(
+                value["data"].pointer(&evidence.data_pointer).unwrap()["id"].as_str(),
+                evidence.object.as_deref()
+            );
+        }
     }
 }
