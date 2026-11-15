@@ -4,7 +4,7 @@
 
 ## 1. 아키텍처 및 워크스페이스 구조 (`crates/`)
 
-플랫폼은 14개의 고성능 모듈식 Rust 크레이트로 구성되어 있습니다.
+플랫폼은 14개의 Rust 크레이트로 구성되어 있습니다.
 
 ```text
 lens-diagnostics/
@@ -13,8 +13,8 @@ lens-diagnostics/
 │   ├── lens-core/      공통 기반 (Zero-Copy I/O, SafeInput TOCTOU 방어, SHA-256, 3상태 Diff, 번들 매니페스트 무결성 검증)
 │   ├── lens-disk/      스토리지 분석, 연속 메모리 아레나 트리, 중복 파일 탐지, FreeDesktop Trash
 │   ├── lens-abi/       ELF 동적 심볼 검사, C++/Rust 심볼 디맹글링, ABI 3상태 Diff
-│   ├── lens-log/       mmap 제로카피 라인 인덱서, 무할당 필터 평가, Session v2
-│   ├── lens-test/      quick-xml 초고속 스트리밍 테스트 파서, 회귀 자동 탐지
+│   ├── lens-log/       mmap 라인 인덱서, 필터 평가, Session v2
+│   ├── lens-test/      quick-xml 스트리밍 테스트 파서, 회귀 자동 탐지
 │   ├── lens-trace/     strace 스트리밍 파서, FD 누수/IO 처리량 추적, 미완료 스레드 복원, 지연/에러 diff
 │   ├── lens-sys/       systemd 유닛/드롭인 파서, Specifier 확장, Tarjan SCC 순환 탐지
 │   ├── lens-build/     compile_commands.json 파서, 플래그 정규화, 헤더 영향도 역방향 DAG
@@ -28,23 +28,12 @@ lens-diagnostics/
 
 ---
 
-## 2. 레거시 도구 대비 혁신 지표
+## 2. 구현 범위와 측정
 
-| 영역 | 기존 레거시 도구 | 차세대 Rust 엔진 (`lens`) |
-|---|---|---|
-| **배포 형태** | Qt6, Python, libstdc++ 런타임 종속 8개 분열 | 단일 CLI 바이너리 (`lens`) |
-| **디스크 트리 저장** | 경로별 개체 분산 할당 | `u32` 인덱스 연속 아레나(`ArenaTree`), 캐시 지역성 확보 |
-| **로그 검색 핫패스** | 검색 시마다 `toLowerAscii` 힙 할당 (100만회+) | mmap 라인 인덱싱 + 무할당 슬라이딩 윈도우 필터 (`contains_insensitive`) |
-| **테스트 XML 파싱** | Python `defusedxml` | `quick-xml` 스트리밍 파서 |
-| **strace 다중스레드** | C++ 파서 복잡성, 스레드 중첩 분실 위험 | 비동기 호출 매칭 및 스트리밍 파서 |
-| **systemd 정적 분석** | Python AST 파싱 | 무평가 정적 파서 + Tarjan SCC 순환 그래프 탐지 |
-| **빌드 영향도 분석** | CMake 캐시 수동 파싱 | 헤더→소스 역방향 영향도 분석 |
-| **Python 환경 감사** | Python 인터프리터 구동 위험 | 제로 코드 실행 정적 메타데이터 & 섀도잉 감사 |
-| **사고 포렌식 기록** | 도구별 산출물 수동 수집 | 통합 `.lens` 비행기록장치 번들 생성/검사/검증 |
-
-> 정확한 구현 상태와 한계는 [crates/README.md](../crates/README.md)와 소스를 참조하세요. 심볼 버전 수집, DWARF 타입 추출, `.d/` drop-in 병합 등이 구현되어 있습니다.
-
----
+[크레이트 안내](../crates/README.md)에 구현과 제약을 기록한다.
+[검증 기록](USABILITY_VALIDATION.md)의 특정 환경 측정을 일반적인 성능 보장으로 확대하지 않는다.
+CLI와 MCP는 `lens-ops`의 판정을 공유하며 TUI는 도메인 crate를 직접 사용한다.
+TUI의 요약 화면을 CLI/MCP의 전체 보고서와 동일한 계약으로 간주하지 않는다.
 
 ## 3. 설치, 빌드 및 테스트
 

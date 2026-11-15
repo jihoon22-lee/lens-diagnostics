@@ -13,7 +13,7 @@
 
 ## 완료
 - GitHub 저장소를 `jihoon22-lee/lens-diagnostics`로 rename; origin 변경. 이력/릴리스 유지. 부모에 canonical URL 전달.
-- 로컬 원본 폴더 이름은 활성 세션 보호를 위해 유지.
+- 당시 로컬 폴더명은 활성 세션 보호를 위해 유지했다. 현재 checkout은 `lens-diagnostics`다.
 
 ## 구현 및 검증 계획
 - [x] P0-A build impact missing/unresolved/truncated complete 회귀 수정, 정적 분석 범위 표시.
@@ -28,7 +28,7 @@
 - [x] docs/README/GUIDE/지원표/CHANGELOG/metadata 갱신, 버전 결정.
 - [x] 필요한 좁은 테스트 및 heavy lock 하 전체 fmt/clippy/test/문서 검사, 실제 MCP 통합, CI/PR 병합.
 - [x] 릴리스 게시/공개 asset 다운로드 digest 및 smoke 확인.
-- [ ] main 동기화, 소유 merged branch/worktree/임시자원 정리.
+- [x] main 동기화, 소유 merged branch/worktree/임시자원 정리(아래 종료 검증).
 
 ## 지원 범위
 Linux/WSL/container 우선. 폐쇄망은 설치 환경으로 유지. macOS/native Windows/PE/Mach-O 및 완전한 compiler 영향도는 조건부 후속 검토이며 이번 릴리스의 동등 지원 약속이 아니다. 미실행 검사와 현장 미검증은 PASS로 기록하지 않는다.
@@ -91,4 +91,4 @@ CLI `lens`, crate `lens-*`, `.lens`, 기존 schema 및 JSON 기본 출력 유지
 - 원본 checkout을 main release SHA로 fast-forward한 뒤 `/home/jihoon/projects/lens-generalization` worktree(소유 target/dist/cache 포함) 제거, prune 완료. active cwd가 없는 것을 확인했다. local/remote `fix/build-evidence`, `feat/generalization`, `release/v0.10.0` 삭제 완료. 세 브랜치 모두 PR merge와 main ancestor로 변경 보존을 확인했다. merge commit까지 전진한 local ref는 upstream보다 앞서 있었으므로 main ancestry 확인 후 upstream을 해제하고 일반 `branch -d`로 제거했다.
 - 소유 `/tmp/lens-generalization-*` 로그/PR본문/검증스크립트 파일11개 및 smoke/download/install 디렉터리2개를 이름별로 제거했다. 무차별 git clean은 사용하지 않았다. 원본 checkout의 기존 target/cache, 공개 tag/releases, 부모 공통 flock, idk 소유 integration 증거는 보존한다.
 - 이 종료 기록은 원본 checkout의 `docs/generalization-closeout` 브랜치에서 작성한다. 이 문서 PR의 필수 CI/병합 후 원본 main으로 복귀·fast-forward하고 해당 local/remote 기록 브랜치와 PR본문 임시파일을 마지막으로 제거한다. 최종 main SHA와 clean 결과는 세션 최종 보고에 남긴다. 이 항목은 종료 기록 작성 시점의 절차이며 기능/릴리스 미완료를 의미하지 않는다.
-- 원본 로컬 폴더명 `toy-projects`는 활성 Paseo 세션 경로를 보호하기 위해 유지했다. GitHub/제품명/remote는 Lens Diagnostics/lens-diagnostics이며 CLI/crate/schema 이름은 기존 계약을 유지한다. 로컬 폴더 이동은 활성 세션 종료 후 별도로 수행할 수 있다.
+- 현재 로컬 폴더명은 `lens-diagnostics`이며 GitHub/제품명/remote와 일치한다. 과거 경로는 당시 검증 기록에만 남긴다.
