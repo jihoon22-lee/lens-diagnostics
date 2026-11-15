@@ -1,14 +1,14 @@
 # Lens Diagnostics (`lens`)
 
-Linux 시스템과 개발 산출물을 검사하고 두 결과를 비교하는 도구입니다. 로그, JUnit, ELF, 디렉터리 등을 자동 판별하며 `.lens` 번들, TUI와 MCP도 제공합니다. idk나 ici 설치는 필요하지 않습니다.
+Linux 시스템과 개발 산출물을 검사하고 두 결과를 비교하는 도구입니다. 로그, JUnit, ELF, 디렉터리 등을 자동 판별하며 `.lens` 번들, TUI와 MCP도 제공합니다. 독립 실행 도구입니다.
 
 ## 설치
 
 Linux x86_64에서는 버전을 지정한 공식 installer를 권장합니다. Python 3.10 이상이 필요합니다.
 
 ```sh
-curl -fLO https://github.com/jihoon22-lee/lens-diagnostics/releases/download/v0.11.0/install.py
-python3 install.py --version v0.11.0
+curl -fLO https://github.com/jihoon22-lee/lens-diagnostics/releases/download/v0.11.1/install.py
+python3 install.py --version v0.11.1
 ~/.local/bin/lens --version
 ```
 
@@ -58,7 +58,7 @@ $ lens diff old.lens new.lens   # 두 시점의 시스템 상태 비교
 ```
 
 ```bash
-# 1. 파일시스템 초고속 스캔 & 중복 파일 탐지 (동일 inode 하드링크 자동 인식)
+# 1. 파일시스템 스캔 & 중복 파일 탐지 (동일 inode 하드링크 자동 인식)
 $ lens disk scan .
 $ lens disk duplicates . --min-size 1048576
 
@@ -66,7 +66,7 @@ $ lens disk duplicates . --min-size 1048576
 $ lens abi inspect /usr/bin/python3
 $ lens abi diff lib_v1.so lib_v2.so
 
-# 3. 수 GB 로그 파일 무할당 제로카피 고속 필터링
+# 3. 로그 파일 필터링
 $ lens log filter /var/log/syslog --query "error" --min-level warn
 $ lens log filter /var/log/syslog -f --min-level warn   # tail -f처럼 실시간 팔로우
 $ lens log stats /var/log/syslog                       # 레벨 분포 + 시간 히스토그램
